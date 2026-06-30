@@ -9,6 +9,7 @@ from motu_proxy.datastore import (
     MotuUsbDatastore,
     ShortUsbFrame,
     ShortUsbWrite,
+    read_device_capability_info,
 )
 from motu_proxy.parser import DatastorePayload, ResponseFrameError
 from motu_proxy.protocol import build_get_frame, build_post_frame
@@ -197,6 +198,46 @@ class DatastoreTests(TestCase):
         transport = SizeCheckingTransport([packet[:64], packet[64:]], short_writes=False)
         datastore = MotuUsbDatastore(transport)
         self.assertEqual(datastore.get("/datastore/uid"), b'{"value":"' + (b"x" * 80) + b'"}')
+
+    def test_read_device_capability_info_assembles_values_and_absent_caps(self) -> None:
+        transport = FakeTransport(
+            [
+                response_packet(b'{"value":"1.0.0"}', message_seq=2, wrapper_seq=0x40),
+                response_packet(b'{"value":"2.0.0"}', message_seq=3, wrapper_seq=0x41),
+                response_packet(b'{"value":"3.0.0"}', message_seq=4, wrapper_seq=0x42),
+                response_packet(
+                    b"HTTP/1.1 404 Not Found\r\n\r\n{\"error\":\"missing\"}",
+                    message_seq=5,
+                    wrapper_seq=0x43,
+                ),
+                response_packet(b'{"value":"0001f2fffe00c719"}', message_seq=6, wrapper_seq=0x44),
+                response_packet(b'{"value":"624"}', message_seq=7, wrapper_seq=0x45),
+                response_packet(b'{"value":"1.4.1"}', message_seq=8, wrapper_seq=0x46),
+                response_packet(b'{"value":"0001f2fffe00c719"}', message_seq=9, wrapper_seq=0x47),
+            ]
+        )
+        datastore = MotuUsbDatastore(transport)
+
+        info = read_device_capability_info(datastore)
+
+        self.assertEqual(info.apiversion, "1.0.0")
+        self.assertEqual(info.capabilities["avb"].version, "2.0.0")
+        self.assertTrue(info.capabilities["avb"].present)
+        self.assertEqual(info.capabilities["router"].version, "3.0.0")
+        self.assertFalse(info.capabilities["mixer"].present)
+        self.assertIsNone(info.capabilities["mixer"].version)
+        self.assertEqual(info.identity["uid"], "0001f2fffe00c719")
+        self.assertEqual(info.identity["model_name"], "624")
+        self.assertEqual(info.identity["firmware_version"], "1.4.1")
+        self.assertEqual(info.identity["serial_number"], "0001f2fffe00c719")
+        self.assertEqual(
+            transport.writes[0],
+            build_get_frame(0x20, 2, "/apiversion"),
+        )
+        self.assertEqual(
+            transport.writes[2],
+            build_get_frame(0x22, 3, "/datastore/ext/caps/avb"),
+        )
 
 
 class DatastoreCoordinatorTests(TestCase):

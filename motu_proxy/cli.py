@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import ipaddress
+import json
 import os
 import secrets
 import socket
@@ -12,8 +13,17 @@ import sys
 import time
 from pathlib import Path
 
-from .datastore import DatastoreConfig, DatastoreCoordinator, ResponseStats, open_datastore
-from .device import DEFAULT_DEVFS_ROOT, DEFAULT_SYSFS_ROOT, UsbDeviceInfo, find_motu_device
+from .datastore import (
+    CAPABILITY_SECTIONS,
+    IDENTITY_KEYS,
+    DatastoreConfig,
+    DatastoreCoordinator,
+    DeviceCapabilityInfo,
+    ResponseStats,
+    open_datastore,
+    read_device_capability_info,
+)
+from .device import DEFAULT_DEVFS_ROOT, DEFAULT_SYSFS_ROOT
 from .fixtures import EXPECTED_GET_DATASTORE, EXPECTED_POST_HOST_OS
 from .http_server import DEFAULT_MAX_WRITE_BODY_BYTES, MotuProxyServer, serve
 from .json_body import validate_json_body
@@ -97,32 +107,33 @@ def prepare_write_token(token_file: str | None) -> tuple[str, str | None]:
 
 
 def command_info(args) -> int:
-    config = config_from_args(args)
-    device = find_motu_device(
-        config.vid,
-        config.pid,
-        serial=config.serial,
-        sysfs_root=config.sysfs_root,
-        devfs_root=config.devfs_root,
-        interface=config.interface,
-        ep_out=config.ep_out,
-        ep_in=config.ep_in,
-    )
-    print_device_info(config, device)
+    with open_datastore(config_from_args(args)) as datastore:
+        info = read_device_capability_info(datastore)
+    if args.json:
+        print(json.dumps(info.as_dict(), indent=2, sort_keys=True))
+    else:
+        print_capability_info(info)
     return 0
 
 
-def print_device_info(config: DatastoreConfig, device: UsbDeviceInfo) -> None:
-    print(f"vid: 0x{config.vid:04x}")
-    print(f"pid: 0x{config.pid:04x}")
-    print(f"product: {device.product or '(unknown)'}")
-    print(f"serial: {device.serial or '(none)'}")
-    print(f"interface: {device.interface}")
-    print(f"ep_out: 0x{device.ep_out:02x}")
-    print(f"ep_in: 0x{device.ep_in:02x}")
-    print(f"max_packet_size: {device.max_packet_size}")
-    print(f"sysfs_path: {device.sysfs_path}")
-    print(f"devfs_path: {device.devfs_path}")
+def print_capability_info(info: DeviceCapabilityInfo) -> None:
+    print(f"apiversion: {_format_info_value(info.apiversion)}")
+    print("capabilities:")
+    for section in CAPABILITY_SECTIONS:
+        capability = info.capabilities[section]
+        value = capability.version if capability.present else None
+        print(f"  {section}: {_format_info_value(value)}")
+    print("identity:")
+    for key in IDENTITY_KEYS:
+        print(f"  {key}: {_format_info_value(info.identity.get(key))}")
+
+
+def _format_info_value(value: object | None) -> str:
+    if value is None:
+        return "not present"
+    if isinstance(value, str):
+        return value.rstrip("\n").replace("\r\n", "\n").replace("\n", "\\n")
+    return str(value)
 
 
 def command_get(args) -> int:
@@ -269,8 +280,9 @@ def build_parser() -> argparse.ArgumentParser:
     get_parser.add_argument("--compact", action="store_true")
     get_parser.set_defaults(func=command_get)
 
-    info_parser = sub.add_parser("info", help="show discovered MOTU USB control endpoint details")
+    info_parser = sub.add_parser("info", help="show datastore API, capability, and identity details")
     add_usb_args(info_parser)
+    info_parser.add_argument("--json", action="store_true", help="emit capability details as JSON")
     info_parser.set_defaults(func=command_info)
 
     post_parser = sub.add_parser("post", help="POST json=<body> to a datastore path over USB")

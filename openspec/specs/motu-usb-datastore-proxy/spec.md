@@ -2,7 +2,6 @@
 
 ## Purpose
 Provide a dependency-light CLI and localhost HTTP proxy for MOTU AVB datastore operations over the Linux USB vendor control interface while preserving safe defaults and the class-compliant ALSA audio path.
-
 ## Requirements
 ### Requirement: Device discovery
 The system SHALL discover a MOTU AVB USB device by VID:PID and optional serial number, and SHALL identify a vendor-specific bulk control interface without claiming ALSA audio streaming interfaces.
@@ -203,3 +202,18 @@ The system SHALL include automated tests for protocol compatibility, path normal
 #### Scenario: Unit tests run without MOTU hardware
 - **WHEN** the automated test suite is run on a development machine without a connected MOTU device
 - **THEN** tests that do not require live USB hardware run and validate the same-functionality contract
+
+### Requirement: Capability and version discovery
+The system SHALL provide a command that reports the device datastore `apiversion`, the per-section capability versions, and device identity read from the documented datastore paths.
+
+#### Scenario: Report API and section versions
+- **WHEN** the user runs the discovery command against a connected MOTU device
+- **THEN** the system reports the global `apiversion` and the available `ext/caps/avb`, `ext/caps/router`, and `ext/caps/mixer` section versions
+
+#### Scenario: Absent section reported as not present
+- **WHEN** a section capability path such as `ext/caps/mixer` does not exist on the device
+- **THEN** the system reports that section as not present rather than failing
+
+#### Scenario: Machine-readable output
+- **WHEN** the user runs the discovery command with JSON output
+- **THEN** the system emits the API version, section versions, and device identity as a JSON object

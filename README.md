@@ -48,10 +48,11 @@ Read a datastore path:
 motu-proxy get /datastore/uid
 ```
 
-Show the discovered USB control endpoint without opening the device:
+Show datastore API, capability, and identity details:
 
 ```sh
 motu-proxy info
+motu-proxy info --json
 ```
 
 Probe a few harmless baseline paths, continuing after errors:

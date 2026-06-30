@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import struct
 import threading
 import time
@@ -19,6 +20,7 @@ from .parser import (
     is_device_ack,
     join_response_frames,
     parse_response_frame,
+    response_status_code,
 )
 from .protocol import (
     DEFAULT_MAX_USB_CHUNK,
@@ -45,6 +47,8 @@ DEFAULT_MAX_IGNORED_PACKETS = 32
 DEFAULT_MAX_RESPONSE_FRAMES = 256
 DEFAULT_POLL_PATH = "/datastore"
 DEFAULT_POLL_READ_TIMEOUT_SLICE_MS = 250
+CAPABILITY_SECTIONS = ("avb", "router", "mixer")
+IDENTITY_KEYS = ("uid", "model_name", "firmware_version", "serial_number")
 
 
 class Transport(Protocol):
@@ -54,6 +58,11 @@ class Transport(Protocol):
         ...
 
     def bulk_read(self, size: int | None = None, timeout_ms: int | None = None) -> bytes:
+        ...
+
+
+class DatastoreReader(Protocol):
+    def get(self, path: str) -> bytes:
         ...
 
 
@@ -115,6 +124,35 @@ class DatastoreTransition:
     to_etag: str
     body: bytes
     origin_client: str | None = None
+
+
+@dataclass(frozen=True)
+class CapabilityVersion:
+    present: bool
+    version: object | None
+
+    def as_dict(self) -> dict[str, object | None]:
+        return {
+            "present": self.present,
+            "version": self.version,
+        }
+
+
+@dataclass(frozen=True)
+class DeviceCapabilityInfo:
+    apiversion: object | None
+    capabilities: dict[str, CapabilityVersion]
+    identity: dict[str, object | None]
+
+    def as_dict(self) -> dict[str, object | None]:
+        return {
+            "apiversion": self.apiversion,
+            "capabilities": {
+                section: capability.as_dict()
+                for section, capability in self.capabilities.items()
+            },
+            "identity": dict(self.identity),
+        }
 
 
 class MotuUsbDatastore:
@@ -418,6 +456,62 @@ class MotuUsbDatastore:
             else:
                 quiet += 1
         return packets
+
+
+def read_device_capability_info(datastore: DatastoreReader) -> DeviceCapabilityInfo:
+    apiversion = _read_required_datastore_value(datastore, "/apiversion")
+    capabilities = {
+        section: CapabilityVersion(present, value)
+        for section in CAPABILITY_SECTIONS
+        for present, value in [_read_optional_datastore_value(datastore, f"/datastore/ext/caps/{section}")]
+    }
+    identity = {
+        key: value
+        for key in IDENTITY_KEYS
+        for _present, value in [_read_optional_datastore_value(datastore, f"/datastore/{key}")]
+    }
+    return DeviceCapabilityInfo(
+        apiversion=apiversion,
+        capabilities=capabilities,
+        identity=identity,
+    )
+
+
+def _read_required_datastore_value(datastore: DatastoreReader, path: str) -> object | None:
+    return _decode_datastore_value(datastore.get(path))
+
+
+def _read_optional_datastore_value(datastore: DatastoreReader, path: str) -> tuple[bool, object | None]:
+    try:
+        response = datastore.get(path)
+    except DatastoreNoResponse:
+        return False, None
+    except RuntimeError as exc:
+        if _looks_like_absent_path(exc):
+            return False, None
+        raise
+    if response_status_code(response) == 404:
+        return False, None
+    value = _decode_datastore_value(response)
+    return value is not None, value
+
+
+def _decode_datastore_value(response: bytes) -> object | None:
+    body = datastore_payload(response).body.strip()
+    if not body:
+        return None
+    try:
+        decoded = json.loads(body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return body.decode("utf-8", errors="replace").strip() or None
+    if isinstance(decoded, dict) and "value" in decoded:
+        return decoded["value"]
+    return decoded
+
+
+def _looks_like_absent_path(exc: RuntimeError) -> bool:
+    message = str(exc).lower()
+    return "404" in message or "not found" in message or "does not exist" in message
 
 
 class DatastoreCoordinator:

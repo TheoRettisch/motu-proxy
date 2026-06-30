@@ -1,5 +1,6 @@
 from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
+import json
 import os
 import stat
 from pathlib import Path
@@ -14,7 +15,7 @@ from motu_proxy.cli import (
     validate_serve_write_safety,
     write_token_file,
 )
-from motu_proxy.datastore import ResponseStats
+from motu_proxy.datastore import DatastoreNoResponse, ResponseStats
 from motu_proxy.http_server import DatastoreDispatcher
 
 
@@ -76,6 +77,19 @@ class FakeSmokeDatastore:
             response_bytes=len(response),
         )
         return response
+
+
+def info_responses() -> dict[str, bytes | Exception]:
+    return {
+        "/apiversion": b'{"value":"1.0.0"}',
+        "/datastore/ext/caps/avb": b'{"value":"2.0.0"}',
+        "/datastore/ext/caps/router": b'{"value":"3.0.0"}',
+        "/datastore/ext/caps/mixer": RuntimeError("404 not found"),
+        "/datastore/uid": b'{"value":"0001f2fffe00c719"}',
+        "/datastore/model_name": b'{"value":"624"}',
+        "/datastore/firmware_version": b'{"value":"1.4.1\\n06/27/25"}',
+        "/datastore/serial_number": DatastoreNoResponse("no datastore response after 1200 ms"),
+    }
 
 
 class FakeServeDatastore:
@@ -284,29 +298,68 @@ class CliPostValidationTests(TestCase):
         self.assertEqual(datastore.calls, [("/datastore/uid", '{"value":"changed"}')])
 
 
-@skipIf(os.name == "nt", "fake sysfs interface names use ':' like Linux")
 class CliInfoTests(TestCase):
-    def test_info_prints_discovered_usb_control_details(self) -> None:
-        with TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            add_device(root, "3-3", "0001f2fffe00c719", 3, 4)
-            args = build_parser().parse_args(
-                ["info", "--sysfs-root", str(root), "--devfs-root", str(root / "dev")]
-            )
-            stdout = StringIO()
-            with redirect_stdout(stdout):
-                result = args.func(args)
-            self.assertEqual(result, 0)
-            output = stdout.getvalue()
-            self.assertIn("vid: 0x07fd", output)
-            self.assertIn("pid: 0x0005", output)
-            self.assertIn("product: 624", output)
-            self.assertIn("serial: 0001f2fffe00c719", output)
-            self.assertIn("interface: 3", output)
-            self.assertIn("ep_out: 0x03", output)
-            self.assertIn("ep_in: 0x83", output)
-            self.assertIn("max_packet_size: 512", output)
-            self.assertIn(f"devfs_path: {root / 'dev' / '003' / '004'}", output)
+    def test_info_prints_datastore_capabilities(self) -> None:
+        datastore = FakeSmokeDatastore(info_responses())
+        args = build_parser().parse_args(["info"])
+        stdout = StringIO()
+        with (
+            patch("motu_proxy.cli.open_datastore", return_value=FakeOpenDatastore(datastore)),
+            redirect_stdout(stdout),
+        ):
+            result = args.func(args)
+
+        self.assertEqual(result, 0)
+        output = stdout.getvalue()
+        self.assertIn("apiversion: 1.0.0", output)
+        self.assertIn("capabilities:", output)
+        self.assertIn("avb: 2.0.0", output)
+        self.assertIn("router: 3.0.0", output)
+        self.assertIn("mixer: not present", output)
+        self.assertIn("identity:", output)
+        self.assertIn("uid: 0001f2fffe00c719", output)
+        self.assertIn("model_name: 624", output)
+        self.assertIn("firmware_version: 1.4.1\\n06/27/25", output)
+        self.assertIn("serial_number: not present", output)
+        self.assertEqual(
+            datastore.calls,
+            [
+                "/apiversion",
+                "/datastore/ext/caps/avb",
+                "/datastore/ext/caps/router",
+                "/datastore/ext/caps/mixer",
+                "/datastore/uid",
+                "/datastore/model_name",
+                "/datastore/firmware_version",
+                "/datastore/serial_number",
+            ],
+        )
+
+    def test_info_json_prints_datastore_capabilities_for_tooling(self) -> None:
+        datastore = FakeSmokeDatastore(info_responses())
+        args = build_parser().parse_args(["info", "--json"])
+        stdout = StringIO()
+        with (
+            patch("motu_proxy.cli.open_datastore", return_value=FakeOpenDatastore(datastore)),
+            redirect_stdout(stdout),
+        ):
+            result = args.func(args)
+
+        self.assertEqual(result, 0)
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(payload["apiversion"], "1.0.0")
+        self.assertEqual(payload["capabilities"]["avb"], {"present": True, "version": "2.0.0"})
+        self.assertEqual(payload["capabilities"]["router"], {"present": True, "version": "3.0.0"})
+        self.assertEqual(payload["capabilities"]["mixer"], {"present": False, "version": None})
+        self.assertEqual(
+            payload["identity"],
+            {
+                "uid": "0001f2fffe00c719",
+                "model_name": "624",
+                "firmware_version": "1.4.1\n06/27/25",
+                "serial_number": None,
+            },
+        )
 
 
 class CliSmokeTests(TestCase):
