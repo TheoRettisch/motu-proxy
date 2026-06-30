@@ -48,13 +48,13 @@ Alternative considered: make PyUSB the primary backend. The host currently has `
 
 ### Preserve the current safety posture
 
-The HTTP server binds to `127.0.0.1` by default. POST/PATCH over HTTP remain disabled unless `--allow-writes` is provided. CLI `post` remains explicit and visible.
+The HTTP server binds to `127.0.0.1` by default. POST/PATCH over HTTP remain disabled unless `--allow-writes` is provided. When writes are enabled, HTTP PATCH is handled only as a compatibility alias for the same MOTU datastore POST frame emitted for HTTP POST. It must not introduce separate partial-update semantics. CLI `post` remains explicit and visible.
 
 Alternative considered: expose a fuller HTTP API immediately. That increases risk around device state mutation before response parsing and write behavior are hardened.
 
 ### Discover the vendor control interface, but keep validated defaults
 
-The rebuilt code should discover the MOTU device by VID:PID and optional serial, then locate an unbound vendor-specific interface with one bulk IN and one bulk OUT endpoint. The validated MOTU 624 defaults are interface `3`, OUT `0x03`, IN `0x83`, max packet `512`.
+The rebuilt code should discover the MOTU device by VID:PID and optional serial, then locate an unbound vendor-specific interface with one bulk IN and one bulk OUT endpoint. This is an intentional, bounded behavior improvement over the handover MVP's hard-coded interface values. The validated MOTU 624 defaults remain interface `3`, OUT `0x03`, IN `0x83`, max packet `512`, and discovery should be tested with fake sysfs fixtures before relying on live hardware.
 
 Alternative considered: hard-code interface 3 forever. That is enough for the current 624, but makes the code less robust across MOTU AVB models and future re-enumeration checks.
 
@@ -68,7 +68,7 @@ Alternative considered: start with only live host testing. That would make refac
 
 - Incomplete response parsing -> keep initial behavior equivalent to the MVP, then isolate parser code so stricter validation can be added without touching transport or HTTP layers.
 - USB access contention -> serialize datastore requests in the HTTP server and open/close the transport per request for MVP equivalence; later work can introduce a long-lived worker if needed.
-- Accidental writes -> keep HTTP writes gated by `--allow-writes`, log write attempts, and keep first live POST validation out of scope for the initial clean rebuild.
+- Accidental writes or misleading PATCH semantics -> keep HTTP writes gated by `--allow-writes`, log write attempts, route HTTP POST and PATCH through one explicit datastore POST implementation, and keep first live POST validation out of scope for the initial clean rebuild.
 - PyUSB uncertainty -> avoid introducing it as a dependency until a concrete benefit is proven against the Ubuntu host.
 - Multiple MOTU devices -> require `--serial` when discovery matches more than one device.
 

@@ -45,8 +45,12 @@ The system SHALL provide command-line operations equivalent to the handover MVP 
 - **WHEN** the user runs the `post` command with a datastore path and JSON body
 - **THEN** the system sends a POST datastore operation over USB and returns the response body
 
+#### Scenario: Serve starts read-only localhost proxy
+- **WHEN** the user runs the `serve` command with default options
+- **THEN** the system starts the localhost HTTP proxy bound to `127.0.0.1` with HTTP writes disabled
+
 ### Requirement: HTTP localhost proxy
-The system SHALL provide a localhost HTTP proxy compatible with the handover MVP for datastore GET requests and gated POST/PATCH requests.
+The system SHALL provide a localhost HTTP proxy compatible with the handover MVP for datastore GET requests and gated POST/PATCH requests. HTTP PATCH SHALL be treated only as a compatibility alias for the same MOTU datastore POST operation used by HTTP POST, and SHALL NOT imply partial-update semantics.
 
 #### Scenario: Read-only proxy GET
 - **WHEN** the proxy is running with default options and a client requests `GET /datastore/uid` on `127.0.0.1`
@@ -58,10 +62,18 @@ The system SHALL provide a localhost HTTP proxy compatible with the handover MVP
 
 #### Scenario: Writes enabled explicitly
 - **WHEN** the proxy is running with `--allow-writes` and a client sends POST or PATCH with a `json` form field or raw JSON body
-- **THEN** the proxy sends a POST datastore operation over USB and returns the response body
+- **THEN** the proxy sends the same POST datastore operation over USB for either HTTP method and returns the response body
+
+#### Scenario: PATCH does not imply partial update
+- **WHEN** the proxy is running with `--allow-writes` and a client sends PATCH with a body
+- **THEN** the proxy routes the request through the datastore POST write implementation without applying PATCH-specific merge or partial-update behavior
 
 ### Requirement: Path compatibility
 The system SHALL normalize datastore paths using the same compatibility behavior as the handover MVP.
+
+#### Scenario: Datastore path pass-through
+- **WHEN** the user requests `/datastore/uid`
+- **THEN** the system uses `/datastore/uid` without adding another datastore prefix
 
 #### Scenario: Bare datastore path
 - **WHEN** the user requests `/uid`

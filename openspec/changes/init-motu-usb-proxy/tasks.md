@@ -17,6 +17,7 @@
 - [ ] 3.2 Implement vendor-specific bulk interface and endpoint discovery while avoiding ALSA-bound interfaces.
 - [ ] 3.3 Implement the Linux usbfs transport as the required baseline backend.
 - [ ] 3.4 Verify sysfs plus usbfs covers the Ubuntu 24.04 host cleanly; defer PyUSB unless a concrete discovery, diagnostics, or reliability gap is found.
+- [ ] 3.5 Add fake sysfs tests for single-device discovery, serial selection, and multiple-device refusal when `--serial` is omitted.
 
 ## 4. Datastore Operations
 
@@ -28,10 +29,12 @@
 ## 5. HTTP Proxy
 
 - [ ] 5.1 Implement a localhost HTTP server that binds to `127.0.0.1` by default.
-- [ ] 5.2 Implement GET handling for normalized datastore paths.
-- [ ] 5.3 Implement POST/PATCH rejection unless `--allow-writes` is explicitly set.
-- [ ] 5.4 Implement POST/PATCH body handling for `json=` form fields and raw JSON bodies.
-- [ ] 5.5 Add tests for HTTP GET behavior and write gating.
+- [ ] 5.2 Implement the `serve` command as the entry point for the localhost HTTP server, with writes disabled by default.
+- [ ] 5.3 Implement GET handling for normalized datastore paths.
+- [ ] 5.4 Implement POST/PATCH rejection unless `--allow-writes` is explicitly set.
+- [ ] 5.5 Implement POST/PATCH body handling for `json=` form fields and raw JSON bodies.
+- [ ] 5.6 Route HTTP POST and PATCH through one explicit datastore POST implementation, with PATCH documented in code as a compatibility alias rather than partial-update semantics.
+- [ ] 5.7 Add tests for HTTP GET behavior, write gating, `serve` defaults, and PATCH alias behavior.
 
 ## 6. Validation
 

@@ -5,8 +5,9 @@ The handover MVP proves that Linux can access the MOTU 624 datastore over the ve
 ## What Changes
 
 - Rebuild the MOTU USB datastore MVP as a small Python package with separated protocol, transport, datastore, CLI, and HTTP proxy layers.
-- Preserve the existing user-facing functionality: `selftest`, `get`, `probe`, explicit CLI `post`, read-only localhost `serve`, and write-enabled POST/PATCH only behind an explicit `--allow-writes` flag.
+- Preserve the existing user-facing functionality: `selftest`, `get`, `probe`, explicit CLI `post`, read-only localhost `serve`, and write-enabled HTTP POST/PATCH only behind an explicit `--allow-writes` flag. HTTP PATCH is a compatibility alias for the MOTU datastore POST write path, not a separate partial-update operation.
 - Preserve the current safety posture: bind to `127.0.0.1` by default, keep writes disabled by default, and avoid disrupting the class-compliant ALSA audio interfaces.
+- Include one bounded behavior improvement over the handover MVP: discover the matching MOTU device, serial, vendor control interface, and bulk endpoints instead of relying only on hard-coded interface values. Keep the validated MOTU 624 defaults as the reference behavior.
 - Keep the Linux usbfs transport as the baseline implementation because it works on the current Ubuntu 24.04 host and remains compatible with tiny deployment environments.
 - Evaluate PyUSB only if it provides a concrete benefit, such as simpler descriptor discovery, better diagnostics, or cleaner cross-host development behavior. Do not make PyUSB a required dependency for the initial same-functionality rebuild unless that benefit is demonstrated.
 - Add automated tests around frame construction, CRC32, path normalization, write gating, and response extraction so the rebuild can stay equivalent to the handover MVP.
