@@ -18,6 +18,10 @@ The system SHALL validate write values against the documented type, numeric rang
 - **WHEN** a client writes a value that is not one of the documented enum values for a known path
 - **THEN** the proxy rejects the request with an HTTP `422` and does not send a USB write
 
+#### Scenario: CLI post validates before USB write
+- **WHEN** the user runs CLI `post` with a value that violates the documented type, range, enum, or permission for a known path
+- **THEN** the command fails with a nonzero exit and does not send a USB write
+
 ### Requirement: Forward-compatible passthrough for unknown paths
 The system SHALL forward writes to datastore paths that are not present in its embedded schema, so that newer firmware paths are not blocked, and SHALL provide a way to disable validation entirely.
 
@@ -26,5 +30,5 @@ The system SHALL forward writes to datastore paths that are not present in its e
 - **THEN** the proxy forwards the write to the device
 
 #### Scenario: Validation disabled
-- **WHEN** the proxy is started with validation disabled
-- **THEN** the proxy forwards writes without checking type, range, enum, or permission
+- **WHEN** HTTP or CLI writes are run with validation disabled
+- **THEN** the system forwards writes without checking type, range, enum, or permission

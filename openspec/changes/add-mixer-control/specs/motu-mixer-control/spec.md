@@ -12,7 +12,7 @@ The system SHALL provide a typed mixer model that maps mixer channel strips and 
 - **THEN** the system reports the channels and buses available on that device rather than a hard-coded set
 
 ### Requirement: Mixer parameter read and write
-The system SHALL read mixer parameters and write read-write mixer parameters within their documented ranges.
+The system SHALL read first-pass mixer parameters (fader, mute, solo, pan, name) and write read-write first-pass mixer parameters within their documented ranges.
 
 #### Scenario: Read a mixer parameter
 - **WHEN** a caller reads a mixer parameter such as a channel fader

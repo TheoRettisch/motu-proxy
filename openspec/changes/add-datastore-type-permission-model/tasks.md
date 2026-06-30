@@ -13,10 +13,12 @@
 ## 3. Integration
 
 - [ ] 3.1 Map permission denial to HTTP `403` and validation failure to HTTP `422`.
-- [ ] 3.2 Add a `--no-validate` flag to forward writes unchecked.
+- [ ] 3.2 Apply validation to CLI `post` by default and return a clear nonzero error before USB I/O on validation failure.
+- [ ] 3.3 Add a `--no-validate` flag for HTTP and CLI write paths to forward writes unchecked.
 
 ## 4. Tests
 
 - [ ] 4.1 Test read-only path denial without USB I/O.
 - [ ] 4.2 Test range, type, and enum violations.
-- [ ] 4.3 Test undocumented-path passthrough and `--no-validate`.
+- [ ] 4.3 Test CLI `post` validation failure and `--no-validate` bypass.
+- [ ] 4.4 Test undocumented-path passthrough and `--no-validate`.

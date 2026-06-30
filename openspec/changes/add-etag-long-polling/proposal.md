@@ -7,10 +7,10 @@ Long-polling is the mechanism the MOTU datastore API provides for low-latency ch
 ## What Changes
 
 - Parse the datastore ETag from USB replies (provided by `add-datastore-http-api-compat`).
-- Add a datastore long-poll read that forwards a client ETag and waits long enough for the device's held response (greater than the 15-second device hold).
-- Map HTTP `If-None-Match` and `client` to the datastore long-poll, returning `304 Not Modified` on a no-change timeout and the changed payload with the new ETag otherwise.
-- Decide and implement how a single USB control pipe serves held requests without starving other requests (see design).
-- Add tests for long-poll request construction, timeout-to-304 mapping, and change-to-response mapping using fake transports.
+- Add a single USB datastore coordinator with a background long-poll worker that owns held reads and fans out changes to HTTP clients.
+- Map HTTP `If-None-Match` and `client` to local long-poll waiters, returning `304 Not Modified` on a no-change timeout and the changed payload with the new ETag otherwise.
+- Keep ordinary reads and writes serialized through the coordinator so the single USB control pipe remains correct while long-polling is active.
+- Add tests for long-poll request construction, poller fan-out, timeout-to-304 mapping, change-to-response mapping, and write/poll serialization using fake transports.
 
 ## Capabilities
 

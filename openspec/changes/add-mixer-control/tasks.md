@@ -1,12 +1,12 @@
 ## 1. Typed Model
 
-- [ ] 1.1 Define bus kinds (`chan`, `main`, `aux`, `group`, `reverb`, `monitor`) and their parameter-to-path maps.
+- [ ] 1.1 Define bus kinds (`chan`, `main`, `aux`, `group`, `reverb`, `monitor`) and first-pass fader/mute/solo/pan/name parameter-to-path maps.
 - [ ] 1.2 Compose concrete datastore paths from kind, index, and parameter with 0-based indexing.
 - [ ] 1.3 Enumerate available channels and buses from the device rather than hard-coding.
 
 ## 2. Read And Write
 
-- [ ] 2.1 Read mixer parameters (fader, mute, solo, pan, name, EQ bands, gate, comp, sends).
+- [ ] 2.1 Read first-pass mixer parameters (fader, mute, solo, pan, name).
 - [ ] 2.2 Write `rw` mixer parameters with documented ranges.
 - [ ] 2.3 Support batched multi-parameter writes in one datastore operation.
 

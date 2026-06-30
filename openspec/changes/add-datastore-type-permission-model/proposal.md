@@ -7,10 +7,10 @@ Every datastore path in the MOTU AVB API has an assigned type, a permission (`r`
 ## What Changes
 
 - Embed a datastore schema (path, type, permission, range, enum values) generated from the documented MOTU datastore API.
-- Validate writes before sending over USB: reject writes to `r` (read-only) paths, and reject values that do not match the documented type, range, or enum.
+- Validate HTTP writes and CLI `post` writes before sending over USB: reject writes to `r` (read-only) paths, and reject values that do not match the documented type, range, or enum.
 - Return appropriate HTTP errors: `403` for read-only paths, `422` for type or range violations.
 - Treat undocumented paths as forward-compatible: forward them by default with an optional warning, so newer firmware paths are not blocked.
-- Provide an escape hatch (`--no-validate`) to forward writes unchecked.
+- Provide an escape hatch (`--no-validate`) to forward writes unchecked for both HTTP and CLI write paths.
 - Add tests for permission denial, range/type/enum checks, and undocumented-path passthrough.
 
 ## Capabilities
@@ -24,6 +24,6 @@ Every datastore path in the MOTU AVB API has an assigned type, a permission (`r`
 ## Impact
 
 - Affected code: new `motu_proxy/schema.py` (embedded path table), `motu_proxy/datastore.py`, `motu_proxy/http_server.py`, `motu_proxy/cli.py` (the `--no-validate` flag).
-- Affected APIs: HTTP writes may now return `403` or `422`; previously such writes were forwarded.
+- Affected APIs: HTTP writes may now return `403` or `422`, and CLI `post` may now fail before USB I/O with a clear validation error; previously such writes were forwarded.
 - Affected systems: any client that writes to the datastore through the proxy.
 - Dependencies: standard library only; the schema is generated once from the API documentation and embedded as data.

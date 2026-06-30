@@ -6,11 +6,11 @@ Both reference projects are, at heart, mixer controllers built on these paths: `
 
 ## What Changes
 
-- Add a `motu-mixer-control` capability: a typed model mapping the documented `mix/*` paths to channel strips and buses with their parameters and ranges.
-- Provide read access (enumerate strips and buses; get fader, mute, solo, pan, name, EQ bands, gate, compressor, sends) and write access for `rw` parameters, using 0-based indexing and documented ranges.
+- Add a `motu-mixer-control` capability: a typed model mapping basic documented `mix/*` controls to channel strips and buses.
+- Provide read and write access for the first-pass control set only: fader, mute, solo, pan, and name where those controls are documented for the strip or bus, using 0-based indexing and documented ranges.
 - Support batched multi-parameter writes in a single datastore operation, matching the API's multi-key subtree write and the reference client's batching behavior.
 - Expose the model through CLI verbs (for example `mixer show`, `mixer set chan <i> fader <v>`), built on the existing datastore layer.
-- Add tests for the path mapping, range handling, and batched-write encoding using a fake transport.
+- Add tests for the first-pass path mapping, range handling, and batched-write encoding using a fake transport.
 
 ## Capabilities
 

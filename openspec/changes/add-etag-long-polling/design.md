@@ -8,13 +8,14 @@ The MOTU datastore supports long-polling via `If-None-Match` with a 15-second de
 
 - Realize datastore long-polling end to end: HTTP `If-None-Match` + `client` mapped to a USB long-poll, returning `304` on no-change and the delta plus new ETag on change.
 - Keep the single-USB-pipe model correct: a held long-poll must not corrupt or permanently block other datastore traffic.
+- Support multiple HTTP long-poll clients without giving each request its own held USB read.
 - Preserve existing read/write semantics and the safety posture.
 
 **Non-Goals:**
 
 - Do not implement metering here.
 - Do not build a full typed mixer model here (`add-mixer-control`).
-- Do not guarantee multi-client fairness beyond the chosen serialization strategy.
+- Do not open a second USB session or claim additional USB interfaces.
 
 ## Decisions
 
@@ -24,38 +25,47 @@ Long-poll reads use a dedicated timeout greater than the 15-second device hold, 
 
 Alternative considered: raise the global timeout. Rejected because it would slow every ordinary read and every quiet-drain.
 
-### Serialize long-polls without starving other requests
+### Use a single background poller with fan-out
 
-The single USB pipe and single dispatch lock mean a naive 15-second held GET blocks all other requests for up to 15 seconds. Three options:
+The single USB pipe and single dispatch lock mean a naive 15-second held GET per HTTP request blocks other traffic and multiplies pressure on the device. This change uses a single datastore coordinator that owns USB operations. A background worker performs one device long-poll at a time with the native hold window, tracks the latest ETag and recent change events, and wakes HTTP long-poll handlers through an in-process condition variable.
 
-1. **Bounded wait (simplest):** cap the held read at a short, configurable maximum (for example 1–2 seconds) and let the client re-poll. Lowest risk, slightly higher poll frequency, no concurrency model change.
-2. **Single background poller with fan-out:** a dedicated thread long-polls the datastore, maintains the latest ETag and a cache, and HTTP long-poll handlers wait on a local condition variable rather than the USB pipe. Best client experience; introduces a worker and cache-coherency design.
-3. **Separate USB session for polling:** open a second handle/endpoint for long-polls. Highest risk against the device and the ALSA-safe posture; not pursued initially.
+HTTP long-poll requests do not issue their own held USB reads when the coordinator is current. They compare the request `If-None-Match` value with coordinator state, return immediately when a matching change is already known, or wait locally until the poller publishes a change or the HTTP wait deadline expires.
 
-This change starts with option 1 to land the contract safely, and records option 2 as the follow-up once behavior is validated on hardware.
+Alternative considered: bounded short waits per request. Rejected because it is MVP-level behavior and increases client polling frequency. Alternative considered: separate USB session for polling. Rejected because it is higher risk against the device and the ALSA-safe posture.
 
-Alternative considered: jump straight to option 2. Rejected for the initial change because cache coherency and delta-merge semantics need live-device validation first.
+### Serialize writes and direct reads through the same coordinator
+
+Ordinary reads and writes enter the same coordinator queue as the poller. The poller only holds the pipe while an actual device long-poll is in flight; between poll cycles the coordinator can service writes and direct reads, then resume polling from the newest known ETag. Successful writes publish their returned ETag/payload when available, or trigger an immediate refresh when the write response does not carry enough state.
+
+This keeps one owner for sequence numbers, ETag state, and USB I/O, which is more reliable than mixing a background poller with independent request-thread transport calls.
+
+### Preserve client filtering locally where possible
+
+The native API lets a `client` identifier filter that client's own changes. A single background poller cannot ask the device for different client filters simultaneously, so the proxy records the `client` value attached to writes that pass through it and suppresses those locally for matching HTTP waiters. Device-originated changes and changes whose origin is unknown are fanned out to all waiters.
+
+Alternative considered: one device long-poll per client identifier. Rejected because it recreates the USB-pipe starvation problem and scales poorly.
 
 ### Map timeout to 304 and change to 200
 
-When the held read returns no change within the wait window, the HTTP layer returns `304 Not Modified` with the same ETag. When the device returns changes, the HTTP layer returns `200` with the changed payload and the new ETag.
+When the coordinator has no matching change before the HTTP wait deadline, the HTTP layer returns `304 Not Modified` with the same ETag. When the poller or a serialized write publishes a matching change, the HTTP layer returns `200` with the changed payload and the new ETag.
+
+### Forward adjacent deltas verbatim and retain bounded history
+
+The coordinator forwards device delta payloads verbatim for adjacent ETag transitions. It does not normalize, merge, reshape, or synthesize deltas in the first implementation, because the native API already defines the meaning of "changes since ETag X" and consumers expect that shape.
+
+The coordinator retains a bounded ring of the 64 most recent ETag transitions. If a client asks from an ETag that can be satisfied from a complete adjacent transition chain, the coordinator may return the corresponding device payload. If the requested ETag is missing or too stale for the ring, the coordinator performs a direct refresh or full datastore read instead of inventing a merged delta.
 
 ## Risks / Trade-offs
 
-- A held read blocks the single USB pipe. Mitigation: bounded wait (option 1) until the background-poller design (option 2) is validated.
-- Delta semantics: the device returns "changes since the given ETag," which may be a partial object. Mitigation: forward the device payload verbatim; do not attempt local merge in this change.
-- Client identifier filtering depends on device behavior. Mitigation: forward `client` and verify filtering against a live device.
+- Coordinator complexity: a worker, condition variable, and shared state are more moving parts than request-local reads. Mitigation: keep a single USB owner and cover fan-out, shutdown, timeout, and write interleaving with fake-transport tests.
+- Delta semantics: the device returns "changes since the given ETag," which may be a partial object. Mitigation: forward device payloads verbatim for adjacent transitions and fall back to a direct coordinator read or full refresh when the 64-entry local history cannot satisfy a stale client safely.
+- Client identifier filtering is only fully knowable for writes that pass through the proxy. Mitigation: locally suppress proxy-originated changes for the same `client`, and fan out unknown-origin changes to avoid dropping real device updates.
 
 ## Migration Plan
 
 1. Parse the reply ETag (from `add-datastore-http-api-compat`).
-2. Add a long-poll datastore read with a dedicated timeout and a bounded wait.
-3. Wire HTTP `If-None-Match` / `client` to it with `304` mapping.
-4. Validate against a live MOTU 624 by changing a parameter and observing prompt long-poll return.
-5. Evaluate the background-poller fan-out as a follow-up.
-
-## Open Questions
-
-- What maximum bounded-wait value best balances latency and pipe contention before the background poller exists?
-- Does the device's delta payload need any normalization for clients, or is verbatim forwarding sufficient?
-- How should a long-poll interact with a concurrent write from another HTTP client under the single lock?
+2. Add the datastore coordinator and background poller with a dedicated native-hold timeout.
+3. Wire HTTP `If-None-Match` / `client` to local waiters with `304` mapping and change fan-out.
+4. Add the 64-entry ETag transition history and stale-client direct refresh fallback.
+5. Route ordinary reads and writes through the coordinator and publish write-originated changes.
+6. Validate against a live MOTU 624 by changing a parameter and observing prompt long-poll return without starving ordinary requests.

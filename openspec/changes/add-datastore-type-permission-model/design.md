@@ -8,6 +8,7 @@ The MOTU datastore API documents, per path, a type (string, real, int, semver, w
 
 - Reject writes to read-only datastore paths before any USB I/O.
 - Validate write values against the documented type, range, and enum for known paths.
+- Apply the same validation policy to HTTP writes and CLI `post` writes by default.
 - Keep forward compatibility for undocumented paths.
 - Return clear, specific HTTP errors.
 
@@ -37,6 +38,16 @@ If a path is not in the schema, forward the write (optionally logging a warning)
 
 Alternative considered: deny unknown paths. Rejected as too brittle against firmware updates.
 
+### Scope the first schema to global, routing, and mixer paths
+
+The first embedded schema covers the documented global, routing, and mixer datastore paths. That is enough to protect the high-value write surfaces without turning the initial change into a full documentation extraction project. Model-specific availability is handled conservatively: validation applies when a known path pattern matches, and paths outside the embedded schema continue through the forward-compatible passthrough path.
+
+### Validate CLI post by default
+
+CLI `post` uses the same validation layer as HTTP writes by default. This keeps the safety model consistent: explicit writes are still possible, but known read-only paths and malformed values are rejected before USB I/O. The CLI exposes `--no-validate` as the raw debugging escape hatch and exits nonzero with the same clear permission, type, range, or enum error used by the HTTP layer.
+
+Alternative considered: keep CLI `post` as a raw lower-level operation by default. Rejected because it makes the easiest typo path the least protected path; `--no-validate` preserves low-level debugging without making it the default.
+
 ## Risks / Trade-offs
 
 - Schema drift: the embedded schema can lag firmware. Mitigation: forward-compatible passthrough for unknown paths and a clearly regenerable data module.
@@ -46,10 +57,6 @@ Alternative considered: deny unknown paths. Rejected as too brittle against firm
 
 1. Generate the schema data module from the documented API.
 2. Add the validation layer with longest-prefix placeholder matching.
-3. Wire validation into the write path with `403`/`422` mapping and the `--no-validate` flag.
-4. Add tests for denial, range/type/enum, and passthrough.
-
-## Open Questions
-
-- Which subset of paths should be authoritative in the first schema pass (global + routing + mixer), and how are model-specific ranges handled?
-- Should CLI `post` enforce validation by default, matching HTTP, or remain a lower-level escape hatch?
+3. Wire validation into HTTP writes with `403`/`422` mapping and the `--no-validate` flag.
+4. Wire validation into CLI `post` by default with a `--no-validate` escape hatch and nonzero validation failures.
+5. Add tests for denial, range/type/enum, passthrough, and CLI validation behavior.

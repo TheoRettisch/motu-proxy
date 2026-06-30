@@ -6,7 +6,7 @@ The MOTU AVB datastore API is documented as a JSON-over-HTTP contract (see `motu
 
 ## What Changes
 
-- Echo the datastore `ETag` returned by the device on every HTTP GET response.
+- Echo the datastore `ETag` returned by the device on HTTP GET responses when the USB reply carries one.
 - Set `Cache-Control: no-cache` on datastore responses to match the documented API.
 - Accept and forward the `client` query-string parameter on reads and writes.
 - Formally specify the GET response shapes the proxy already produces: single-key `{"value": ...}`, subtree nested object, and full `/datastore` object.
@@ -24,6 +24,6 @@ The MOTU AVB datastore API is documented as a JSON-over-HTTP contract (see `motu
 ## Impact
 
 - Affected code: `motu_proxy/http_server.py`, `motu_proxy/parser.py` (extract the datastore ETag from replies), `motu_proxy/datastore.py`.
-- Affected APIs: HTTP GET responses gain `ETag` and `Cache-Control` headers; the `client` query parameter is now recognized. No breaking change to existing behavior.
+- Affected APIs: HTTP GET responses gain `Cache-Control` headers and include `ETag` when available; the `client` query parameter is now recognized. No breaking change to existing behavior.
 - Affected systems: any HTTP datastore client pointed at the proxy, including the documented `curl` examples and the reference projects.
 - Dependencies: standard library only; no new runtime dependency. Prerequisite for `add-etag-long-polling`.
