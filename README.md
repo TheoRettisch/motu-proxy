@@ -98,8 +98,14 @@ Read through HTTP:
 curl http://127.0.0.1:1280/datastore/uid
 ```
 
-By default the server binds to `127.0.0.1`, serializes access with one
-dispatcher lock, opens the USB datastore per request, and rejects POST/PATCH.
+By default the server binds to `127.0.0.1`, opens one USB datastore session for
+the server lifetime, and rejects POST/PATCH. A `DatastoreCoordinator` owns USB
+access for the HTTP server: foreground reads and writes are serialized against a
+background `/datastore` long-poller that tracks ETags and fans out changes to
+HTTP long-poll waiters.
+
+During shutdown the coordinator asks the background poller to stop and waits for
+it before the USB datastore context is released.
 
 ## Write Mode
 
@@ -150,7 +156,9 @@ Additional write-mode protections:
 - Non-loopback `Host` headers are rejected by default.
 - Cross-origin browser writes are rejected when an `Origin` header is present.
 - `Origin: null` is rejected.
-- Request bodies larger than `--max-write-body-bytes` are rejected.
+- Request bodies larger than `--max-write-body-bytes` are rejected, and writes
+  that cannot fit in one current MOTU USB datastore frame are rejected before
+  USB I/O.
 - `--allow-writes` with a non-loopback `--listen` address requires
   `--unsafe-allow-remote-writes`.
 
@@ -220,7 +228,8 @@ valid paths.
   helpers, and JSON display extraction.
 - `motu_proxy/device.py`: Linux sysfs device/interface/endpoint discovery.
 - `motu_proxy/transports/usbfs.py`: Linux usbfs bulk transport.
-- `motu_proxy/datastore.py`: datastore GET/POST orchestration over a transport.
+- `motu_proxy/datastore.py`: datastore GET/POST orchestration over a transport
+  plus the persistent HTTP coordinator/long-poller.
 - `motu_proxy/http_server.py`: localhost HTTP compatibility layer and write
   safety checks.
 - `motu_proxy/cli.py`: command-line entry point.
@@ -237,7 +246,5 @@ This project is licensed under the MIT License. See `LICENSE`.
 
 ## Known Follow-Ups
 
-- Consider an optional persistent USB session mode for HTTP serving if request
-  latency becomes a problem.
 - Add service packaging and deployment-specific udev/systemd integration when
   the target image layout is settled.

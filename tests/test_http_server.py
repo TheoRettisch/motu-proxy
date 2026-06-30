@@ -21,6 +21,7 @@ from motu_proxy.http_server import (
 )
 from motu_proxy.json_body import InvalidJsonBody
 from motu_proxy.parser import DatastorePayload
+from motu_proxy.protocol import ProtocolFrameTooLarge, max_post_json_body_bytes
 
 
 WRITE_TOKEN = "test-write-token"
@@ -417,6 +418,33 @@ class HttpServerTests(TestCase):
             )
         self.assertEqual(calls, [])
 
+    def test_oversized_write_frame_is_rejected_before_usb_call(self) -> None:
+        calls: list[tuple[str, str]] = []
+        logs: list[tuple[str, str, str]] = []
+        max_body = max_post_json_body_bytes("/datastore/host/os")
+        body = '{"v":"' + ("x" * (max_body - 7)) + '"}'
+
+        def post(path: str, body: str, client: str | None = None) -> bytes:
+            calls.append((path, body))
+            return b"{}"
+
+        with self.assertRaises(ProtocolFrameTooLarge):
+            dispatch_datastore_request(
+                "POST",
+                "/host/os",
+                body,
+                "application/json",
+                True,
+                lambda path, client=None: b"{}",
+                post,
+                log_write=lambda method, path, body: logs.append((method, path, body)),
+                host="127.0.0.1:1280",
+                write_token=WRITE_TOKEN,
+                request_token=WRITE_TOKEN,
+            )
+        self.assertEqual(calls, [])
+        self.assertEqual(logs, [])
+
     def test_non_object_write_json_is_rejected_before_usb_call(self) -> None:
         calls: list[tuple[str, str]] = []
 
@@ -542,6 +570,16 @@ class HttpHandlerTests(TestCase):
             json.loads(handler.wfile.getvalue().decode("utf-8"))["error"],
             "MOTU USB datastore did not respond",
         )
+
+    def test_handler_returns_413_for_oversized_protocol_frame(self) -> None:
+        class Dispatcher:
+            def dispatch(self, *args, **kwargs):
+                raise ProtocolFrameTooLarge("too large")
+
+        handler = self.make_handler({"Content-Length": "17"}, b'{"value":"linux"}', Dispatcher())
+        handler.handle_datastore_request("POST")
+        self.assertEqual(handler.statuses, [413])
+        self.assertEqual(json.loads(handler.wfile.getvalue().decode("utf-8"))["error"], "too large")
 
     def test_handler_accepts_bearer_token_for_local_scripts(self) -> None:
         handler = self.make_handler({"Authorization": f"Bearer {WRITE_TOKEN}"})

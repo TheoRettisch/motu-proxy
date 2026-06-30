@@ -7,6 +7,7 @@ import ipaddress
 import os
 import secrets
 import socket
+import stat
 import sys
 import time
 from pathlib import Path
@@ -70,11 +71,19 @@ def validate_serve_write_safety(listen: str, allow_writes: bool, unsafe_allow_re
 
 def write_token_file(path: Path, token: str) -> None:
     path.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        if stat.S_ISLNK(os.lstat(path).st_mode):
+            raise RuntimeError(f"refusing to write token file through symlink: {path}")
+    except FileNotFoundError:
+        pass
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = os.open(path, flags, 0o600)
     with os.fdopen(fd, "w", encoding="ascii") as handle:
+        os.fchmod(handle.fileno(), 0o600)
         handle.write(token)
         handle.write("\n")
-    os.chmod(path, 0o600)
 
 
 def prepare_write_token(token_file: str | None) -> tuple[str, str | None]:

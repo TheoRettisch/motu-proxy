@@ -18,6 +18,15 @@ DEFAULT_MAX_USB_CHUNK = 512
 
 HOST_SEQ_MIN = 0x20
 HOST_SEQ_COUNT = 0x20
+MAX_U16 = 0xFFFF
+USB_LOGICAL_HEADER_BYTES = 4
+MOTU_FRAME_CONTROL_BYTES = 16
+UTOM_REQUEST_PREFIX_BYTES = 20
+POST_BODY_PREFIX_BYTES = 12
+
+
+class ProtocolFrameTooLarge(RuntimeError):
+    pass
 
 
 def _crc32_table() -> list[int]:
@@ -57,10 +66,22 @@ def sized_word(value: str | bytes) -> bytes:
     return u32(len(value)) + value
 
 
+def sized_word_len(value: str | bytes) -> int:
+    if isinstance(value, str):
+        value = value.encode("utf-8")
+    return 4 + len(value)
+
+
 def query_fields(client: str | int | None = None) -> bytes:
     if client is None:
         return u32(0)
     return u32(1) + sized_word("client") + sized_word(str(client))
+
+
+def query_fields_len(client: str | int | None = None) -> int:
+    if client is None:
+        return 4
+    return 4 + sized_word_len("client") + sized_word_len(str(client))
 
 
 def next_host_seq(seq: int) -> int:
@@ -77,9 +98,60 @@ class HostSequencer:
         return seq
 
 
+def _header_bytes(header: str) -> bytes:
+    encoded = header.encode("ascii")
+    if len(encoded) != 4:
+        raise ValueError("MOTU frame header must be exactly four ASCII bytes")
+    return encoded
+
+
+def max_motu_payload_bytes(header: str = "NREK") -> int:
+    header_len = len(_header_bytes(header))
+    return MAX_U16 - USB_LOGICAL_HEADER_BYTES - header_len - MOTU_FRAME_CONTROL_BYTES
+
+
+def max_post_json_body_bytes(
+    path: str,
+    header: str = "NREK",
+    client: str | int | None = None,
+) -> int:
+    request_len = (
+        sized_word_len("POST")
+        + sized_word_len(path)
+        + 4
+        + sized_word_len("Unsecure-Auth-MOTU")
+        + sized_word_len("unicorn666")
+        + query_fields_len(client)
+    )
+    fixed_payload_len = UTOM_REQUEST_PREFIX_BYTES + request_len + 4 + POST_BODY_PREFIX_BYTES
+    return max_motu_payload_bytes(header) - fixed_payload_len
+
+
+def validate_post_frame_size(
+    path: str,
+    json_body: str,
+    header: str = "NREK",
+    client: str | int | None = None,
+) -> None:
+    body_len = len(json_body.encode("utf-8"))
+    max_body_len = max_post_json_body_bytes(path, header=header, client=client)
+    if body_len > max_body_len:
+        raise ProtocolFrameTooLarge(
+            f"POST JSON body is {body_len} bytes; maximum single-frame body "
+            f"for {path} is {max_body_len} bytes"
+        )
+
+
 def build_motu_frame(seq: int, header: str, message_seq: int, motu_payload: bytes) -> bytes:
+    header_bytes = _header_bytes(header)
+    max_payload_len = max_motu_payload_bytes(header)
+    if len(motu_payload) > max_payload_len:
+        raise ProtocolFrameTooLarge(
+            f"MOTU payload is {len(motu_payload)} bytes; maximum single-frame "
+            f"payload is {max_payload_len} bytes"
+        )
     body = (
-        header.encode("ascii")
+        header_bytes
         + u32(crc32(motu_payload))
         + u32(message_seq)
         + u32(1)
@@ -126,6 +198,7 @@ def build_post_frame(
         + sized_word("unicorn666")
         + query_fields(client)
     )
+    validate_post_frame_size(path, json_body, header=header, client=client)
     body = sized_word("json") + sized_word(json_body)
     motu_payload = b"UTOM" + u32(8) + u32(1) + u32(0) + u32(len(request)) + request + u32(len(body)) + body
     return build_motu_frame(seq, header, message_seq, motu_payload)

@@ -9,7 +9,7 @@ from collections import deque
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterator, Protocol
+from typing import Callable, Iterator, Protocol
 
 from .device import DEFAULT_DEVFS_ROOT, DEFAULT_SYSFS_ROOT, find_motu_device
 from .parser import (
@@ -44,6 +44,7 @@ DEFAULT_MAX_RESPONSE_READS = 256
 DEFAULT_MAX_IGNORED_PACKETS = 32
 DEFAULT_MAX_RESPONSE_FRAMES = 256
 DEFAULT_POLL_PATH = "/datastore"
+DEFAULT_POLL_READ_TIMEOUT_SLICE_MS = 250
 
 
 class Transport(Protocol):
@@ -73,6 +74,10 @@ class DatastoreTimeout(RuntimeError):
 
 
 class DatastoreResponseLimit(RuntimeError):
+    pass
+
+
+class DatastoreCancelled(RuntimeError):
     pass
 
 
@@ -143,12 +148,19 @@ class MotuUsbDatastore:
         etag: str = "0",
         client: str | int | None = None,
         timeout_ms: int = DEFAULT_RESPONSE_TIMEOUT_MS,
+        should_cancel: Callable[[], bool] | None = None,
+        read_timeout_slice_ms: int | None = None,
     ) -> bytes:
         message_seq = self.message_seq
         frame = build_get_frame(self._next_host_seq(), message_seq, path, etag=etag, client=client)
         self._write_frame(frame)
         self.message_seq += 1
-        return self._collect_response(message_seq, timeout_ms=timeout_ms)
+        return self._collect_response(
+            message_seq,
+            timeout_ms=timeout_ms,
+            should_cancel=should_cancel,
+            read_timeout_slice_ms=read_timeout_slice_ms,
+        )
 
     def post(
         self,
@@ -193,6 +205,8 @@ class MotuUsbDatastore:
         max_reads: int = DEFAULT_MAX_RESPONSE_READS,
         max_ignored_packets: int = DEFAULT_MAX_IGNORED_PACKETS,
         max_response_frames: int = DEFAULT_MAX_RESPONSE_FRAMES,
+        should_cancel: Callable[[], bool] | None = None,
+        read_timeout_slice_ms: int | None = None,
     ) -> bytes:
         self.last_response_stats = None
         self.last_response_etag = None
@@ -206,6 +220,17 @@ class MotuUsbDatastore:
         deadline = time.monotonic() + (timeout_ms / 1000)
 
         while quiet_reads < 2:
+            if should_cancel is not None and should_cancel():
+                self._record_response_stats(
+                    timeout_ms,
+                    started,
+                    reads,
+                    len(frames),
+                    ignored_packets,
+                    ack_packets,
+                    total,
+                )
+                raise DatastoreCancelled("datastore response collection cancelled")
             if reads >= max_reads:
                 self._record_response_stats(
                     timeout_ms,
@@ -254,9 +279,13 @@ class MotuUsbDatastore:
                     )
                 )
             read_timeout_ms = max(1, int((deadline - now) * 1000))
+            if read_timeout_slice_ms is not None:
+                read_timeout_ms = min(read_timeout_ms, max(1, read_timeout_slice_ms))
             packet = self._read_logical_frame(timeout_ms=read_timeout_ms)
             reads += 1
             if not packet:
+                if read_timeout_slice_ms is not None and time.monotonic() < deadline:
+                    continue
                 quiet_reads += 1
                 continue
             quiet_reads = 0
@@ -400,12 +429,14 @@ class DatastoreCoordinator:
         http_wait_timeout_ms: int = DEFAULT_HTTP_LONG_POLL_WAIT_MS,
         history_size: int = DEFAULT_ETAG_HISTORY_SIZE,
         poll_interval_s: float = 0.05,
+        poll_read_timeout_slice_ms: int = DEFAULT_POLL_READ_TIMEOUT_SLICE_MS,
     ) -> None:
         self.datastore = datastore
         self.poll_path = poll_path
         self.long_poll_timeout_ms = long_poll_timeout_ms
         self.http_wait_timeout_ms = http_wait_timeout_ms
         self.poll_interval_s = poll_interval_s
+        self.poll_read_timeout_slice_ms = poll_read_timeout_slice_ms
         self._condition = threading.Condition()
         self._io_busy = False
         self._foreground_waiters = 0
@@ -436,12 +467,12 @@ class DatastoreCoordinator:
             )
             self._worker.start()
 
-    def close(self, timeout: float | None = 1.0) -> None:
+    def close(self, timeout: float | None = None) -> None:
         with self._condition:
             self._closed = True
             self._condition.notify_all()
             worker = self._worker
-        if worker is not None:
+        if worker is not None and worker is not threading.current_thread():
             worker.join(timeout=timeout)
 
     def get(
@@ -473,14 +504,20 @@ class DatastoreCoordinator:
 
     def post(self, path: str, json_body: str, client: str | int | None = None) -> DatastorePayload:
         origin_client = _client_string(client)
+        refresh: DatastorePayload | None = None
         self._acquire_foreground_io()
         try:
             response = self.datastore.post(path, json_body, client=client)
             payload = self._payload_from_response(response)
-            refresh = self._read_locked(self.poll_path, etag="0", client=None)
+            try:
+                refresh = self._read_locked(self.poll_path, etag="0", client=None)
+                self.last_poller_error = None
+            except Exception as exc:
+                self.last_poller_error = exc
         finally:
             self._release_io()
-        self._publish_payload(refresh, origin_client=origin_client)
+        if refresh is not None:
+            self._publish_payload(refresh, origin_client=origin_client)
         return payload
 
     def wait_for_change(
@@ -520,12 +557,18 @@ class DatastoreCoordinator:
                         self.poll_path,
                         etag=etag,
                         timeout_ms=self.long_poll_timeout_ms,
+                        should_cancel=self._is_closed,
+                        read_timeout_slice_ms=self.poll_read_timeout_slice_ms,
                     )
                     payload = self._payload_from_response(response)
                 finally:
                     self._release_io()
                 self.last_poller_error = None
                 self._publish_payload(payload, origin_client=None, from_etag=etag)
+            except DatastoreCancelled as exc:
+                if self._is_closed():
+                    return
+                self.last_poller_error = exc
             except (DatastoreNoResponse, DatastoreTimeout) as exc:
                 self.last_poller_error = exc
             except Exception as exc:
@@ -534,6 +577,10 @@ class DatastoreCoordinator:
                 if self._closed:
                     return
                 self._condition.wait(self.poll_interval_s)
+
+    def _is_closed(self) -> bool:
+        with self._condition:
+            return self._closed
 
     def _read_locked(
         self,

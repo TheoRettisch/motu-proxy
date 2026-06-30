@@ -298,6 +298,27 @@ class DatastoreCoordinatorTests(TestCase):
         self.assertEqual(other.etag, "2")
         self.assertTrue(own.not_modified)
 
+    def test_post_returns_write_response_when_refresh_fails(self) -> None:
+        transport = FakeTransport(
+            [
+                response_packet(b'HTTP/1.1 200 OK\r\nETag: 2\r\n\r\n{"post":true}'),
+            ]
+        )
+        coordinator = DatastoreCoordinator(
+            MotuUsbDatastore(transport),
+            http_wait_timeout_ms=1,
+        )
+
+        returned = coordinator.post("/datastore/host/os", '{"value":"linux"}', client="7")
+
+        self.assertEqual(returned.body, b'{"post":true}')
+        self.assertEqual(returned.etag, "2")
+        self.assertIsInstance(coordinator.last_poller_error, DatastoreNoResponse)
+        self.assertEqual(
+            transport.writes[2],
+            build_get_frame(0x22, 3, "/datastore"),
+        )
+
     def test_client_filter_suppresses_proxy_originated_own_change(self) -> None:
         transport = FakeTransport([response_packet(b'HTTP/1.1 200 OK\r\nETag: 1\r\n\r\n{"state":1}')])
         coordinator = DatastoreCoordinator(
@@ -353,6 +374,36 @@ class DatastoreCoordinatorTests(TestCase):
             thread.join(timeout=1)
 
             self.assertEqual([result.body for result in results], [b'{"value":"ok"}'])
+        finally:
+            coordinator.close()
+
+    def test_close_waits_for_blocked_long_poll_to_exit(self) -> None:
+        transport = BlockingTransport()
+        coordinator = DatastoreCoordinator(
+            MotuUsbDatastore(transport),
+            long_poll_timeout_ms=1000,
+            poll_read_timeout_slice_ms=20,
+            poll_interval_s=0,
+        )
+        coordinator.start()
+        try:
+            self.assertTrue(transport.wait_for_writes(1))
+            deadline = time.monotonic() + 1
+            while time.monotonic() < deadline:
+                with transport._condition:
+                    if transport.read_timeouts:
+                        break
+                time.sleep(0.005)
+            else:
+                self.fail("poller did not block in a USB read")
+
+            started = time.monotonic()
+            coordinator.close()
+            elapsed = time.monotonic() - started
+
+            self.assertLess(elapsed, 0.5)
+            assert coordinator._worker is not None
+            self.assertFalse(coordinator._worker.is_alive())
         finally:
             coordinator.close()
 

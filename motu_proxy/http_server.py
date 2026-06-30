@@ -23,12 +23,15 @@ from .device import DeviceDiscoveryError
 from .json_body import InvalidJsonBody, validate_json_body
 from .paths import normalize_path
 from .parser import DatastorePayload, ResponseFrameError
+from .protocol import ProtocolFrameTooLarge, validate_post_frame_size
 
 
 DatastoreRead = Callable[..., bytes | DatastorePayload]
 DatastoreWrite = Callable[[str, str, str | None], bytes | DatastorePayload]
 WriteLogger = Callable[[str, str, str], None]
-DEFAULT_MAX_WRITE_BODY_BYTES = 64 * 1024
+# Keep the default comfortably below the protocol's single-frame u16 limits.
+# Path/client-specific validation below catches exact frame overflows.
+DEFAULT_MAX_WRITE_BODY_BYTES = 60 * 1024
 WRITE_TOKEN_HEADER = "X-Motu-Proxy-Token"
 MAX_CLIENT_ID = 0xFFFFFFFF
 
@@ -171,6 +174,7 @@ def dispatch_datastore_request(
     validate_write_token(method, allow_writes, write_token, request_token)
     write_body = parse_write_body(raw_body, content_type)
     validate_json_body(write_body)
+    validate_post_frame_size(path, write_body, client=client)
     if log_write is not None:
         log_write(method, path, write_body)
     # HTTP PATCH is a compatibility alias for the MOTU datastore POST write.
@@ -289,6 +293,8 @@ class MotuProxyHandler(BaseHTTPRequestHandler):
         except (WritesDisabled, CrossOriginWrite, HostNotAllowed, WriteTokenRequired) as exc:
             self.send_json_error(403, str(exc))
         except RequestBodyTooLarge as exc:
+            self.send_json_error(413, str(exc))
+        except ProtocolFrameTooLarge as exc:
             self.send_json_error(413, str(exc))
         except (BadRequest, InvalidJsonBody) as exc:
             self.send_json_error(400, str(exc))

@@ -123,6 +123,19 @@ class CliServeSecurityTests(TestCase):
             if os.name != "nt":
                 self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), 0o600)
 
+    @skipIf(not hasattr(os, "symlink"), "symlinks are not supported on this platform")
+    def test_write_token_file_refuses_symlink(self) -> None:
+        with TemporaryDirectory() as tmp:
+            target = Path(tmp) / "target"
+            link = Path(tmp) / "write-token"
+            target.write_text("keep\n", encoding="ascii")
+            os.symlink(target, link)
+
+            with self.assertRaisesRegex(RuntimeError, "symlink"):
+                write_token_file(link, "secret-token")
+
+            self.assertEqual(target.read_text(encoding="ascii"), "keep\n")
+
     def test_prepare_write_token_writes_generated_token_to_file(self) -> None:
         with TemporaryDirectory() as tmp:
             path = Path(tmp) / "write-token"
