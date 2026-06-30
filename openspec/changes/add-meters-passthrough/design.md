@@ -9,7 +9,7 @@ The spike (`research/spike-metering/findings.md`) established the full `/meters`
 **Goals:**
 
 - Faithfully transport the device's `/meters` resource over USB and HTTP: issue the right request (path + `meters` query field) and return the device's response and ETag unchanged.
-- Generalize query-field encoding so meters — and any future query parameter — work without special-casing.
+- Generalize query-field encoding so meters — and any future GET query parameter — work without special-casing.
 - Keep `/meters` routing consistent with the device (top-level, no datastore prefix).
 - Preserve HTTP query ordering so the USB frame is a faithful representation of the incoming request.
 - Forward meter `If-None-Match` to the device as a one-shot request rather than using datastore long-poll state.
@@ -39,9 +39,9 @@ Alternative considered: a generic "don't prefix any unknown top-level resource" 
 
 ### Forward HTTP query parameters as USB query fields
 
-The HTTP layer already extracts `client` from the query string; extend GET dispatch to preserve the parsed query pair order and forward query parameters to the datastore request, which encodes them as USB query fields. This bridges the network form `GET /meters?meters=mix/level` to the USB query-field form. The proxy never places the query string in the USB path (the device `404`s on that).
+The HTTP layer already extracts `client` from the query string; extend GET dispatch to preserve the parsed query pair order and forward query parameters to the datastore request, which encodes them as USB query fields. This applies to datastore and `/meters` GET requests. It bridges the network form `GET /meters?meters=mix/level` to the USB query-field form. The proxy never places the query string in the USB path (the device `404`s on that).
 
-Existing `client` validation should remain in force where it exists today. For non-`client` GET query parameters, the proxy should decode and forward the field name/value without validation or interpretation.
+Existing `client` validation should remain in force where it exists today, including the current 32-bit unsigned integer bounds check before forwarding. For non-`client` GET query parameters, the proxy should decode and forward the field name/value without validation or interpretation.
 
 ### Use a one-shot meters read path, not datastore long-poll history
 
@@ -55,7 +55,7 @@ A `meters` CLI command issues exactly one `/meters?meters=<group>` read and prin
 
 ## Risks / Trade-offs
 
-- **Single-pipe contention (cross-reference, not solved here):** a consumer polling meters shares the one USB bulk pipe with datastore reads/writes and the long-poll coordinator (whose ~15 s lock-hold is a known issue). The proxy only transports; the consumer must budget its meter rate, and the coordinator lock-hold should be fixed independently.
+- **Single-pipe contention (cross-reference, not solved here):** a consumer polling meters shares the one USB bulk pipe with datastore reads/writes and the long-poll coordinator (whose ~15 s lock-hold is a known issue). The proxy only transports; this change must not introduce any meter polling. The consumer must budget its meter rate, and `avoid-long-poll-foreground-blocking` should land before recommending a high-rate meter consumer through the proxy.
 - **Fixtures:** generalizing `query_fields` must keep the single-`client` encoding byte-identical so existing protocol fixtures and `add-datastore-http-api-compat` behavior do not change. Locked with a test.
 - **Forward-compatibility:** the proxy forwards any `meters=` group value unmodified (it does not validate group names), so new meter groups in future firmware work without a proxy change — consistent with the datastore passthrough philosophy.
 
@@ -66,7 +66,7 @@ A `meters` CLI command issues exactly one `/meters?meters=<group>` read and prin
 3. In the HTTP layer, forward parsed GET query parameters (incl. `meters`) as query fields to the device read; keep write query behavior unchanged except for existing `client`.
 4. Route `/meters` reads with `If-None-Match` as one-shot device reads rather than local datastore long-polls; return body/status + meter ETag.
 5. Add the single-shot `meters` CLI read.
-6. Tests: query-field encoding (incl. unchanged `client` fixture), query ordering, `/meters` routing, HTTP `?meters=` → USB query field, meter `If-None-Match` one-shot behavior, ETag exposure, no-poll/no-interpretation.
+6. Tests: query-field encoding (incl. unchanged `client` fixture), preserved `client` validation, non-`client` datastore GET query passthrough, query ordering, `/meters` routing, HTTP `?meters=` -> USB query field with USB path `/meters`, meter `If-None-Match` one-shot behavior with no coordinator wait, ETag exposure, no-poll/no-interpretation.
 7. Validate on the live 624 over USB: `GET /meters?meters=mix/level` through the proxy returns the device's meter JSON and ETag.
 
 ## Open Questions

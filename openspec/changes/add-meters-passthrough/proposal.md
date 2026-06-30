@@ -33,3 +33,4 @@ Scope is deliberately narrow. This keeps `motu-proxy` a **schema-aware proxy** â
 - Affected APIs: `GET /meters?meters=<group>` now works through the proxy; existing datastore and `client` behavior are unchanged.
 - Affected systems: meter clients (the separate polling project) that point at the proxy instead of the device's network port; validated against the live 624 over USB.
 - Dependencies: builds on the already-implemented `add-datastore-http-api-compat` (ETag and `client` plumbing). Standard library only.
+- Operational sequencing: this change must not introduce polling; land `avoid-long-poll-foreground-blocking` before recommending high-rate meter consumers through the proxy.

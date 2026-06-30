@@ -1,7 +1,7 @@
 ## ADDED Requirements
 
 ### Requirement: Generalized USB query fields
-The system SHALL encode arbitrary query parameters as ordered USB query fields in datastore and meters GET frames, not only the `client` parameter, and SHALL keep the single-`client` encoding byte-compatible with prior behavior.
+The system SHALL encode arbitrary GET query parameters as ordered USB query fields in datastore and meters GET frames, not only the `client` parameter, and SHALL keep the single-`client` encoding byte-compatible with prior behavior. Existing `client` validation SHALL remain in force before forwarding `client` as a USB query field.
 
 #### Scenario: Meters query field is encoded
 - **WHEN** a meters request carries a `meters=mix/level` query parameter
@@ -10,6 +10,14 @@ The system SHALL encode arbitrary query parameters as ordered USB query fields i
 #### Scenario: Existing client encoding is unchanged
 - **WHEN** a request carries only `client=<number>`
 - **THEN** the resulting GET frame bytes are identical to the prior single-`client` encoding
+
+#### Scenario: Client query validation is preserved
+- **WHEN** an HTTP GET request includes a `client` query parameter
+- **THEN** the proxy applies the existing 32-bit unsigned integer validation before forwarding it as a USB query field
+
+#### Scenario: Non-client datastore GET query fields are forwarded
+- **WHEN** a datastore GET request includes an unknown non-`client` query parameter
+- **THEN** the proxy forwards that parameter as a USB query field without validation or interpretation
 
 #### Scenario: Multiple query fields
 - **WHEN** a request carries both `meters=mix/level` and `client=<number>` in that order
@@ -33,6 +41,11 @@ The system SHALL forward an HTTP `GET /meters?meters=<group>` to the device over
 - **WHEN** a client sends `GET /meters?meters=mix/level` to the proxy
 - **THEN** the proxy issues the corresponding USB meters request and returns the device's meter response body with the meter ETag in the `ETag` header
 
+#### Scenario: Meters query is not appended to the USB path
+- **WHEN** a client sends `GET /meters?meters=mix/level` to the proxy
+- **THEN** the USB request path is `/meters`
+- **AND** `meters=mix/level` is encoded only as a USB query field
+
 #### Scenario: Unrecognized meter group is forwarded
 - **WHEN** a client requests a meter group the proxy does not recognize
 - **THEN** the proxy forwards the group value to the device unchanged, without validation or interpretation
@@ -40,6 +53,7 @@ The system SHALL forward an HTTP `GET /meters?meters=<group>` to the device over
 #### Scenario: Meter If-None-Match is forwarded to the device
 - **WHEN** a client sends `GET /meters?meters=mix/level` with an `If-None-Match` header
 - **THEN** the proxy forwards that ETag to the device in a single USB meters request and does not wait on datastore long-poll history
+- **AND** the datastore coordinator wait path is not invoked
 
 ### Requirement: Meters pass-through without interpretation or polling
 The system SHALL pass meter requests and responses through without interpreting meter values, mapping channels, or running a background meter poll loop. Continuous polling and any typed meter model are out of scope for the proxy.
