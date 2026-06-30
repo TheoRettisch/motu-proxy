@@ -47,6 +47,21 @@ class DatastoreTests(TestCase):
         self.assertEqual(transport.writes[0], build_get_frame(0x20, 2, "/datastore/uid"))
         self.assertEqual(transport.writes[1], bytes.fromhex("21 81 04 00"))
 
+    def test_get_forwards_client_identifier(self) -> None:
+        transport = FakeTransport([response_packet(b'{"value":"ok"}')])
+        datastore = MotuUsbDatastore(transport)
+        datastore.get("/datastore/uid", client=1479701624)
+        self.assertEqual(
+            transport.writes[0],
+            build_get_frame(0x20, 2, "/datastore/uid", client=1479701624),
+        )
+
+    def test_get_records_response_etag(self) -> None:
+        transport = FakeTransport([response_packet(b'HTTP/1.1 200 OK\r\nETag: 5678\r\n\r\n{"value":"ok"}')])
+        datastore = MotuUsbDatastore(transport)
+        datastore.get("/datastore/uid")
+        self.assertEqual(datastore.last_response_etag, "5678")
+
     def test_get_collects_response_frames_read_during_ack_drain(self) -> None:
         first = response_packet(b'{"first":true}', final=False, segment_index=0, wrapper_seq=0x40)
         second = response_packet(b'{"second":true}', final=True, segment_index=1, wrapper_seq=0x41)
@@ -92,6 +107,15 @@ class DatastoreTests(TestCase):
         datastore = MotuUsbDatastore(transport)
         datastore.post("/datastore/host/os", '{"value":"linux"}')
         self.assertEqual(transport.writes[0], build_post_frame(0x20, 2, "/datastore/host/os", '{"value":"linux"}'))
+
+    def test_post_forwards_client_identifier(self) -> None:
+        transport = FakeTransport([response_packet(b'{"ok":true}')])
+        datastore = MotuUsbDatastore(transport)
+        datastore.post("/datastore/host/os", '{"value":"linux"}', client=1479701624)
+        self.assertEqual(
+            transport.writes[0],
+            build_post_frame(0x20, 2, "/datastore/host/os", '{"value":"linux"}', client=1479701624),
+        )
 
     def test_get_rejects_response_with_wrong_message_sequence(self) -> None:
         transport = FakeTransport([response_packet(b'{"value":"wrong"}', message_seq=3)])

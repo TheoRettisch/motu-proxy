@@ -2,12 +2,15 @@ from unittest import TestCase
 
 from motu_proxy.parser import (
     ResponseFrameError,
+    datastore_payload,
     extract_json_bytes,
+    extract_response_etag,
     is_device_ack,
     join_response_frames,
     parse_response_frame,
     response_to_text,
 )
+from motu_proxy.protocol import sized_word, u32
 from motu_proxy.paths import normalize_path
 
 from tests.helpers import response_packet
@@ -82,6 +85,38 @@ class ParserTests(TestCase):
 
     def test_response_to_text_can_pretty_print(self) -> None:
         self.assertIn('"value": "ok"', response_to_text(b'{"value":"ok"}'))
+
+    def test_extract_response_etag_from_sized_header_words(self) -> None:
+        metadata = (
+            u32(200)
+            + u32(3)
+            + sized_word("Access-Control-Expose-Headers")
+            + sized_word("ETag")
+            + sized_word("Cache-Control")
+            + sized_word("no-cache")
+            + sized_word("ETag")
+            + sized_word("5678")
+        )
+        payload = (
+            b"UTOM"
+            + u32(8)
+            + u32(1)
+            + u32(0)
+            + u32(len(metadata))
+            + metadata
+            + b'{"value":"ok"}'
+        )
+        response = join_response_frames([response_packet(payload)], expected_message_seq=2)
+        self.assertEqual(extract_response_etag(response), "5678")
+
+    def test_extract_response_etag_from_http_header_text(self) -> None:
+        response = b"HTTP/1.1 200 OK\r\nETag: 5678\r\nCache-Control: no-cache\r\n\r\n{}"
+        self.assertEqual(extract_response_etag(response), "5678")
+
+    def test_datastore_payload_keeps_json_body_and_etag(self) -> None:
+        payload = datastore_payload(b"HTTP/1.1 200 OK\r\nETag: 5678\r\n\r\n{\"value\":\"ok\"}")
+        self.assertEqual(payload.body, b'{"value":"ok"}')
+        self.assertEqual(payload.etag, "5678")
 
 
 class PathTests(TestCase):

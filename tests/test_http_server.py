@@ -20,6 +20,7 @@ from motu_proxy.http_server import (
     response_content_type,
 )
 from motu_proxy.json_body import InvalidJsonBody
+from motu_proxy.parser import DatastorePayload
 
 
 WRITE_TOKEN = "test-write-token"
@@ -55,11 +56,11 @@ class HttpServerTests(TestCase):
     ):
         calls: list[tuple[str, str, str | None]] = []
 
-        def get(path: str) -> bytes:
+        def get(path: str, client: str | None = None) -> bytes:
             calls.append(("GET", path, None))
             return b'{"value":"0001f2fffe00c719"}'
 
-        def post(path: str, body: str) -> bytes:
+        def post(path: str, body: str, client: str | None = None) -> bytes:
             calls.append(("POST", path, body))
             return b'{"ok":true}'
 
@@ -89,6 +90,56 @@ class HttpServerTests(TestCase):
         self.assertEqual(result.path, "/datastore/uid")
         self.assertEqual(calls, [("GET", "/datastore/uid", None)])
 
+    def test_get_response_shapes_are_forwarded_verbatim(self) -> None:
+        cases = [
+            ("/datastore/uid", b'{"value":"0001f2fffe00c719"}'),
+            ("/datastore/mix/chan/0/gate", b'{"enable":{"value":0},"threshold":{"value":-60}}'),
+            ("/datastore", b'{"uid":{"value":"0001f2fffe00c719"},"host":{"mode":{"value":"UAC"}}}'),
+        ]
+        for request_path, body in cases:
+            with self.subTest(request_path=request_path):
+                result = dispatch_datastore_request(
+                    "GET",
+                    request_path,
+                    "",
+                    "",
+                    False,
+                    lambda path, client=None, body=body: body,
+                    lambda path, body, client=None: b"{}",
+                )
+                self.assertEqual(result.response, body)
+
+    def test_get_forwards_client_identifier(self) -> None:
+        calls: list[tuple[str, str | None]] = []
+
+        def get(path: str, client: str | None = None) -> bytes:
+            calls.append((path, client))
+            return b'{"value":"0001f2fffe00c719"}'
+
+        result = dispatch_datastore_request(
+            "GET",
+            "/uid?client=1479701624",
+            "",
+            "",
+            False,
+            get,
+            lambda path, body, client=None: b"{}",
+        )
+        self.assertEqual(result.path, "/datastore/uid")
+        self.assertEqual(calls, [("/datastore/uid", "1479701624")])
+
+    def test_invalid_client_identifier_is_rejected(self) -> None:
+        with self.assertRaisesRegex(BadRequest, "client"):
+            dispatch_datastore_request(
+                "GET",
+                "/uid?client=-1",
+                "",
+                "",
+                False,
+                lambda path, client=None: b"{}",
+                lambda path, body, client=None: b"{}",
+            )
+
     def test_writes_rejected_by_default(self) -> None:
         with self.assertRaises(WritesDisabled):
             self.dispatch("POST", "/datastore/uid", body='{"value":"x"}')
@@ -104,6 +155,28 @@ class HttpServerTests(TestCase):
         self.assertEqual(result.response, b'{"ok":true}')
         self.assertEqual(calls, [("POST", "/datastore/host/os", '{"value":"linux"}')])
 
+    def test_post_forwards_client_identifier(self) -> None:
+        calls: list[tuple[str, str, str | None]] = []
+
+        def post(path: str, body: str, client: str | None = None) -> bytes:
+            calls.append((path, body, client))
+            return b'{"ok":true}'
+
+        result = dispatch_datastore_request(
+            "POST",
+            "/host/os?client=1479701624",
+            '{"value":"linux"}',
+            "application/json",
+            True,
+            lambda path, client=None: b"{}",
+            post,
+            host="127.0.0.1:1280",
+            write_token=WRITE_TOKEN,
+            request_token=WRITE_TOKEN,
+        )
+        self.assertEqual(result.path, "/datastore/host/os")
+        self.assertEqual(calls, [("/datastore/host/os", '{"value":"linux"}', "1479701624")])
+
     def test_patch_is_post_alias_not_partial_update(self) -> None:
         result, calls = self.dispatch("PATCH", "/host/os", body='{"value":"linux"}', allow_writes=True)
         self.assertEqual(result.response, b'{"ok":true}')
@@ -112,11 +185,11 @@ class HttpServerTests(TestCase):
     def test_cross_origin_write_is_rejected_when_writes_are_enabled(self) -> None:
         calls: list[tuple[str, str, str | None]] = []
 
-        def get(path: str) -> bytes:
+        def get(path: str, client: str | None = None) -> bytes:
             calls.append(("GET", path, None))
             return b"{}"
 
-        def post(path: str, body: str) -> bytes:
+        def post(path: str, body: str, client: str | None = None) -> bytes:
             calls.append(("POST", path, body))
             return b"{}"
 
@@ -212,11 +285,11 @@ class HttpServerTests(TestCase):
     def test_dispatcher_serializes_access_with_lock(self) -> None:
         calls: list[tuple[str, str]] = []
 
-        def get(path: str) -> bytes:
+        def get(path: str, client: str | None = None) -> bytes:
             calls.append(("GET", path))
             return b"{}"
 
-        def post(path: str, body: str) -> bytes:
+        def post(path: str, body: str, client: str | None = None) -> bytes:
             calls.append(("POST", path))
             return b"{}"
 
@@ -231,8 +304,8 @@ class HttpServerTests(TestCase):
         logs: list[tuple[str, str, str]] = []
         dispatcher = DatastoreDispatcher(
             False,
-            lambda path: b"{}",
-            lambda path, body: b"{}",
+            lambda path, client=None: b"{}",
+            lambda path, body, client=None: b"{}",
             log_write=lambda method, path, body: logs.append((method, path, body)),
             lock=RecordingLock(),
         )
@@ -244,8 +317,8 @@ class HttpServerTests(TestCase):
         logs: list[tuple[str, str, str]] = []
         dispatcher = DatastoreDispatcher(
             True,
-            lambda path: b"{}",
-            lambda path, body: b"{}",
+            lambda path, client=None: b"{}",
+            lambda path, body, client=None: b"{}",
             write_token=WRITE_TOKEN,
             log_write=lambda method, path, body: logs.append((method, path, body)),
             lock=RecordingLock(),
@@ -265,8 +338,8 @@ class HttpServerTests(TestCase):
         logs: list[tuple[str, str, str]] = []
         dispatcher = DatastoreDispatcher(
             True,
-            lambda path: b"{}",
-            lambda path, body: b"{}",
+            lambda path, client=None: b"{}",
+            lambda path, body, client=None: b"{}",
             write_token=WRITE_TOKEN,
             log_write=lambda method, path, body: logs.append((method, path, body)),
             lock=RecordingLock(),
@@ -284,7 +357,7 @@ class HttpServerTests(TestCase):
     def test_invalid_write_json_is_rejected_before_usb_call(self) -> None:
         calls: list[tuple[str, str]] = []
 
-        def post(path: str, body: str) -> bytes:
+        def post(path: str, body: str, client: str | None = None) -> bytes:
             calls.append((path, body))
             return b"{}"
 
@@ -295,7 +368,7 @@ class HttpServerTests(TestCase):
                 '{"value":',
                 "application/json",
                 True,
-                lambda path: b"{}",
+                lambda path, client=None: b"{}",
                 post,
                 host="127.0.0.1:1280",
                 write_token=WRITE_TOKEN,
@@ -340,7 +413,32 @@ class HttpHandlerTests(TestCase):
         handler.handle_datastore_request("GET")
         self.assertEqual(handler.statuses, [200])
         self.assertIn(("Content-Type", "application/octet-stream"), handler.sent_headers)
+        self.assertIn(("Cache-Control", "no-cache"), handler.sent_headers)
         self.assertEqual(handler.wfile.getvalue(), b'{"first":true}{"second":true}')
+
+    def test_handler_emits_etag_for_get_response(self) -> None:
+        class Dispatcher:
+            def dispatch(self, *args, **kwargs):
+                return DispatchResult(b'{"value":"ok"}', "/datastore/uid", etag="5678")
+
+        handler = self.make_handler(dispatcher=Dispatcher())
+        handler.handle_datastore_request("GET")
+        self.assertEqual(handler.statuses, [200])
+        self.assertIn(("Cache-Control", "no-cache"), handler.sent_headers)
+        self.assertIn(("ETag", "5678"), handler.sent_headers)
+
+    def test_dispatch_accepts_datastore_payload_metadata(self) -> None:
+        result = dispatch_datastore_request(
+            "GET",
+            "/uid",
+            "",
+            "",
+            False,
+            lambda path, client=None: DatastorePayload(b'{"value":"ok"}', etag="5678"),
+            lambda path, body, client=None: b"{}",
+        )
+        self.assertEqual(result.response, b'{"value":"ok"}')
+        self.assertEqual(result.etag, "5678")
 
     def test_handler_returns_json_403_when_token_is_missing(self) -> None:
         class Dispatcher:

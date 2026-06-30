@@ -57,6 +57,12 @@ def sized_word(value: str | bytes) -> bytes:
     return u32(len(value)) + value
 
 
+def query_fields(client: str | int | None = None) -> bytes:
+    if client is None:
+        return u32(0)
+    return u32(1) + sized_word("client") + sized_word(str(client))
+
+
 def next_host_seq(seq: int) -> int:
     return ((seq + 1 - HOST_SEQ_MIN) % HOST_SEQ_COUNT) + HOST_SEQ_MIN
 
@@ -84,27 +90,41 @@ def build_motu_frame(seq: int, header: str, message_seq: int, motu_payload: byte
     return bytes([seq & 0xFF, 0x80]) + u16(len(body) + 4) + body
 
 
-def build_get_frame(seq: int, message_seq: int, path: str, etag: str = "0", header: str = "NREK") -> bytes:
+def build_get_frame(
+    seq: int,
+    message_seq: int,
+    path: str,
+    etag: str = "0",
+    header: str = "NREK",
+    client: str | int | None = None,
+) -> bytes:
     request = (
         sized_word("GET")
         + sized_word(path)
         + u32(1)
         + sized_word("If-None-Match")
         + sized_word(etag)
-        + u32(0)
+        + query_fields(client)
     )
     motu_payload = b"UTOM" + u32(8) + u32(1) + u32(0) + u32(len(request)) + request
     return build_motu_frame(seq, header, message_seq, motu_payload)
 
 
-def build_post_frame(seq: int, message_seq: int, path: str, json_body: str, header: str = "NREK") -> bytes:
+def build_post_frame(
+    seq: int,
+    message_seq: int,
+    path: str,
+    json_body: str,
+    header: str = "NREK",
+    client: str | int | None = None,
+) -> bytes:
     request = (
         sized_word("POST")
         + sized_word(path)
         + u32(1)
         + sized_word("Unsecure-Auth-MOTU")
         + sized_word("unicorn666")
-        + u32(0)
+        + query_fields(client)
     )
     body = sized_word("json") + sized_word(json_body)
     motu_payload = b"UTOM" + u32(8) + u32(1) + u32(0) + u32(len(request)) + request + u32(len(body)) + body

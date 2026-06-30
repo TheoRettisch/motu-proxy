@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Iterator, Protocol
 
 from .device import DEFAULT_DEVFS_ROOT, DEFAULT_SYSFS_ROOT, find_motu_device
-from .parser import is_device_ack, join_response_frames, parse_response_frame
+from .parser import extract_response_etag, is_device_ack, join_response_frames, parse_response_frame
 from .protocol import (
     DEFAULT_MAX_USB_CHUNK,
     DEFAULT_MESSAGE_SEQ,
@@ -102,6 +102,7 @@ class MotuUsbDatastore:
         self.host_seq = HostSequencer(seq_start)
         self.message_seq = message_seq
         self.last_response_stats: ResponseStats | None = None
+        self.last_response_etag: str | None = None
 
     def _next_host_seq(self) -> int:
         return self.host_seq.take()
@@ -115,16 +116,16 @@ class MotuUsbDatastore:
         self._write_frame(build_init(self._next_host_seq()))
         self._drain_quiet(quiet_reads=1, timeout_ms=200)
 
-    def get(self, path: str, etag: str = "0") -> bytes:
+    def get(self, path: str, etag: str = "0", client: str | int | None = None) -> bytes:
         message_seq = self.message_seq
-        frame = build_get_frame(self._next_host_seq(), message_seq, path, etag=etag)
+        frame = build_get_frame(self._next_host_seq(), message_seq, path, etag=etag, client=client)
         self.message_seq += 1
         self._write_frame(frame)
         return self._collect_response(message_seq)
 
-    def post(self, path: str, json_body: str) -> bytes:
+    def post(self, path: str, json_body: str, client: str | int | None = None) -> bytes:
         message_seq = self.message_seq
-        frame = build_post_frame(self._next_host_seq(), message_seq, path, json_body)
+        frame = build_post_frame(self._next_host_seq(), message_seq, path, json_body, client=client)
         self.message_seq += 1
         self._write_frame(frame)
         return self._collect_response(message_seq)
@@ -161,6 +162,7 @@ class MotuUsbDatastore:
         max_response_frames: int = DEFAULT_MAX_RESPONSE_FRAMES,
     ) -> bytes:
         self.last_response_stats = None
+        self.last_response_etag = None
         frames: list[bytes] = []
         total = 0
         quiet_reads = 0
@@ -307,6 +309,7 @@ class MotuUsbDatastore:
                 )
             )
         response = join_response_frames(frames, expected_message_seq)
+        self.last_response_etag = extract_response_etag(response)
         self._record_response_stats(
             timeout_ms,
             started,

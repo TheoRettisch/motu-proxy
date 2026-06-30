@@ -16,7 +16,7 @@ from .device import DEFAULT_DEVFS_ROOT, DEFAULT_SYSFS_ROOT, UsbDeviceInfo, find_
 from .fixtures import EXPECTED_GET_DATASTORE, EXPECTED_POST_HOST_OS
 from .http_server import DEFAULT_MAX_WRITE_BODY_BYTES, MotuProxyServer, serve
 from .json_body import validate_json_body
-from .parser import response_to_text
+from .parser import DatastorePayload, datastore_payload, response_to_text
 from .paths import normalize_path
 from .protocol import (
     DEFAULT_MESSAGE_SEQ,
@@ -185,13 +185,15 @@ def command_serve(args) -> int:
     config = config_from_args(args)
     validate_serve_write_safety(args.listen, args.allow_writes, args.unsafe_allow_remote_writes)
 
-    def run_get(path: str) -> bytes:
+    def run_get(path: str, client: str | None = None) -> DatastorePayload:
         with open_datastore(config) as datastore:
-            return datastore.get(path)
+            response = datastore.get(path, client=client)
+            return datastore_payload(response)
 
-    def run_post(path: str, json_body: str) -> bytes:
+    def run_post(path: str, json_body: str, client: str | None = None) -> DatastorePayload:
         with open_datastore(config) as datastore:
-            return datastore.post(path, json_body)
+            response = datastore.post(path, json_body, client=client)
+            return datastore_payload(response)
 
     write_token, write_token_file_path = (
         prepare_write_token(args.write_token_file) if args.allow_writes else (None, None)

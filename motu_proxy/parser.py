@@ -25,6 +25,12 @@ class ResponseFrame:
     payload: bytes
 
 
+@dataclass(frozen=True)
+class DatastorePayload:
+    body: bytes
+    etag: str | None = None
+
+
 def is_device_ack(packet: bytes) -> bool:
     return len(packet) == 8 and packet[:4] == packet[4:] and packet[1] == 0 and packet[2:4] == b"\x08\x00"
 
@@ -141,6 +147,93 @@ def extract_json_bytes(response: bytes) -> bytes | None:
             if depth == 0:
                 return response[start : index + 1]
     return None
+
+
+def extract_response_etag(response: bytes) -> str | None:
+    return (
+        _extract_utom_header_value(response, "ETag")
+        or _extract_sized_header_value(response, "ETag")
+        or _extract_text_header_value(response, "ETag")
+    )
+
+
+def datastore_payload(response: bytes) -> DatastorePayload:
+    return DatastorePayload(body=extract_json_bytes(response) or response, etag=extract_response_etag(response))
+
+
+def _extract_sized_header_value(response: bytes, header_name: str) -> str | None:
+    header = header_name.encode("ascii")
+    needle = struct.pack("<I", len(header)) + header
+    offset = 0
+    while True:
+        index = response.find(needle, offset)
+        if index < 0:
+            return None
+        value_offset = index + len(needle)
+        if value_offset + 4 <= len(response):
+            value_len = _u32(response, value_offset)
+            value_end = value_offset + 4 + value_len
+            if 0 < value_len <= 1024 and value_end <= len(response):
+                value = response[value_offset + 4 : value_end]
+                decoded = _decode_header_value(value)
+                if decoded is not None:
+                    return decoded
+        offset = index + 1
+
+
+def _extract_utom_header_value(response: bytes, header_name: str) -> str | None:
+    if len(response) < 28 or not response.startswith(b"UTOM"):
+        return None
+    metadata_len = _u32(response, 16)
+    metadata_start = 20
+    metadata_end = metadata_start + metadata_len
+    if metadata_end > len(response) or metadata_len < 8:
+        return None
+
+    header_count = _u32(response, 24)
+    offset = 28
+    wanted = header_name.lower()
+    for _ in range(header_count):
+        name, offset = _read_sized_value(response, offset, metadata_end)
+        value, offset = _read_sized_value(response, offset, metadata_end)
+        if name is None or value is None:
+            return None
+        decoded_name = _decode_header_value(name)
+        if decoded_name is not None and decoded_name.lower() == wanted:
+            return _decode_header_value(value)
+    return None
+
+
+def _read_sized_value(data: bytes, offset: int, end: int) -> tuple[bytes | None, int]:
+    if offset + 4 > end:
+        return None, offset
+    size = _u32(data, offset)
+    value_start = offset + 4
+    value_end = value_start + size
+    if size > 4096 or value_end > end:
+        return None, offset
+    return data[value_start:value_end], value_end
+
+
+def _extract_text_header_value(response: bytes, header_name: str) -> str | None:
+    text = response.decode("iso-8859-1", errors="ignore")
+    wanted = header_name.lower()
+    for line in text.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        name, separator, value = line.partition(":")
+        if separator and name.strip().lower() == wanted:
+            value = value.strip()
+            return value or None
+    return None
+
+
+def _decode_header_value(value: bytes) -> str | None:
+    if any(byte < 0x20 or byte > 0x7E for byte in value):
+        return None
+    try:
+        decoded = value.decode("ascii").strip()
+    except UnicodeDecodeError:
+        return None
+    return decoded or None
 
 
 def response_to_text(response: bytes, pretty: bool = True) -> str:

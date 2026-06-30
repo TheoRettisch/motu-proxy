@@ -22,14 +22,15 @@ from .datastore import (
 from .device import DeviceDiscoveryError
 from .json_body import InvalidJsonBody, validate_json_body
 from .paths import normalize_path
-from .parser import ResponseFrameError
+from .parser import DatastorePayload, ResponseFrameError
 
 
-DatastoreRead = Callable[[str], bytes]
-DatastoreWrite = Callable[[str, str], bytes]
+DatastoreRead = Callable[[str, str | None], bytes | DatastorePayload]
+DatastoreWrite = Callable[[str, str, str | None], bytes | DatastorePayload]
 WriteLogger = Callable[[str, str, str], None]
 DEFAULT_MAX_WRITE_BODY_BYTES = 64 * 1024
 WRITE_TOKEN_HEADER = "X-Motu-Proxy-Token"
+MAX_CLIENT_ID = 0xFFFFFFFF
 
 
 class WritesDisabled(RuntimeError):
@@ -60,6 +61,7 @@ class BadRequest(RuntimeError):
 class DispatchResult:
     response: bytes
     path: str
+    etag: str | None = None
 
 
 def parse_write_body(raw: str, content_type: str) -> str:
@@ -76,6 +78,19 @@ def parse_write_body(raw: str, content_type: str) -> str:
         if values:
             return values[0]
     return raw
+
+
+def parse_client_query(request_path: str) -> str | None:
+    values = parse_qs(urlparse(request_path).query, keep_blank_values=True).get("client")
+    if not values:
+        return None
+    value = values[0].strip()
+    if not value.isdecimal():
+        raise BadRequest("client must be a 32-bit unsigned integer")
+    client = int(value, 10)
+    if client > MAX_CLIENT_ID:
+        raise BadRequest("client must be a 32-bit unsigned integer")
+    return str(client)
 
 
 def _origin_matches_host(origin: str, host: str) -> bool:
@@ -139,8 +154,10 @@ def dispatch_datastore_request(
     allow_remote_writes: bool = False,
 ) -> DispatchResult:
     path = normalize_path(urlparse(request_path).path)
+    client = parse_client_query(request_path)
     if method == "GET":
-        return DispatchResult(run_get(path), path)
+        payload = _datastore_payload(run_get(path, client))
+        return DispatchResult(payload.body, path, payload.etag)
     if not allow_writes:
         raise WritesDisabled("writes require --allow-writes")
     validate_write_host(method, allow_writes, host, allow_remote_writes)
@@ -151,7 +168,14 @@ def dispatch_datastore_request(
     if log_write is not None:
         log_write(method, path, write_body)
     # HTTP PATCH is a compatibility alias for the MOTU datastore POST write.
-    return DispatchResult(run_post(path, write_body), path)
+    payload = _datastore_payload(run_post(path, write_body, client))
+    return DispatchResult(payload.body, path, payload.etag)
+
+
+def _datastore_payload(value: bytes | DatastorePayload) -> DatastorePayload:
+    if isinstance(value, DatastorePayload):
+        return value
+    return DatastorePayload(value)
 
 
 def log_write_attempt(method: str, path: str, body: str) -> None:
@@ -237,6 +261,9 @@ class MotuProxyHandler(BaseHTTPRequestHandler):
             body = result.response
             self.send_response(200)
             self.send_header("Content-Type", response_content_type(body))
+            self.send_header("Cache-Control", "no-cache")
+            if method == "GET" and result.etag is not None:
+                self.send_header("ETag", result.etag)
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
