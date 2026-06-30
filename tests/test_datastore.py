@@ -1,12 +1,10 @@
 from unittest import TestCase
 
 from motu_proxy.datastore import MotuUsbDatastore, ShortUsbFrame, ShortUsbWrite
+from motu_proxy.parser import ResponseFrameError
 from motu_proxy.protocol import build_get_frame, build_post_frame
 
-
-def logical_packet(body: bytes) -> bytes:
-    total = len(body) + 4
-    return bytes([0x77, 0x00, total & 0xFF, total >> 8]) + body
+from tests.helpers import response_packet
 
 
 class FakeTransport:
@@ -31,8 +29,7 @@ class FakeTransport:
 
 class DatastoreTests(TestCase):
     def test_get_collects_response_and_acks(self) -> None:
-        body = b"NREK" + b"\x00" * 16 + b'{"value":"ok"}'
-        transport = FakeTransport([bytes.fromhex("20 00 08 00 20 00 08 00"), logical_packet(body)])
+        transport = FakeTransport([bytes.fromhex("20 00 08 00 20 00 08 00"), response_packet(b'{"value":"ok"}')])
         datastore = MotuUsbDatastore(transport)
         response = datastore.get("/datastore/uid")
         self.assertEqual(response, b'{"value":"ok"}')
@@ -40,9 +37,9 @@ class DatastoreTests(TestCase):
         self.assertEqual(transport.writes[1], bytes.fromhex("21 81 04 00"))
 
     def test_get_collects_response_frames_read_during_ack_drain(self) -> None:
-        first = b"NREK" + b"\x00" * 16 + b'{"first":true}'
-        second = b"NREK" + b"\x00" * 16 + b'{"second":true}'
-        transport = FakeTransport([logical_packet(first), logical_packet(second)])
+        first = response_packet(b'{"first":true}', final=False, segment_index=0, wrapper_seq=0x40)
+        second = response_packet(b'{"second":true}', final=True, segment_index=1, wrapper_seq=0x41)
+        transport = FakeTransport([first, second])
         datastore = MotuUsbDatastore(transport)
         response = datastore.get("/datastore")
         self.assertEqual(response, b'{"first":true}{"second":true}')
@@ -51,8 +48,7 @@ class DatastoreTests(TestCase):
         self.assertEqual(transport.writes[2], bytes.fromhex("22 81 04 00"))
 
     def test_get_rejects_partial_logical_frame_without_ack(self) -> None:
-        body = b"NREK" + b"\x00" * 16 + b'{"value":"partial"}'
-        transport = FakeTransport([logical_packet(body)[:-3]])
+        transport = FakeTransport([response_packet(b'{"value":"partial"}')[:-3]])
         datastore = MotuUsbDatastore(transport)
         with self.assertRaises(ShortUsbFrame):
             datastore.get("/datastore/uid")
@@ -66,8 +62,19 @@ class DatastoreTests(TestCase):
         self.assertEqual(transport.writes, [build_get_frame(0x20, 2, "/datastore/uid")])
 
     def test_post_uses_post_frame(self) -> None:
-        body = b"NREK" + b"\x00" * 16 + b'{"ok":true}'
-        transport = FakeTransport([logical_packet(body)])
+        transport = FakeTransport([response_packet(b'{"ok":true}')])
         datastore = MotuUsbDatastore(transport)
         datastore.post("/datastore/host/os", '{"value":"linux"}')
         self.assertEqual(transport.writes[0], build_post_frame(0x20, 2, "/datastore/host/os", '{"value":"linux"}'))
+
+    def test_get_rejects_response_with_wrong_message_sequence(self) -> None:
+        transport = FakeTransport([response_packet(b'{"value":"wrong"}', message_seq=3)])
+        datastore = MotuUsbDatastore(transport)
+        with self.assertRaises(ResponseFrameError):
+            datastore.get("/datastore/uid")
+        self.assertEqual(transport.writes, [build_get_frame(0x20, 2, "/datastore/uid")])
+
+    def test_get_allows_response_padding_after_logical_wrapper(self) -> None:
+        transport = FakeTransport([response_packet(b'{"value":"ok"}', padding=b"\x00")])
+        datastore = MotuUsbDatastore(transport)
+        self.assertEqual(datastore.get("/datastore/uid"), b'{"value":"ok"}')

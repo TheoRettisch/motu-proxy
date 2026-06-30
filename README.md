@@ -192,22 +192,27 @@ Run the fixture self-test:
 python -m motu_proxy selftest
 ```
 
-The tests cover protocol byte fixtures, path normalization, parser helpers,
-fake sysfs discovery, HTTP write gating, token handling, and USB short
-read/write failure paths. Fake Linux sysfs tests are skipped on Windows where
-Linux interface names such as `3-3:1.3` are not valid paths.
+The tests cover protocol byte fixtures, path normalization, strict response
+frame validation, parser helpers, fake sysfs discovery, HTTP write gating,
+token handling, and USB short read/write failure paths. Fake Linux sysfs tests
+are skipped on Windows where Linux interface names such as `3-3:1.3` are not
+valid paths.
 
 ## Project Layout
 
 - `motu_proxy/protocol.py`: CRC32, frame builders, ACK/init helpers, host
   sequence helpers.
-- `motu_proxy/parser.py`: response body helpers and JSON display extraction.
+- `motu_proxy/parser.py`: strict response-frame validation, response body
+  helpers, and JSON display extraction.
 - `motu_proxy/device.py`: Linux sysfs device/interface/endpoint discovery.
 - `motu_proxy/transports/usbfs.py`: Linux usbfs bulk transport.
 - `motu_proxy/datastore.py`: datastore GET/POST orchestration over a transport.
 - `motu_proxy/http_server.py`: localhost HTTP compatibility layer and write
   safety checks.
 - `motu_proxy/cli.py`: command-line entry point.
+- `tools/live_validate_response_frames.py`: opt-in live USB response-frame
+  validator for CRC, message sequence, segmentation, and logical wrapper
+  behavior.
 - `tests/`: hardware-free regression tests.
 - `handover/`: original MVP notes and reference script.
 - `openspec/`: design/specification history for the rebuild.
@@ -218,8 +223,6 @@ This project is licensed under the MIT License. See `LICENSE`.
 
 ## Known Follow-Ups
 
-- Validate strict response-frame CRC/message-sequence parsing against live MOTU
-  response captures before making it mandatory.
 - Consider an optional persistent USB session mode for HTTP serving if request
   latency becomes a problem.
 - Add service packaging and deployment-specific udev/systemd integration when

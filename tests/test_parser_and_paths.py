@@ -1,7 +1,16 @@
 from unittest import TestCase
 
-from motu_proxy.parser import extract_json_bytes, is_device_ack, join_response_frames, response_to_text
+from motu_proxy.parser import (
+    ResponseFrameError,
+    extract_json_bytes,
+    is_device_ack,
+    join_response_frames,
+    parse_response_frame,
+    response_to_text,
+)
 from motu_proxy.paths import normalize_path
+
+from tests.helpers import response_packet
 
 
 class ParserTests(TestCase):
@@ -9,9 +18,58 @@ class ParserTests(TestCase):
         self.assertTrue(is_device_ack(bytes.fromhex("21 00 08 00 21 00 08 00")))
         self.assertFalse(is_device_ack(b"not an ack"))
 
-    def test_join_response_frames_strips_motu_header(self) -> None:
-        frame = b"NREK" + b"\x00" * 16 + b'{"value":"ok"}'
-        self.assertEqual(join_response_frames([frame]), b'{"value":"ok"}')
+    def test_parse_response_frame_validates_and_strips_payload(self) -> None:
+        frame = parse_response_frame(response_packet(b'{"value":"ok"}'), expected_message_seq=2)
+        self.assertEqual(frame.payload, b'{"value":"ok"}')
+        self.assertTrue(frame.final)
+        self.assertEqual(frame.segment_index, 0)
+
+    def test_join_response_frames_concatenates_segments(self) -> None:
+        frames = [
+            response_packet(b'{"first":true}', final=False, segment_index=0, wrapper_seq=0x40),
+            response_packet(b'{"second":true}', final=True, segment_index=1, wrapper_seq=0x41),
+        ]
+        self.assertEqual(join_response_frames(frames, expected_message_seq=2), b'{"first":true}{"second":true}')
+
+    def test_response_frame_allows_padding_after_logical_wrapper(self) -> None:
+        frame = parse_response_frame(response_packet(b'{"value":"ok"}', padding=b"\x00\x00"), expected_message_seq=2)
+        self.assertEqual(frame.payload, b'{"value":"ok"}')
+
+    def test_response_frame_rejects_crc_mismatch(self) -> None:
+        packet = bytearray(response_packet(b'{"value":"ok"}'))
+        packet[8] ^= 0xFF
+        with self.assertRaisesRegex(ResponseFrameError, "CRC mismatch"):
+            parse_response_frame(bytes(packet), expected_message_seq=2)
+
+    def test_response_frame_rejects_message_sequence_mismatch(self) -> None:
+        with self.assertRaisesRegex(ResponseFrameError, "message sequence"):
+            parse_response_frame(response_packet(b'{"value":"ok"}', message_seq=3), expected_message_seq=2)
+
+    def test_response_frame_rejects_bad_trailer(self) -> None:
+        packet = bytearray(response_packet(b'{"value":"ok"}'))
+        packet[-1] ^= 0xFF
+        with self.assertRaisesRegex(ResponseFrameError, "trailer"):
+            parse_response_frame(bytes(packet), expected_message_seq=2)
+
+    def test_join_response_frames_rejects_segment_gap(self) -> None:
+        frames = [
+            response_packet(b"first", final=False, segment_index=0, wrapper_seq=0x40),
+            response_packet(b"second", final=True, segment_index=2, wrapper_seq=0x41),
+        ]
+        with self.assertRaisesRegex(ResponseFrameError, "segment index"):
+            join_response_frames(frames, expected_message_seq=2)
+
+    def test_join_response_frames_rejects_final_flag_before_last_segment(self) -> None:
+        frames = [
+            response_packet(b"first", final=True, segment_index=0, wrapper_seq=0x40),
+            response_packet(b"second", final=True, segment_index=1, wrapper_seq=0x41),
+        ]
+        with self.assertRaisesRegex(ResponseFrameError, "final flag"):
+            join_response_frames(frames, expected_message_seq=2)
+
+    def test_join_response_frames_requires_final_segment(self) -> None:
+        with self.assertRaisesRegex(ResponseFrameError, "final segment"):
+            join_response_frames([response_packet(b"first", final=False)], expected_message_seq=2)
 
     def test_extract_json_bytes_uses_first_object(self) -> None:
         self.assertEqual(extract_json_bytes(b"prefix {\"value\":\"ok\"} suffix"), b'{"value":"ok"}')

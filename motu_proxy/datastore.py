@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Iterator, Protocol
 
 from .device import DEFAULT_DEVFS_ROOT, DEFAULT_SYSFS_ROOT, find_motu_device
-from .parser import is_device_ack, join_response_frames
+from .parser import is_device_ack, join_response_frames, parse_response_frame
 from .protocol import (
     DEFAULT_MAX_USB_CHUNK,
     DEFAULT_MESSAGE_SEQ,
@@ -85,16 +85,18 @@ class MotuUsbDatastore:
         self._drain_quiet(quiet_reads=1, timeout_ms=200)
 
     def get(self, path: str, etag: str = "0") -> bytes:
-        frame = build_get_frame(self._next_host_seq(), self.message_seq, path, etag=etag)
+        message_seq = self.message_seq
+        frame = build_get_frame(self._next_host_seq(), message_seq, path, etag=etag)
         self.message_seq += 1
         self._write_frame(frame)
-        return self._collect_response()
+        return self._collect_response(message_seq)
 
     def post(self, path: str, json_body: str) -> bytes:
-        frame = build_post_frame(self._next_host_seq(), self.message_seq, path, json_body)
+        message_seq = self.message_seq
+        frame = build_post_frame(self._next_host_seq(), message_seq, path, json_body)
         self.message_seq += 1
         self._write_frame(frame)
-        return self._collect_response()
+        return self._collect_response(message_seq)
 
     def _read_logical_frame(self, timeout_ms: int | None = None) -> bytes:
         max_chunk = getattr(self.transport, "max_packet_size", DEFAULT_MAX_USB_CHUNK) or DEFAULT_MAX_USB_CHUNK
@@ -118,7 +120,7 @@ class MotuUsbDatastore:
             raise ShortUsbFrame(f"short USB logical frame: got {got} of {expected} bytes")
         return b"".join(chunks)
 
-    def _collect_response(self, max_bytes: int = 1024 * 1024) -> bytes:
+    def _collect_response(self, expected_message_seq: int, max_bytes: int = 1024 * 1024) -> bytes:
         frames: list[bytes] = []
         pending: list[bytes] = []
         total = 0
@@ -136,8 +138,9 @@ class MotuUsbDatastore:
 
             body = packet[4:] if len(packet) >= 4 else packet
             if body.startswith((b"NREK", b"PTTH")):
-                frames.append(body)
-                total += len(body)
+                parse_response_frame(packet, expected_message_seq)
+                frames.append(packet)
+                total += len(packet)
                 self._write_frame(build_ack(self._next_host_seq()))
                 pending.extend(self._drain_quiet(quiet_reads=1, timeout_ms=120))
                 if total > max_bytes:
@@ -145,7 +148,7 @@ class MotuUsbDatastore:
 
         if not frames:
             return b""
-        return join_response_frames(frames)
+        return join_response_frames(frames, expected_message_seq)
 
     def _drain_quiet(self, quiet_reads: int, timeout_ms: int) -> list[bytes]:
         packets: list[bytes] = []
