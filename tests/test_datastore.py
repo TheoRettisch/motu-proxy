@@ -86,6 +86,7 @@ class DatastoreTests(TestCase):
         with self.assertRaises(ShortUsbWrite):
             datastore.get("/datastore/uid")
         self.assertEqual(transport.writes, [build_get_frame(0x20, 2, "/datastore/uid")])
+        self.assertEqual(datastore.message_seq, 2)
 
     def test_get_rejects_missing_response(self) -> None:
         transport = FakeTransport([])
@@ -107,6 +108,13 @@ class DatastoreTests(TestCase):
         datastore = MotuUsbDatastore(transport)
         datastore.post("/datastore/host/os", '{"value":"linux"}')
         self.assertEqual(transport.writes[0], build_post_frame(0x20, 2, "/datastore/host/os", '{"value":"linux"}'))
+
+    def test_post_short_write_does_not_advance_message_sequence(self) -> None:
+        transport = FakeTransport([], short_writes=True)
+        datastore = MotuUsbDatastore(transport)
+        with self.assertRaises(ShortUsbWrite):
+            datastore.post("/datastore/host/os", '{"value":"linux"}')
+        self.assertEqual(datastore.message_seq, 2)
 
     def test_post_forwards_client_identifier(self) -> None:
         transport = FakeTransport([response_packet(b'{"ok":true}')])

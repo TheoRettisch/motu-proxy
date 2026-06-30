@@ -15,6 +15,7 @@ from motu_proxy.cli import (
     write_token_file,
 )
 from motu_proxy.datastore import ResponseStats
+from motu_proxy.http_server import DatastoreDispatcher
 
 
 def write(path: Path, value: str) -> None:
@@ -77,6 +78,19 @@ class FakeSmokeDatastore:
         return response
 
 
+class FakeServeDatastore:
+    def __init__(self, response: bytes) -> None:
+        self.response = response
+        self.calls: list[tuple[str, str | None]] = []
+
+    def get(self, path: str, client: str | None = None) -> bytes:
+        self.calls.append((path, client))
+        return self.response
+
+    def post(self, path: str, json_body: str, client: str | None = None) -> bytes:
+        raise AssertionError("unexpected post")
+
+
 class CliServeSecurityTests(TestCase):
     def test_serve_write_token_file_defaults_to_run_path(self) -> None:
         args = build_parser().parse_args(["serve"])
@@ -103,6 +117,60 @@ class CliServeSecurityTests(TestCase):
             token, token_file = prepare_write_token(str(path))
             self.assertEqual(token_file, str(path))
             self.assertEqual(path.read_text(encoding="ascii"), f"{token}\n")
+
+    def test_serve_get_does_not_truncate_raw_concatenated_json_response(self) -> None:
+        datastore = FakeServeDatastore(b'{"first":true}{"second":true}')
+        captured = {}
+
+        class FakeServer:
+            def __init__(
+                self,
+                server_address,
+                allow_writes,
+                debug,
+                run_get,
+                run_post,
+                write_token=None,
+                write_token_file=None,
+                allow_remote_writes=False,
+                max_write_body_bytes=64 * 1024,
+            ) -> None:
+                self.server_address = server_address
+                self.allow_writes = allow_writes
+                self.debug = debug
+                self.write_token = write_token
+                self.write_token_file = write_token_file
+                self.allow_remote_writes = allow_remote_writes
+                self.max_write_body_bytes = max_write_body_bytes
+                self.dispatcher = DatastoreDispatcher(
+                    allow_writes,
+                    run_get,
+                    run_post,
+                    write_token=write_token,
+                    allow_remote_writes=allow_remote_writes,
+                )
+
+            def server_close(self) -> None:
+                pass
+
+        def fake_serve(server) -> int:
+            try:
+                captured["result"] = server.dispatcher.dispatch("GET", "/datastore")
+            finally:
+                server.server_close()
+            return 0
+
+        args = build_parser().parse_args(["serve", "--port", "0"])
+        with (
+            patch("motu_proxy.cli.open_datastore", return_value=FakeOpenDatastore(datastore)),
+            patch("motu_proxy.cli.MotuProxyServer", FakeServer),
+            patch("motu_proxy.cli.serve", side_effect=fake_serve),
+        ):
+            result = args.func(args)
+
+        self.assertEqual(result, 0)
+        self.assertEqual(captured["result"].response, b'{"first":true}{"second":true}')
+        self.assertEqual(datastore.calls, [("/datastore", None)])
 
 
 @skipIf(os.name == "nt", "fake sysfs interface names use ':' like Linux")
@@ -131,15 +199,16 @@ class CliInfoTests(TestCase):
 
 
 class CliSmokeTests(TestCase):
-    def test_smoke_reads_paths_and_returns_failure_when_any_read_fails(self) -> None:
+    def test_smoke_aborts_after_failed_read_by_default(self) -> None:
         datastore = FakeSmokeDatastore(
             {
                 "/datastore/uid": b'{"value":"uid"}',
                 "/datastore/host/mode": RuntimeError("boom"),
+                "/datastore/ext/maxUSBToHost": b'{"value":24}',
             }
         )
         args = build_parser().parse_args(
-            ["smoke", "--no-body", "--path", "/uid", "--path", "/host/mode"]
+            ["smoke", "--no-body", "--path", "/uid", "--path", "/host/mode", "--path", "/ext/maxUSBToHost"]
         )
         stdout = StringIO()
         stderr = StringIO()
@@ -158,4 +227,42 @@ class CliSmokeTests(TestCase):
         self.assertIn("bytes=15 frames=1 reads=2 ignored=0 ack=1", output)
         self.assertIn("# /datastore/host/mode", output)
         self.assertIn("FAIL ", output)
+        self.assertIn("ERROR: boom", stderr.getvalue())
+
+    def test_smoke_can_continue_after_failure_when_requested(self) -> None:
+        datastore = FakeSmokeDatastore(
+            {
+                "/datastore/uid": b'{"value":"uid"}',
+                "/datastore/host/mode": RuntimeError("boom"),
+                "/datastore/ext/maxUSBToHost": b'{"value":24}',
+            }
+        )
+        args = build_parser().parse_args(
+            [
+                "smoke",
+                "--continue-on-error",
+                "--no-body",
+                "--path",
+                "/uid",
+                "--path",
+                "/host/mode",
+                "--path",
+                "/ext/maxUSBToHost",
+            ]
+        )
+        stdout = StringIO()
+        stderr = StringIO()
+        with (
+            patch("motu_proxy.cli.open_datastore", return_value=FakeOpenDatastore(datastore)),
+            redirect_stdout(stdout),
+            redirect_stderr(stderr),
+        ):
+            result = args.func(args)
+
+        self.assertEqual(result, 1)
+        self.assertEqual(
+            datastore.calls,
+            ["/datastore/uid", "/datastore/host/mode", "/datastore/ext/maxUSBToHost"],
+        )
+        self.assertIn("# /datastore/ext/maxUSBToHost", stdout.getvalue())
         self.assertIn("ERROR: boom", stderr.getvalue())

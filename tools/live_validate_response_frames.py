@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import struct
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -29,6 +30,10 @@ DEFAULT_PATHS = (
     "/datastore/uid",
     "/datastore/host/mode",
 )
+DEFAULT_RESPONSE_TIMEOUT_MS = 10_000
+DEFAULT_MAX_RESPONSE_READS = 512
+DEFAULT_MAX_IGNORED_PACKETS = 32
+DEFAULT_MAX_RESPONSE_FRAMES = 256
 
 
 def _u16(data: bytes, offset: int) -> int:
@@ -198,19 +203,32 @@ def capture_get(
     path: str,
     etag: str,
     max_bytes: int,
+    response_timeout_ms: int,
+    max_reads: int,
+    max_ignored_packets: int,
+    max_response_frames: int,
 ) -> CaptureResult:
     path = normalize_path(path)
     request_seq = datastore._next_host_seq()
     message_seq = datastore.message_seq
-    datastore.message_seq += 1
     datastore._write_frame(build_get_frame(request_seq, message_seq, path, etag=etag))
+    datastore.message_seq += 1
 
     result = CaptureResult(path=path, request_seq=request_seq, message_seq=message_seq)
     total = 0
     quiet_reads = 0
+    reads = 0
+    deadline = time.monotonic() + (response_timeout_ms / 1000)
 
     while quiet_reads < 2:
-        packet = datastore._read_logical_frame()
+        if reads >= max_reads:
+            raise RuntimeError(f"response read limit exceeded after {max_reads} reads for {path}")
+        now = time.monotonic()
+        if now >= deadline:
+            raise RuntimeError(f"response timed out after {response_timeout_ms} ms for {path}")
+        read_timeout_ms = max(1, int((deadline - now) * 1000))
+        packet = datastore._read_logical_frame(timeout_ms=read_timeout_ms)
+        reads += 1
         if not packet:
             quiet_reads += 1
             continue
@@ -227,11 +245,15 @@ def capture_get(
             ack = build_ack(datastore._next_host_seq())
             datastore._write_frame(ack)
             result.host_acks.append(ack)
+            if len(result.response_packets) > max_response_frames:
+                raise RuntimeError(f"response exceeded {max_response_frames} frames for {path}")
             if total > max_bytes:
                 raise RuntimeError(f"response exceeded {max_bytes} bytes")
             continue
 
         result.unexpected_packets.append(packet)
+        if len(result.unexpected_packets) > max_ignored_packets:
+            raise RuntimeError(f"ignored packet limit exceeded after {max_ignored_packets} packets for {path}")
 
     result.frame_checks = [
         validate_response_packet(path, index, packet, message_seq)
@@ -289,6 +311,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--devfs-root", default=str(DEFAULT_DEVFS_ROOT))
     parser.add_argument("--etag", default="0")
     parser.add_argument("--max-bytes", type=int, default=1024 * 1024)
+    parser.add_argument("--response-timeout-ms", type=int, default=DEFAULT_RESPONSE_TIMEOUT_MS)
+    parser.add_argument("--max-reads", type=int, default=DEFAULT_MAX_RESPONSE_READS)
+    parser.add_argument("--max-ignored-packets", type=int, default=DEFAULT_MAX_IGNORED_PACKETS)
+    parser.add_argument("--max-response-frames", type=int, default=DEFAULT_MAX_RESPONSE_FRAMES)
     parser.add_argument("--no-init", action="store_true")
     parser.add_argument("--debug", action="store_true")
     parser.add_argument(
@@ -328,7 +354,16 @@ def main() -> int:
         if not args.no_init:
             datastore.init()
         for path in paths:
-            result = capture_get(datastore, path, args.etag, args.max_bytes)
+            result = capture_get(
+                datastore,
+                path,
+                args.etag,
+                args.max_bytes,
+                args.response_timeout_ms,
+                args.max_reads,
+                args.max_ignored_packets,
+                args.max_response_frames,
+            )
             print_result(result)
             all_results.append(result)
 

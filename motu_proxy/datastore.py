@@ -119,15 +119,15 @@ class MotuUsbDatastore:
     def get(self, path: str, etag: str = "0", client: str | int | None = None) -> bytes:
         message_seq = self.message_seq
         frame = build_get_frame(self._next_host_seq(), message_seq, path, etag=etag, client=client)
-        self.message_seq += 1
         self._write_frame(frame)
+        self.message_seq += 1
         return self._collect_response(message_seq)
 
     def post(self, path: str, json_body: str, client: str | int | None = None) -> bytes:
         message_seq = self.message_seq
         frame = build_post_frame(self._next_host_seq(), message_seq, path, json_body, client=client)
-        self.message_seq += 1
         self._write_frame(frame)
+        self.message_seq += 1
         return self._collect_response(message_seq)
 
     def _read_logical_frame(self, timeout_ms: int | None = None) -> bytes:

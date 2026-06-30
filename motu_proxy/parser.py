@@ -158,7 +158,17 @@ def extract_response_etag(response: bytes) -> str | None:
 
 
 def datastore_payload(response: bytes) -> DatastorePayload:
-    return DatastorePayload(body=extract_json_bytes(response) or response, etag=extract_response_etag(response))
+    return DatastorePayload(body=extract_datastore_body(response), etag=extract_response_etag(response))
+
+
+def extract_datastore_body(response: bytes) -> bytes:
+    body = _extract_utom_body(response)
+    if body is not None:
+        return body
+    body = _extract_text_http_body(response)
+    if body is not None:
+        return body
+    return response
 
 
 def _extract_sized_header_value(response: bytes, header_name: str) -> str | None:
@@ -204,6 +214,16 @@ def _extract_utom_header_value(response: bytes, header_name: str) -> str | None:
     return None
 
 
+def _extract_utom_body(response: bytes) -> bytes | None:
+    if len(response) < 28 or not response.startswith(b"UTOM"):
+        return None
+    metadata_len = _u32(response, 16)
+    metadata_end = 20 + metadata_len
+    if metadata_end > len(response) or metadata_len < 8:
+        return None
+    return response[metadata_end:]
+
+
 def _read_sized_value(data: bytes, offset: int, end: int) -> tuple[bytes | None, int]:
     if offset + 4 > end:
         return None, offset
@@ -223,6 +243,20 @@ def _extract_text_header_value(response: bytes, header_name: str) -> str | None:
         if separator and name.strip().lower() == wanted:
             value = value.strip()
             return value or None
+    return None
+
+
+def _extract_text_http_body(response: bytes) -> bytes | None:
+    if not response.startswith(b"HTTP/"):
+        return None
+    separator = b"\r\n\r\n"
+    index = response.find(separator)
+    if index >= 0:
+        return response[index + len(separator) :]
+    separator = b"\n\n"
+    index = response.find(separator)
+    if index >= 0:
+        return response[index + len(separator) :]
     return None
 
 

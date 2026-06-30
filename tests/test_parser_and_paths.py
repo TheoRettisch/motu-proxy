@@ -3,6 +3,7 @@ from unittest import TestCase
 from motu_proxy.parser import (
     ResponseFrameError,
     datastore_payload,
+    extract_datastore_body,
     extract_json_bytes,
     extract_response_etag,
     is_device_ack,
@@ -117,6 +118,16 @@ class ParserTests(TestCase):
         payload = datastore_payload(b"HTTP/1.1 200 OK\r\nETag: 5678\r\n\r\n{\"value\":\"ok\"}")
         self.assertEqual(payload.body, b'{"value":"ok"}')
         self.assertEqual(payload.etag, "5678")
+
+    def test_datastore_payload_does_not_truncate_raw_concatenated_json(self) -> None:
+        response = b'{"first":true}{"second":true}'
+        payload = datastore_payload(response)
+        self.assertEqual(payload.body, response)
+
+    def test_extract_datastore_body_strips_only_recognized_utom_envelope(self) -> None:
+        metadata = u32(200) + u32(1) + sized_word("ETag") + sized_word("5678")
+        response = b"UTOM" + u32(8) + u32(1) + u32(0) + u32(len(metadata)) + metadata + b'{"value":"ok"}'
+        self.assertEqual(extract_datastore_body(response), b'{"value":"ok"}')
 
 
 class PathTests(TestCase):

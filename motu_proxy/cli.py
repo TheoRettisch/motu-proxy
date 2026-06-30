@@ -169,6 +169,8 @@ def command_smoke(args) -> int:
                 elapsed_ms = (time.monotonic() - started) * 1000
                 print(f"FAIL {format_response_stats(elapsed_ms, datastore.last_response_stats)}")
                 print(f"ERROR: {exc}", file=sys.stderr)
+                if not args.continue_on_error:
+                    return 1
     return 1 if failures else 0
 
 
@@ -284,6 +286,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     smoke_parser.add_argument("--compact", action="store_true")
     smoke_parser.add_argument("--no-body", action="store_true", help="print only timing and frame statistics")
+    smoke_parser.add_argument(
+        "--continue-on-error",
+        action="store_true",
+        help="continue reading remaining paths after a smoke read failure",
+    )
     smoke_parser.set_defaults(func=command_smoke)
 
     serve_parser = sub.add_parser("serve", help="serve a tiny localhost datastore proxy")
