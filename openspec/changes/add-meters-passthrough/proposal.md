@@ -11,9 +11,10 @@ Scope is deliberately narrow. This keeps `motu-proxy` a **schema-aware proxy** â
 
 ## What Changes
 
-- Generalize USB query-field encoding so a GET frame can carry arbitrary `(name, value)` query parameters, not only `client`. Existing `client` behavior and frame fixtures stay byte-identical.
+- Generalize USB query-field encoding so a GET frame can carry ordered `(name, value)` query parameters, not only `client`. Existing single-`client` behavior and frame fixtures stay byte-identical.
 - Route `/meters` as a top-level resource in path normalization (like `/apiversion`), with no `/datastore` prefix.
-- Forward HTTP query parameters (e.g. `?meters=mix/level`) as USB query fields, since the device `404`s on a `?`-suffixed USB path.
+- Forward HTTP GET query parameters (e.g. `?meters=mix/level`) as USB query fields, since the device `404`s on a `?`-suffixed USB path. Existing write requests keep their current `client` query behavior.
+- Treat meter `If-None-Match` as a one-shot device request header, not as datastore long-poll coordination.
 - Return the device's meter response unchanged, exposing the meter ETag via the existing `ETag` header machinery.
 - Add a single-shot, read-only `meters` CLI command for validation â€” one request per invocation, explicitly not a poller.
 - Do **not** interpret meter values, map channels, or run any background poll loop.
@@ -28,7 +29,7 @@ Scope is deliberately narrow. This keeps `motu-proxy` a **schema-aware proxy** â
 
 ## Impact
 
-- Affected code: `motu_proxy/protocol.py` (generalized query fields), `motu_proxy/paths.py` (route `/meters`), `motu_proxy/http_server.py` (forward query params as query fields), `motu_proxy/datastore.py` (pass query params through), `motu_proxy/cli.py` (one-shot `meters` command).
+- Affected code: `motu_proxy/protocol.py` (generalized GET query fields), `motu_proxy/paths.py` (route `/meters`), `motu_proxy/http_server.py` (forward GET query params and meter ETags correctly), `motu_proxy/datastore.py` (pass GET query params through), `motu_proxy/cli.py` (one-shot `meters` command).
 - Affected APIs: `GET /meters?meters=<group>` now works through the proxy; existing datastore and `client` behavior are unchanged.
 - Affected systems: meter clients (the separate polling project) that point at the proxy instead of the device's network port; validated against the live 624 over USB.
 - Dependencies: builds on the already-implemented `add-datastore-http-api-compat` (ETag and `client` plumbing). Standard library only.

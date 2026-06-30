@@ -11,6 +11,8 @@ The spike (`research/spike-metering/findings.md`) established the full `/meters`
 - Faithfully transport the device's `/meters` resource over USB and HTTP: issue the right request (path + `meters` query field) and return the device's response and ETag unchanged.
 - Generalize query-field encoding so meters — and any future query parameter — work without special-casing.
 - Keep `/meters` routing consistent with the device (top-level, no datastore prefix).
+- Preserve HTTP query ordering so the USB frame is a faithful representation of the incoming request.
+- Forward meter `If-None-Match` to the device as a one-shot request rather than using datastore long-poll state.
 - Stay byte-faithful: no interpretation.
 
 **Non-Goals (these belong to the separate consumer/polling project):**
@@ -19,12 +21,13 @@ The spike (`research/spike-metering/findings.md`) established the full `/meters`
 - No typed meter model, channel mapping, or value interpretation. (Meter values are device-scaled integers, not 0–1 — the consumer maps them.)
 - No meter-specific long-poll coordinator. (The device throttles meter `If-None-Match` to ~10 Hz, so a consumer should poll plain — but that is the consumer's concern.)
 - No attempt to raise the device meter rate (it is a fixed, non-configurable ~83 Hz).
+- No new arbitrary query-parameter passthrough for writes beyond the existing `client` query behavior.
 
 ## Decisions
 
 ### Generalize query fields rather than special-case `meters`
 
-`protocol.query_fields` currently hardcodes `client`. Generalize it to encode an ordered list of `(name, value)` pairs; `client` becomes one caller of the same path. The proxy stays parameter-agnostic — it forwards whatever query parameters arrive, just as it forwards arbitrary datastore paths.
+`protocol.query_fields` currently hardcodes `client`. Generalize the helper to encode an ordered list of `(name, value)` pairs, and teach GET frame construction to use it. The existing single-`client` path remains byte-identical, including POST frames that carry `client`, but arbitrary write-query passthrough is not part of this change.
 
 Alternative considered: add a dedicated `meters` parameter to the frame builders. Rejected — it bakes meter-specific knowledge into the transport, drifting toward the domain layer the proxy must stay out of.
 
@@ -36,11 +39,15 @@ Alternative considered: a generic "don't prefix any unknown top-level resource" 
 
 ### Forward HTTP query parameters as USB query fields
 
-The HTTP layer already extracts `client` from the query string; extend it to forward query parameters generally to the datastore request, which encodes them as USB query fields. This bridges the network form `GET /meters?meters=mix/level` to the USB query-field form. The proxy never places the query string in the USB path (the device `404`s on that).
+The HTTP layer already extracts `client` from the query string; extend GET dispatch to preserve the parsed query pair order and forward query parameters to the datastore request, which encodes them as USB query fields. This bridges the network form `GET /meters?meters=mix/level` to the USB query-field form. The proxy never places the query string in the USB path (the device `404`s on that).
 
-### Reuse the existing read path (no new HTTP semantics)
+Existing `client` validation should remain in force where it exists today. For non-`client` GET query parameters, the proxy should decode and forward the field name/value without validation or interpretation.
 
-Meters are GET-only reads, so they ride the existing HTTP GET path: ETag exposure, `Cache-Control: no-cache`, CORS, and read-only behavior all come from `add-datastore-http-api-compat`. No write gating is involved.
+### Use a one-shot meters read path, not datastore long-poll history
+
+Meters are GET-only reads, but they must not use datastore long-poll fan-out. The current datastore HTTP path interprets `If-None-Match` as a request to wait against the background `/datastore` ETag history. Meter ETags are independent and fast-advancing, so `/meters` should instead perform exactly one serialized device read, forwarding the incoming `If-None-Match` value as the USB `If-None-Match` header when present.
+
+The HTTP response can still reuse normal read response behavior: ETag exposure, `Cache-Control: no-cache`, content type detection, and read-only behavior. No write gating is involved.
 
 ### Single-shot CLI only
 
@@ -54,12 +61,13 @@ A `meters` CLI command issues exactly one `/meters?meters=<group>` read and prin
 
 ## Migration Plan
 
-1. Generalize `query_fields` / `build_get_frame` / `build_post_frame` to accept ordered `(name, value)` query parameters; keep `client` byte-identical.
+1. Generalize `query_fields` and `build_get_frame` to accept ordered `(name, value)` query parameters; keep single-`client` GET and POST frames byte-identical.
 2. Add `/meters` to `paths.normalize_path` passthrough.
-3. In the HTTP layer, forward parsed query parameters (incl. `meters`) as query fields to the datastore GET; return body + meter ETag.
-4. Add the single-shot `meters` CLI read.
-5. Tests: query-field encoding (incl. unchanged `client` fixture), `/meters` routing, HTTP `?meters=` → USB query field, ETag exposure, no-poll/no-interpretation.
-6. Validate on the live 624 over USB: `GET /meters?meters=mix/level` through the proxy returns the device's meter JSON and ETag.
+3. In the HTTP layer, forward parsed GET query parameters (incl. `meters`) as query fields to the device read; keep write query behavior unchanged except for existing `client`.
+4. Route `/meters` reads with `If-None-Match` as one-shot device reads rather than local datastore long-polls; return body/status + meter ETag.
+5. Add the single-shot `meters` CLI read.
+6. Tests: query-field encoding (incl. unchanged `client` fixture), query ordering, `/meters` routing, HTTP `?meters=` → USB query field, meter `If-None-Match` one-shot behavior, ETag exposure, no-poll/no-interpretation.
+7. Validate on the live 624 over USB: `GET /meters?meters=mix/level` through the proxy returns the device's meter JSON and ETag.
 
 ## Open Questions
 

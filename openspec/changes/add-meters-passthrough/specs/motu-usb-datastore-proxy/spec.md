@@ -1,7 +1,7 @@
 ## ADDED Requirements
 
 ### Requirement: Generalized USB query fields
-The system SHALL encode arbitrary query parameters as USB query fields in datastore and meters GET frames, not only the `client` parameter, and SHALL keep the single-`client` encoding byte-compatible with prior behavior.
+The system SHALL encode arbitrary query parameters as ordered USB query fields in datastore and meters GET frames, not only the `client` parameter, and SHALL keep the single-`client` encoding byte-compatible with prior behavior.
 
 #### Scenario: Meters query field is encoded
 - **WHEN** a meters request carries a `meters=mix/level` query parameter
@@ -12,8 +12,8 @@ The system SHALL encode arbitrary query parameters as USB query fields in datast
 - **THEN** the resulting GET frame bytes are identical to the prior single-`client` encoding
 
 #### Scenario: Multiple query fields
-- **WHEN** a request carries both `meters=mix/level` and `client=<number>`
-- **THEN** the system encodes both as query fields in the GET frame
+- **WHEN** a request carries both `meters=mix/level` and `client=<number>` in that order
+- **THEN** the system encodes both as query fields in the GET frame in that same order
 
 ### Requirement: Meters resource routing
 The system SHALL treat `/meters` as a top-level resource and SHALL NOT add a `/datastore` prefix to it.
@@ -27,7 +27,7 @@ The system SHALL treat `/meters` as a top-level resource and SHALL NOT add a `/d
 - **THEN** the system still normalizes it to `/datastore/uid`
 
 ### Requirement: Meters request bridging
-The system SHALL forward an HTTP `GET /meters?meters=<group>` to the device over USB as a `/meters` request carrying the `meters` query field, and SHALL return the device's meter response with its ETag exposed in the `ETag` header.
+The system SHALL forward an HTTP `GET /meters?meters=<group>` to the device over USB as a single `/meters` request carrying the `meters` query field, and SHALL return the device's meter response with its ETag exposed in the `ETag` header.
 
 #### Scenario: HTTP meters read returns the device frame
 - **WHEN** a client sends `GET /meters?meters=mix/level` to the proxy
@@ -36,6 +36,10 @@ The system SHALL forward an HTTP `GET /meters?meters=<group>` to the device over
 #### Scenario: Unrecognized meter group is forwarded
 - **WHEN** a client requests a meter group the proxy does not recognize
 - **THEN** the proxy forwards the group value to the device unchanged, without validation or interpretation
+
+#### Scenario: Meter If-None-Match is forwarded to the device
+- **WHEN** a client sends `GET /meters?meters=mix/level` with an `If-None-Match` header
+- **THEN** the proxy forwards that ETag to the device in a single USB meters request and does not wait on datastore long-poll history
 
 ### Requirement: Meters pass-through without interpretation or polling
 The system SHALL pass meter requests and responses through without interpreting meter values, mapping channels, or running a background meter poll loop. Continuous polling and any typed meter model are out of scope for the proxy.
