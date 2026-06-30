@@ -1,6 +1,12 @@
 from unittest import TestCase
 
-from motu_proxy.datastore import MotuUsbDatastore, ShortUsbFrame, ShortUsbWrite
+from motu_proxy.datastore import (
+    DatastoreNoResponse,
+    DatastoreTimeout,
+    MotuUsbDatastore,
+    ShortUsbFrame,
+    ShortUsbWrite,
+)
 from motu_proxy.parser import ResponseFrameError
 from motu_proxy.protocol import build_get_frame, build_post_frame
 
@@ -33,6 +39,11 @@ class DatastoreTests(TestCase):
         datastore = MotuUsbDatastore(transport)
         response = datastore.get("/datastore/uid")
         self.assertEqual(response, b'{"value":"ok"}')
+        self.assertIsNotNone(datastore.last_response_stats)
+        assert datastore.last_response_stats is not None
+        self.assertEqual(datastore.last_response_stats.reads, 2)
+        self.assertEqual(datastore.last_response_stats.accepted_frames, 1)
+        self.assertEqual(datastore.last_response_stats.ack_packets, 1)
         self.assertEqual(transport.writes[0], build_get_frame(0x20, 2, "/datastore/uid"))
         self.assertEqual(transport.writes[1], bytes.fromhex("21 81 04 00"))
 
@@ -58,6 +69,21 @@ class DatastoreTests(TestCase):
         transport = FakeTransport([], short_writes=True)
         datastore = MotuUsbDatastore(transport)
         with self.assertRaises(ShortUsbWrite):
+            datastore.get("/datastore/uid")
+        self.assertEqual(transport.writes, [build_get_frame(0x20, 2, "/datastore/uid")])
+
+    def test_get_rejects_missing_response(self) -> None:
+        transport = FakeTransport([])
+        datastore = MotuUsbDatastore(transport)
+        with self.assertRaises(DatastoreNoResponse):
+            datastore.get("/datastore/uid")
+        self.assertEqual(transport.writes, [build_get_frame(0x20, 2, "/datastore/uid")])
+
+    def test_get_bounds_ignored_response_packets(self) -> None:
+        ignored_packet = bytes.fromhex("77 00 04 00")
+        transport = FakeTransport([ignored_packet] * 33)
+        datastore = MotuUsbDatastore(transport)
+        with self.assertRaises(DatastoreTimeout):
             datastore.get("/datastore/uid")
         self.assertEqual(transport.writes, [build_get_frame(0x20, 2, "/datastore/uid")])
 

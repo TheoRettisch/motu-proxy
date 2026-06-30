@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import struct
+import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -26,6 +27,12 @@ from .protocol import (
 from .transports.usbfs import UsbFsTransport
 
 
+DEFAULT_RESPONSE_TIMEOUT_MS = DEFAULT_TIMEOUT_MS * 2
+DEFAULT_MAX_RESPONSE_READS = 256
+DEFAULT_MAX_IGNORED_PACKETS = 32
+DEFAULT_MAX_RESPONSE_FRAMES = 256
+
+
 class Transport(Protocol):
     max_packet_size: int
 
@@ -42,6 +49,29 @@ class ShortUsbFrame(RuntimeError):
 
 class ShortUsbWrite(RuntimeError):
     pass
+
+
+class DatastoreNoResponse(RuntimeError):
+    pass
+
+
+class DatastoreTimeout(RuntimeError):
+    pass
+
+
+class DatastoreResponseLimit(RuntimeError):
+    pass
+
+
+@dataclass(frozen=True)
+class ResponseStats:
+    timeout_ms: int
+    elapsed_ms: float
+    reads: int
+    accepted_frames: int
+    ignored_packets: int
+    ack_packets: int
+    response_bytes: int
 
 
 @dataclass(frozen=True)
@@ -71,6 +101,7 @@ class MotuUsbDatastore:
         self.transport = transport
         self.host_seq = HostSequencer(seq_start)
         self.message_seq = message_seq
+        self.last_response_stats: ResponseStats | None = None
 
     def _next_host_seq(self) -> int:
         return self.host_seq.take()
@@ -120,41 +151,202 @@ class MotuUsbDatastore:
             raise ShortUsbFrame(f"short USB logical frame: got {got} of {expected} bytes")
         return b"".join(chunks)
 
-    def _collect_response(self, expected_message_seq: int, max_bytes: int = 1024 * 1024) -> bytes:
+    def _collect_response(
+        self,
+        expected_message_seq: int,
+        max_bytes: int = 1024 * 1024,
+        timeout_ms: int = DEFAULT_RESPONSE_TIMEOUT_MS,
+        max_reads: int = DEFAULT_MAX_RESPONSE_READS,
+        max_ignored_packets: int = DEFAULT_MAX_IGNORED_PACKETS,
+        max_response_frames: int = DEFAULT_MAX_RESPONSE_FRAMES,
+    ) -> bytes:
+        self.last_response_stats = None
         frames: list[bytes] = []
-        pending: list[bytes] = []
         total = 0
         quiet_reads = 0
+        reads = 0
+        ignored_packets = 0
+        ack_packets = 0
+        started = time.monotonic()
+        deadline = time.monotonic() + (timeout_ms / 1000)
 
         while quiet_reads < 2:
-            packet = pending.pop(0) if pending else self._read_logical_frame()
+            if reads >= max_reads:
+                self._record_response_stats(
+                    timeout_ms,
+                    started,
+                    reads,
+                    len(frames),
+                    ignored_packets,
+                    ack_packets,
+                    total,
+                )
+                raise DatastoreTimeout(
+                    _response_wait_message(
+                        f"response read limit exceeded after {max_reads} reads",
+                        timeout_ms,
+                        reads,
+                        len(frames),
+                        ignored_packets,
+                        ack_packets,
+                    )
+                )
+            now = time.monotonic()
+            if now >= deadline:
+                error_cls = DatastoreTimeout if frames else DatastoreNoResponse
+                reason = (
+                    f"response timed out after {timeout_ms} ms"
+                    if frames
+                    else f"no datastore response after {timeout_ms} ms"
+                )
+                self._record_response_stats(
+                    timeout_ms,
+                    started,
+                    reads,
+                    len(frames),
+                    ignored_packets,
+                    ack_packets,
+                    total,
+                )
+                raise error_cls(
+                    _response_wait_message(
+                        reason,
+                        timeout_ms,
+                        reads,
+                        len(frames),
+                        ignored_packets,
+                        ack_packets,
+                    )
+                )
+            read_timeout_ms = max(1, int((deadline - now) * 1000))
+            packet = self._read_logical_frame(timeout_ms=read_timeout_ms)
+            reads += 1
             if not packet:
                 quiet_reads += 1
                 continue
             quiet_reads = 0
 
             if is_device_ack(packet):
+                ack_packets += 1
                 continue
 
             body = packet[4:] if len(packet) >= 4 else packet
             if body.startswith((b"NREK", b"PTTH")):
-                parse_response_frame(packet, expected_message_seq)
+                parsed = parse_response_frame(packet, expected_message_seq)
                 frames.append(packet)
                 total += len(packet)
+                if len(frames) > max_response_frames:
+                    self._record_response_stats(
+                        timeout_ms,
+                        started,
+                        reads,
+                        len(frames),
+                        ignored_packets,
+                        ack_packets,
+                        total,
+                    )
+                    raise DatastoreResponseLimit(
+                        f"response exceeded {max_response_frames} frames"
+                    )
                 self._write_frame(build_ack(self._next_host_seq()))
-                pending.extend(self._drain_quiet(quiet_reads=1, timeout_ms=120))
                 if total > max_bytes:
-                    raise RuntimeError(f"response exceeded {max_bytes} bytes")
+                    self._record_response_stats(
+                        timeout_ms,
+                        started,
+                        reads,
+                        len(frames),
+                        ignored_packets,
+                        ack_packets,
+                        total,
+                    )
+                    raise DatastoreResponseLimit(f"response exceeded {max_bytes} bytes")
+                if parsed.final:
+                    break
+                continue
+
+            ignored_packets += 1
+            if ignored_packets > max_ignored_packets:
+                self._record_response_stats(
+                    timeout_ms,
+                    started,
+                    reads,
+                    len(frames),
+                    ignored_packets,
+                    ack_packets,
+                    total,
+                )
+                raise DatastoreTimeout(
+                    _response_wait_message(
+                        f"response ignored packet limit exceeded after {max_ignored_packets} packets",
+                        timeout_ms,
+                        reads,
+                        len(frames),
+                        ignored_packets,
+                        ack_packets,
+                    )
+                )
 
         if not frames:
-            return b""
-        return join_response_frames(frames, expected_message_seq)
+            self._record_response_stats(
+                timeout_ms,
+                started,
+                reads,
+                0,
+                ignored_packets,
+                ack_packets,
+                total,
+            )
+            raise DatastoreNoResponse(
+                _response_wait_message(
+                    f"no datastore response after {timeout_ms} ms",
+                    timeout_ms,
+                    reads,
+                    0,
+                    ignored_packets,
+                    ack_packets,
+                )
+            )
+        response = join_response_frames(frames, expected_message_seq)
+        self._record_response_stats(
+            timeout_ms,
+            started,
+            reads,
+            len(frames),
+            ignored_packets,
+            ack_packets,
+            total,
+        )
+        return response
 
-    def _drain_quiet(self, quiet_reads: int, timeout_ms: int) -> list[bytes]:
+    def _record_response_stats(
+        self,
+        timeout_ms: int,
+        started: float,
+        reads: int,
+        accepted_frames: int,
+        ignored_packets: int,
+        ack_packets: int,
+        response_bytes: int,
+    ) -> None:
+        self.last_response_stats = ResponseStats(
+            timeout_ms=timeout_ms,
+            elapsed_ms=(time.monotonic() - started) * 1000,
+            reads=reads,
+            accepted_frames=accepted_frames,
+            ignored_packets=ignored_packets,
+            ack_packets=ack_packets,
+            response_bytes=response_bytes,
+        )
+
+    def _drain_quiet(self, quiet_reads: int, timeout_ms: int, max_reads: int = 16) -> list[bytes]:
         packets: list[bytes] = []
         quiet = 0
+        reads = 0
         while quiet < quiet_reads:
+            if reads >= max_reads:
+                raise DatastoreTimeout(f"USB drain did not become quiet after {max_reads} reads")
             packet = self._read_logical_frame(timeout_ms=timeout_ms)
+            reads += 1
             if packet:
                 packets.append(packet)
                 quiet = 0
@@ -180,3 +372,17 @@ def open_datastore(config: DatastoreConfig) -> Iterator[MotuUsbDatastore]:
         if not config.no_init:
             datastore.init()
         yield datastore
+
+
+def _response_wait_message(
+    reason: str,
+    timeout_ms: int,
+    reads: int,
+    accepted: int,
+    ignored: int,
+    ack: int,
+) -> str:
+    return (
+        f"{reason}; timeout_ms={timeout_ms} reads={reads} "
+        f"accepted={accepted} ignored={ignored} ack={ack}"
+    )

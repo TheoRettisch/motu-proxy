@@ -12,7 +12,17 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Callable
 from urllib.parse import parse_qs, urlparse
 
+from .datastore import (
+    DatastoreNoResponse,
+    DatastoreResponseLimit,
+    DatastoreTimeout,
+    ShortUsbFrame,
+    ShortUsbWrite,
+)
+from .device import DeviceDiscoveryError
+from .json_body import InvalidJsonBody, validate_json_body
 from .paths import normalize_path
+from .parser import ResponseFrameError
 
 
 DatastoreRead = Callable[[str], bytes]
@@ -54,7 +64,15 @@ class DispatchResult:
 
 def parse_write_body(raw: str, content_type: str) -> str:
     if "application/x-www-form-urlencoded" in content_type or raw.startswith("json="):
-        values = parse_qs(raw, keep_blank_values=True).get("json")
+        try:
+            values = parse_qs(
+                raw,
+                keep_blank_values=True,
+                encoding="utf-8",
+                errors="strict",
+            ).get("json")
+        except UnicodeDecodeError as exc:
+            raise BadRequest("request body must be valid UTF-8") from exc
         if values:
             return values[0]
     return raw
@@ -123,14 +141,15 @@ def dispatch_datastore_request(
     path = normalize_path(urlparse(request_path).path)
     if method == "GET":
         return DispatchResult(run_get(path), path)
-    write_body = parse_write_body(raw_body, content_type)
-    if log_write is not None:
-        log_write(method, path, write_body)
     if not allow_writes:
         raise WritesDisabled("writes require --allow-writes")
     validate_write_host(method, allow_writes, host, allow_remote_writes)
     validate_write_origin(method, allow_writes, origin, host)
     validate_write_token(method, allow_writes, write_token, request_token)
+    write_body = parse_write_body(raw_body, content_type)
+    validate_json_body(write_body)
+    if log_write is not None:
+        log_write(method, path, write_body)
     # HTTP PATCH is a compatibility alias for the MOTU datastore POST write.
     return DispatchResult(run_post(path, write_body), path)
 
@@ -225,10 +244,16 @@ class MotuProxyHandler(BaseHTTPRequestHandler):
             self.send_json_error(403, str(exc))
         except RequestBodyTooLarge as exc:
             self.send_json_error(413, str(exc))
-        except BadRequest as exc:
+        except (BadRequest, InvalidJsonBody) as exc:
             self.send_json_error(400, str(exc))
+        except DeviceDiscoveryError as exc:
+            self.send_backend_error(503, "MOTU USB device is not available", exc)
+        except (DatastoreNoResponse, DatastoreTimeout) as exc:
+            self.send_backend_error(504, "MOTU USB datastore did not respond", exc)
+        except (ResponseFrameError, DatastoreResponseLimit, ShortUsbFrame, ShortUsbWrite) as exc:
+            self.send_backend_error(502, "MOTU USB datastore returned an invalid response", exc)
         except Exception as exc:
-            self.send_json_error(502, str(exc))
+            self.send_backend_error(502, "MOTU USB datastore request failed", exc)
 
     def read_raw_body(self) -> str:
         try:
@@ -239,7 +264,10 @@ class MotuProxyHandler(BaseHTTPRequestHandler):
             raise BadRequest("invalid Content-Length")
         if length > self.server.max_write_body_bytes:
             raise RequestBodyTooLarge(f"request body exceeds {self.server.max_write_body_bytes} bytes")
-        return self.rfile.read(length).decode("utf-8", errors="replace")
+        try:
+            return self.rfile.read(length).decode("utf-8", errors="strict")
+        except UnicodeDecodeError as exc:
+            raise BadRequest("request body must be valid UTF-8") from exc
 
     def read_write_token(self) -> str | None:
         token = self.headers.get(WRITE_TOKEN_HEADER)
@@ -258,6 +286,13 @@ class MotuProxyHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def send_backend_error(self, status: int, public_message: str, exc: Exception) -> None:
+        if self.server.debug:
+            self.send_json_error(status, str(exc))
+            return
+        print(f"{status} {public_message}: {exc}", file=sys.stderr)
+        self.send_json_error(status, public_message)
 
 
 class MotuProxyServer(ThreadingHTTPServer):

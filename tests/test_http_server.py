@@ -4,8 +4,10 @@ from types import SimpleNamespace
 from unittest import TestCase
 
 from motu_proxy.cli import build_parser
+from motu_proxy.datastore import DatastoreNoResponse
 from motu_proxy.http_server import (
     WRITE_TOKEN_HEADER,
+    BadRequest,
     CrossOriginWrite,
     DatastoreDispatcher,
     DispatchResult,
@@ -17,6 +19,7 @@ from motu_proxy.http_server import (
     dispatch_datastore_request,
     response_content_type,
 )
+from motu_proxy.json_body import InvalidJsonBody
 
 
 WRITE_TOKEN = "test-write-token"
@@ -224,7 +227,7 @@ class HttpServerTests(TestCase):
         self.assertEqual(lock.exits, 1)
         self.assertEqual(calls, [("GET", "/datastore/uid")])
 
-    def test_write_attempts_are_logged_when_disabled(self) -> None:
+    def test_disabled_write_attempts_do_not_log_body(self) -> None:
         logs: list[tuple[str, str, str]] = []
         dispatcher = DatastoreDispatcher(
             False,
@@ -235,7 +238,28 @@ class HttpServerTests(TestCase):
         )
         with self.assertRaises(WritesDisabled):
             dispatcher.dispatch("PATCH", "/host/os", '{"value":"linux"}')
-        self.assertEqual(logs, [("PATCH", "/datastore/host/os", '{"value":"linux"}')])
+        self.assertEqual(logs, [])
+
+    def test_write_attempts_are_not_logged_before_token_validation(self) -> None:
+        logs: list[tuple[str, str, str]] = []
+        dispatcher = DatastoreDispatcher(
+            True,
+            lambda path: b"{}",
+            lambda path, body: b"{}",
+            write_token=WRITE_TOKEN,
+            log_write=lambda method, path, body: logs.append((method, path, body)),
+            lock=RecordingLock(),
+        )
+        with self.assertRaises(WriteTokenRequired):
+            dispatcher.dispatch(
+                "POST",
+                "/host/os",
+                '{"value":"linux"}',
+                "application/json",
+                host="127.0.0.1:1280",
+                request_token=None,
+            )
+        self.assertEqual(logs, [])
 
     def test_write_attempts_are_logged_when_enabled(self) -> None:
         logs: list[tuple[str, str, str]] = []
@@ -256,6 +280,28 @@ class HttpServerTests(TestCase):
             request_token=WRITE_TOKEN,
         )
         self.assertEqual(logs, [("POST", "/datastore/host/os", '{"value":"linux"}')])
+
+    def test_invalid_write_json_is_rejected_before_usb_call(self) -> None:
+        calls: list[tuple[str, str]] = []
+
+        def post(path: str, body: str) -> bytes:
+            calls.append((path, body))
+            return b"{}"
+
+        with self.assertRaises(InvalidJsonBody):
+            dispatch_datastore_request(
+                "POST",
+                "/host/os",
+                '{"value":',
+                "application/json",
+                True,
+                lambda path: b"{}",
+                post,
+                host="127.0.0.1:1280",
+                write_token=WRITE_TOKEN,
+                request_token=WRITE_TOKEN,
+            )
+        self.assertEqual(calls, [])
 
     def test_serve_defaults_are_read_only_localhost(self) -> None:
         args = build_parser().parse_args(["serve"])
@@ -307,6 +353,19 @@ class HttpHandlerTests(TestCase):
         self.assertIn(("Content-Type", "application/json"), handler.sent_headers)
         self.assertIn("valid write token required", json.loads(handler.wfile.getvalue().decode("utf-8"))["error"])
 
+    def test_handler_returns_504_for_missing_datastore_response(self) -> None:
+        class Dispatcher:
+            def dispatch(self, *args, **kwargs):
+                raise DatastoreNoResponse("no datastore response")
+
+        handler = self.make_handler(dispatcher=Dispatcher())
+        handler.handle_datastore_request("GET")
+        self.assertEqual(handler.statuses, [504])
+        self.assertEqual(
+            json.loads(handler.wfile.getvalue().decode("utf-8"))["error"],
+            "MOTU USB datastore did not respond",
+        )
+
     def test_handler_accepts_bearer_token_for_local_scripts(self) -> None:
         handler = self.make_handler({"Authorization": f"Bearer {WRITE_TOKEN}"})
         self.assertEqual(handler.read_write_token(), WRITE_TOKEN)
@@ -314,4 +373,9 @@ class HttpHandlerTests(TestCase):
     def test_handler_rejects_oversized_write_body_before_dispatch(self) -> None:
         handler = self.make_handler({"Content-Length": "5", WRITE_TOKEN_HEADER: WRITE_TOKEN}, b"12345", max_write_body_bytes=4)
         with self.assertRaises(RequestBodyTooLarge):
+            handler.read_raw_body()
+
+    def test_handler_rejects_invalid_utf8_write_body(self) -> None:
+        handler = self.make_handler({"Content-Length": "1"}, b"\xff")
+        with self.assertRaisesRegex(BadRequest, "valid UTF-8"):
             handler.read_raw_body()

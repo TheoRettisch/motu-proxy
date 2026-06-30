@@ -8,12 +8,14 @@ import os
 import secrets
 import socket
 import sys
+import time
 from pathlib import Path
 
-from .datastore import DatastoreConfig, open_datastore
-from .device import DEFAULT_DEVFS_ROOT, DEFAULT_SYSFS_ROOT
+from .datastore import DatastoreConfig, ResponseStats, open_datastore
+from .device import DEFAULT_DEVFS_ROOT, DEFAULT_SYSFS_ROOT, UsbDeviceInfo, find_motu_device
 from .fixtures import EXPECTED_GET_DATASTORE, EXPECTED_POST_HOST_OS
 from .http_server import DEFAULT_MAX_WRITE_BODY_BYTES, MotuProxyServer, serve
+from .json_body import validate_json_body
 from .parser import response_to_text
 from .paths import normalize_path
 from .protocol import (
@@ -29,6 +31,7 @@ from .protocol import (
 
 
 DEFAULT_WRITE_TOKEN_FILE = Path("/run/motu-proxy/write-token")
+DEFAULT_SMOKE_PATHS = ("/datastore/uid", "/datastore/ext/maxUSBToHost", "/datastore/host/mode")
 
 
 def config_from_args(args) -> DatastoreConfig:
@@ -83,6 +86,35 @@ def prepare_write_token(token_file: str | None) -> tuple[str, str | None]:
     return token, str(path)
 
 
+def command_info(args) -> int:
+    config = config_from_args(args)
+    device = find_motu_device(
+        config.vid,
+        config.pid,
+        serial=config.serial,
+        sysfs_root=config.sysfs_root,
+        devfs_root=config.devfs_root,
+        interface=config.interface,
+        ep_out=config.ep_out,
+        ep_in=config.ep_in,
+    )
+    print_device_info(config, device)
+    return 0
+
+
+def print_device_info(config: DatastoreConfig, device: UsbDeviceInfo) -> None:
+    print(f"vid: 0x{config.vid:04x}")
+    print(f"pid: 0x{config.pid:04x}")
+    print(f"product: {device.product or '(unknown)'}")
+    print(f"serial: {device.serial or '(none)'}")
+    print(f"interface: {device.interface}")
+    print(f"ep_out: 0x{device.ep_out:02x}")
+    print(f"ep_in: 0x{device.ep_in:02x}")
+    print(f"max_packet_size: {device.max_packet_size}")
+    print(f"sysfs_path: {device.sysfs_path}")
+    print(f"devfs_path: {device.devfs_path}")
+
+
 def command_get(args) -> int:
     path = normalize_path(args.path)
     with open_datastore(config_from_args(args)) as datastore:
@@ -96,6 +128,7 @@ def command_get(args) -> int:
 
 def command_post(args) -> int:
     path = normalize_path(args.path)
+    validate_json_body(args.json_body)
     with open_datastore(config_from_args(args)) as datastore:
         response = datastore.post(path, args.json_body)
     if args.raw:
@@ -106,7 +139,7 @@ def command_post(args) -> int:
 
 
 def command_probe(args) -> int:
-    paths = ["/datastore/uid", "/datastore/ext/maxUSBToHost", "/datastore/host/mode"]
+    paths = list(DEFAULT_SMOKE_PATHS)
     with open_datastore(config_from_args(args)) as datastore:
         for path in paths:
             try:
@@ -116,6 +149,36 @@ def command_probe(args) -> int:
             except Exception as exc:
                 print(f"\n# {path}\nERROR: {exc}", file=sys.stderr)
     return 0
+
+
+def command_smoke(args) -> int:
+    paths = [normalize_path(path) for path in (args.paths or DEFAULT_SMOKE_PATHS)]
+    failures = 0
+    with open_datastore(config_from_args(args)) as datastore:
+        for path in paths:
+            started = time.monotonic()
+            print(f"\n# {path}")
+            try:
+                response = datastore.get(path)
+                elapsed_ms = (time.monotonic() - started) * 1000
+                print(f"OK {format_response_stats(elapsed_ms, datastore.last_response_stats)}")
+                if not args.no_body:
+                    print(response_to_text(response, pretty=not args.compact))
+            except Exception as exc:
+                failures += 1
+                elapsed_ms = (time.monotonic() - started) * 1000
+                print(f"FAIL {format_response_stats(elapsed_ms, datastore.last_response_stats)}")
+                print(f"ERROR: {exc}", file=sys.stderr)
+    return 1 if failures else 0
+
+
+def format_response_stats(elapsed_ms: float, stats: ResponseStats | None) -> str:
+    if stats is None:
+        return f"{elapsed_ms:.1f} ms"
+    return (
+        f"{elapsed_ms:.1f} ms bytes={stats.response_bytes} frames={stats.accepted_frames} "
+        f"reads={stats.reads} ignored={stats.ignored_packets} ack={stats.ack_packets}"
+    )
 
 
 def command_serve(args) -> int:
@@ -192,6 +255,10 @@ def build_parser() -> argparse.ArgumentParser:
     get_parser.add_argument("--compact", action="store_true")
     get_parser.set_defaults(func=command_get)
 
+    info_parser = sub.add_parser("info", help="show discovered MOTU USB control endpoint details")
+    add_usb_args(info_parser)
+    info_parser.set_defaults(func=command_info)
+
     post_parser = sub.add_parser("post", help="POST json=<body> to a datastore path over USB")
     add_usb_args(post_parser)
     post_parser.add_argument("path")
@@ -204,6 +271,18 @@ def build_parser() -> argparse.ArgumentParser:
     add_usb_args(probe_parser)
     probe_parser.add_argument("--compact", action="store_true")
     probe_parser.set_defaults(func=command_probe)
+
+    smoke_parser = sub.add_parser("smoke", help="run a read-only USB datastore smoke test")
+    add_usb_args(smoke_parser)
+    smoke_parser.add_argument(
+        "--path",
+        dest="paths",
+        action="append",
+        help="datastore path to read; may be repeated; defaults to harmless baseline paths",
+    )
+    smoke_parser.add_argument("--compact", action="store_true")
+    smoke_parser.add_argument("--no-body", action="store_true", help="print only timing and frame statistics")
+    smoke_parser.set_defaults(func=command_smoke)
 
     serve_parser = sub.add_parser("serve", help="serve a tiny localhost datastore proxy")
     add_usb_args(serve_parser)

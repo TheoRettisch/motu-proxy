@@ -48,10 +48,24 @@ Read a datastore path:
 motu-proxy get /datastore/uid
 ```
 
-Probe a few harmless baseline paths:
+Show the discovered USB control endpoint without opening the device:
+
+```sh
+motu-proxy info
+```
+
+Probe a few harmless baseline paths, continuing after errors:
 
 ```sh
 motu-proxy probe --compact
+```
+
+Run a strict read-only smoke test that exits nonzero on any failed read and
+prints timing/frame counters:
+
+```sh
+motu-proxy smoke --compact
+motu-proxy smoke --no-body
 ```
 
 Send an explicit datastore POST over USB:

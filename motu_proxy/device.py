@@ -30,6 +30,22 @@ class _Endpoint:
     max_packet_size: int
 
 
+class DeviceDiscoveryError(RuntimeError):
+    pass
+
+
+class NoDeviceFound(DeviceDiscoveryError):
+    pass
+
+
+class MultipleDevicesFound(DeviceDiscoveryError):
+    pass
+
+
+class NoControlInterfaceFound(DeviceDiscoveryError):
+    pass
+
+
 def read_text(path: Path) -> str:
     return path.read_text(encoding="ascii", errors="replace").strip()
 
@@ -124,7 +140,7 @@ def find_motu_device(
         discovered = _discover_control_interface(path, sysfs_root)
         if discovered is None:
             if interface is None or ep_out is None or ep_in is None:
-                raise RuntimeError(
+                raise NoControlInterfaceFound(
                     f"no unbound vendor-specific bulk control interface found for "
                     f"{device_product or f'{vid:04x}:{pid:04x}'} {device_serial or '(no serial)'}"
                 )
@@ -145,8 +161,8 @@ def find_motu_device(
 
     if not matches:
         serial_text = f" serial {serial}" if serial else ""
-        raise RuntimeError(f"no MOTU USB device found for {vid:04x}:{pid:04x}{serial_text}")
+        raise NoDeviceFound(f"no MOTU USB device found for {vid:04x}:{pid:04x}{serial_text}")
     if len(matches) > 1:
         serials = ", ".join(match.serial or "(no serial)" for match in matches)
-        raise RuntimeError(f"multiple MOTU devices matched; choose --serial. Matches: {serials}")
+        raise MultipleDevicesFound(f"multiple MOTU devices matched; choose --serial. Matches: {serials}")
     return matches[0]
