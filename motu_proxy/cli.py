@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import argparse
+import ipaddress
+import os
+import secrets
 import socket
 import sys
 from pathlib import Path
@@ -10,7 +13,7 @@ from pathlib import Path
 from .datastore import DatastoreConfig, open_datastore
 from .device import DEFAULT_DEVFS_ROOT, DEFAULT_SYSFS_ROOT
 from .fixtures import EXPECTED_GET_DATASTORE, EXPECTED_POST_HOST_OS
-from .http_server import MotuProxyServer, serve
+from .http_server import DEFAULT_MAX_WRITE_BODY_BYTES, MotuProxyServer, serve
 from .parser import response_to_text
 from .paths import normalize_path
 from .protocol import (
@@ -23,6 +26,9 @@ from .protocol import (
     build_post_frame,
     crc32,
 )
+
+
+DEFAULT_WRITE_TOKEN_FILE = Path("/run/motu-proxy/write-token")
 
 
 def config_from_args(args) -> DatastoreConfig:
@@ -41,6 +47,40 @@ def config_from_args(args) -> DatastoreConfig:
         sysfs_root=Path(args.sysfs_root),
         devfs_root=Path(args.devfs_root),
     )
+
+
+def _is_loopback_listen_address(address: str) -> bool:
+    if address == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(address).is_loopback
+    except ValueError:
+        return False
+
+
+def validate_serve_write_safety(listen: str, allow_writes: bool, unsafe_allow_remote_writes: bool) -> None:
+    if allow_writes and not unsafe_allow_remote_writes and not _is_loopback_listen_address(listen):
+        raise RuntimeError(
+            "--allow-writes requires a loopback --listen address unless --unsafe-allow-remote-writes is set"
+        )
+
+
+def write_token_file(path: Path, token: str) -> None:
+    path.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="ascii") as handle:
+        handle.write(token)
+        handle.write("\n")
+    os.chmod(path, 0o600)
+
+
+def prepare_write_token(token_file: str | None) -> tuple[str, str | None]:
+    token = secrets.token_urlsafe(32)
+    if token_file is None:
+        return token, None
+    path = Path(token_file)
+    write_token_file(path, token)
+    return token, str(path)
 
 
 def command_get(args) -> int:
@@ -80,6 +120,7 @@ def command_probe(args) -> int:
 
 def command_serve(args) -> int:
     config = config_from_args(args)
+    validate_serve_write_safety(args.listen, args.allow_writes, args.unsafe_allow_remote_writes)
 
     def run_get(path: str) -> bytes:
         with open_datastore(config) as datastore:
@@ -89,7 +130,20 @@ def command_serve(args) -> int:
         with open_datastore(config) as datastore:
             return datastore.post(path, json_body)
 
-    server = MotuProxyServer((args.listen, args.port), args.allow_writes, args.debug, run_get, run_post)
+    write_token, write_token_file_path = (
+        prepare_write_token(args.write_token_file) if args.allow_writes else (None, None)
+    )
+    server = MotuProxyServer(
+        (args.listen, args.port),
+        args.allow_writes,
+        args.debug,
+        run_get,
+        run_post,
+        write_token=write_token,
+        write_token_file=write_token_file_path,
+        allow_remote_writes=args.unsafe_allow_remote_writes,
+        max_write_body_bytes=args.max_write_body_bytes,
+    )
     return serve(server)
 
 
@@ -156,6 +210,29 @@ def build_parser() -> argparse.ArgumentParser:
     serve_parser.add_argument("--listen", default="127.0.0.1")
     serve_parser.add_argument("--port", type=int, default=1280)
     serve_parser.add_argument("--allow-writes", action="store_true")
+    serve_parser.add_argument(
+        "--write-token-file",
+        default=str(DEFAULT_WRITE_TOKEN_FILE),
+        help="write the generated HTTP write token here for local automation",
+    )
+    serve_parser.add_argument(
+        "--no-write-token-file",
+        dest="write_token_file",
+        action="store_const",
+        const=None,
+        help="print the generated write token but do not write a token file",
+    )
+    serve_parser.add_argument(
+        "--unsafe-allow-remote-writes",
+        action="store_true",
+        help="allow --allow-writes on a non-loopback listen address; token is still required",
+    )
+    serve_parser.add_argument(
+        "--max-write-body-bytes",
+        type=int,
+        default=DEFAULT_MAX_WRITE_BODY_BYTES,
+        help="maximum accepted HTTP write body size",
+    )
     serve_parser.set_defaults(func=command_serve)
 
     selftest_parser = sub.add_parser("selftest", help="verify frame builder against capture bytes")

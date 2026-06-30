@@ -1,7 +1,26 @@
+import json
+from io import BytesIO
+from types import SimpleNamespace
 from unittest import TestCase
 
 from motu_proxy.cli import build_parser
-from motu_proxy.http_server import CrossOriginWrite, DatastoreDispatcher, WritesDisabled, dispatch_datastore_request
+from motu_proxy.http_server import (
+    WRITE_TOKEN_HEADER,
+    CrossOriginWrite,
+    DatastoreDispatcher,
+    DispatchResult,
+    HostNotAllowed,
+    MotuProxyHandler,
+    RequestBodyTooLarge,
+    WriteTokenRequired,
+    WritesDisabled,
+    dispatch_datastore_request,
+    response_content_type,
+)
+
+
+WRITE_TOKEN = "test-write-token"
+_UNSET = object()
 
 
 class RecordingLock:
@@ -26,7 +45,10 @@ class HttpServerTests(TestCase):
         content_type: str = "",
         allow_writes: bool = False,
         origin: str | None = None,
-        host: str | None = None,
+        host: str | None | object = _UNSET,
+        write_token: str | None = WRITE_TOKEN,
+        request_token: str | None | object = _UNSET,
+        allow_remote_writes: bool = False,
     ):
         calls: list[tuple[str, str, str | None]] = []
 
@@ -38,6 +60,10 @@ class HttpServerTests(TestCase):
             calls.append(("POST", path, body))
             return b'{"ok":true}'
 
+        if host is _UNSET:
+            host = "127.0.0.1:1280" if allow_writes else None
+        if request_token is _UNSET:
+            request_token = write_token if allow_writes else None
         result = dispatch_datastore_request(
             method,
             path,
@@ -48,6 +74,9 @@ class HttpServerTests(TestCase):
             post,
             origin=origin,
             host=host,
+            write_token=write_token,
+            request_token=request_token,
+            allow_remote_writes=allow_remote_writes,
         )
         return result, calls
 
@@ -99,8 +128,58 @@ class HttpServerTests(TestCase):
                 post,
                 origin="https://example.test",
                 host="127.0.0.1:1280",
+                write_token=WRITE_TOKEN,
+                request_token=WRITE_TOKEN,
             )
         self.assertEqual(calls, [])
+
+    def test_missing_write_token_is_rejected_when_writes_are_enabled(self) -> None:
+        with self.assertRaises(WriteTokenRequired):
+            self.dispatch("POST", "/host/os", body='{"value":"linux"}', allow_writes=True, request_token=None)
+
+    def test_unknown_host_is_rejected_when_writes_are_enabled(self) -> None:
+        with self.assertRaises(HostNotAllowed):
+            self.dispatch(
+                "POST",
+                "/host/os",
+                body='{"value":"linux"}',
+                allow_writes=True,
+                host="device.local:1280",
+            )
+
+    def test_null_origin_is_rejected_when_writes_are_enabled(self) -> None:
+        with self.assertRaises(CrossOriginWrite):
+            self.dispatch(
+                "POST",
+                "/host/os",
+                body='{"value":"linux"}',
+                allow_writes=True,
+                origin="null",
+            )
+
+    def test_unsafe_remote_write_mode_still_requires_token(self) -> None:
+        with self.assertRaises(WriteTokenRequired):
+            self.dispatch(
+                "POST",
+                "/host/os",
+                body='{"value":"linux"}',
+                allow_writes=True,
+                host="device.local:1280",
+                request_token=None,
+                allow_remote_writes=True,
+            )
+
+    def test_unsafe_remote_write_mode_allows_non_loopback_host_with_token(self) -> None:
+        result, calls = self.dispatch(
+            "POST",
+            "/host/os",
+            body='{"value":"linux"}',
+            allow_writes=True,
+            host="device.local:1280",
+            allow_remote_writes=True,
+        )
+        self.assertEqual(result.response, b'{"ok":true}')
+        self.assertEqual(calls, [("POST", "/datastore/host/os", '{"value":"linux"}')])
 
     def test_https_origin_is_rejected_for_plain_http_server(self) -> None:
         with self.assertRaises(CrossOriginWrite):
@@ -164,13 +243,75 @@ class HttpServerTests(TestCase):
             True,
             lambda path: b"{}",
             lambda path, body: b"{}",
+            write_token=WRITE_TOKEN,
             log_write=lambda method, path, body: logs.append((method, path, body)),
             lock=RecordingLock(),
         )
-        dispatcher.dispatch("POST", "/host/os", 'json={"value":"linux"}', "application/x-www-form-urlencoded")
+        dispatcher.dispatch(
+            "POST",
+            "/host/os",
+            'json={"value":"linux"}',
+            "application/x-www-form-urlencoded",
+            host="127.0.0.1:1280",
+            request_token=WRITE_TOKEN,
+        )
         self.assertEqual(logs, [("POST", "/datastore/host/os", '{"value":"linux"}')])
 
     def test_serve_defaults_are_read_only_localhost(self) -> None:
         args = build_parser().parse_args(["serve"])
         self.assertEqual(args.listen, "127.0.0.1")
         self.assertFalse(args.allow_writes)
+
+    def test_response_content_type_uses_octet_stream_for_concatenated_json(self) -> None:
+        self.assertEqual(response_content_type(b'{"first":true}{"second":true}'), "application/octet-stream")
+
+
+class HttpHandlerTests(TestCase):
+    def make_handler(self, headers=None, body: bytes = b"", dispatcher=None, max_write_body_bytes: int = 64 * 1024):
+        handler = object.__new__(MotuProxyHandler)
+        handler.headers = headers or {}
+        handler.rfile = BytesIO(body)
+        handler.wfile = BytesIO()
+        handler.path = "/datastore"
+        handler.server = SimpleNamespace(
+            debug=False,
+            dispatcher=dispatcher,
+            max_write_body_bytes=max_write_body_bytes,
+        )
+        handler.statuses = []
+        handler.sent_headers = []
+        handler.send_response = lambda status: handler.statuses.append(status)
+        handler.send_header = lambda key, value: handler.sent_headers.append((key, value))
+        handler.end_headers = lambda: None
+        return handler
+
+    def test_handler_does_not_truncate_concatenated_json_response(self) -> None:
+        class Dispatcher:
+            def dispatch(self, *args, **kwargs):
+                return DispatchResult(b'{"first":true}{"second":true}', "/datastore")
+
+        handler = self.make_handler(dispatcher=Dispatcher())
+        handler.handle_datastore_request("GET")
+        self.assertEqual(handler.statuses, [200])
+        self.assertIn(("Content-Type", "application/octet-stream"), handler.sent_headers)
+        self.assertEqual(handler.wfile.getvalue(), b'{"first":true}{"second":true}')
+
+    def test_handler_returns_json_403_when_token_is_missing(self) -> None:
+        class Dispatcher:
+            def dispatch(self, *args, **kwargs):
+                raise WriteTokenRequired("valid write token required")
+
+        handler = self.make_handler({"Content-Length": "17"}, b'{"value":"linux"}', Dispatcher())
+        handler.handle_datastore_request("POST")
+        self.assertEqual(handler.statuses, [403])
+        self.assertIn(("Content-Type", "application/json"), handler.sent_headers)
+        self.assertIn("valid write token required", json.loads(handler.wfile.getvalue().decode("utf-8"))["error"])
+
+    def test_handler_accepts_bearer_token_for_local_scripts(self) -> None:
+        handler = self.make_handler({"Authorization": f"Bearer {WRITE_TOKEN}"})
+        self.assertEqual(handler.read_write_token(), WRITE_TOKEN)
+
+    def test_handler_rejects_oversized_write_body_before_dispatch(self) -> None:
+        handler = self.make_handler({"Content-Length": "5", WRITE_TOKEN_HEADER: WRITE_TOKEN}, b"12345", max_write_body_bytes=4)
+        with self.assertRaises(RequestBodyTooLarge):
+            handler.read_raw_body()

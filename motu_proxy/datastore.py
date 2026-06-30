@@ -36,6 +36,14 @@ class Transport(Protocol):
         ...
 
 
+class ShortUsbFrame(RuntimeError):
+    pass
+
+
+class ShortUsbWrite(RuntimeError):
+    pass
+
+
 @dataclass(frozen=True)
 class DatastoreConfig:
     vid: int = MOTU_VID
@@ -67,20 +75,25 @@ class MotuUsbDatastore:
     def _next_host_seq(self) -> int:
         return self.host_seq.take()
 
+    def _write_frame(self, frame: bytes) -> None:
+        written = self.transport.bulk_write(frame)
+        if written != len(frame):
+            raise ShortUsbWrite(f"short USB write: wrote {written} of {len(frame)} bytes")
+
     def init(self) -> None:
-        self.transport.bulk_write(build_init(self._next_host_seq()))
+        self._write_frame(build_init(self._next_host_seq()))
         self._drain_quiet(quiet_reads=1, timeout_ms=200)
 
     def get(self, path: str, etag: str = "0") -> bytes:
         frame = build_get_frame(self._next_host_seq(), self.message_seq, path, etag=etag)
         self.message_seq += 1
-        self.transport.bulk_write(frame)
+        self._write_frame(frame)
         return self._collect_response()
 
     def post(self, path: str, json_body: str) -> bytes:
         frame = build_post_frame(self._next_host_seq(), self.message_seq, path, json_body)
         self.message_seq += 1
-        self.transport.bulk_write(frame)
+        self._write_frame(frame)
         return self._collect_response()
 
     def _read_logical_frame(self, timeout_ms: int | None = None) -> bytes:
@@ -89,10 +102,10 @@ class MotuUsbDatastore:
         if not first:
             return b""
         if len(first) < 4:
-            return first
+            raise ShortUsbFrame(f"short USB logical frame header: got {len(first)} bytes")
         expected = struct.unpack_from("<H", first, 2)[0]
         if expected < 4:
-            return first
+            raise ShortUsbFrame(f"invalid USB logical frame length {expected}")
         chunks = [first]
         got = len(first)
         while got < expected:
@@ -101,6 +114,8 @@ class MotuUsbDatastore:
                 break
             chunks.append(chunk)
             got += len(chunk)
+        if got < expected:
+            raise ShortUsbFrame(f"short USB logical frame: got {got} of {expected} bytes")
         return b"".join(chunks)
 
     def _collect_response(self, max_bytes: int = 1024 * 1024) -> bytes:
@@ -123,7 +138,7 @@ class MotuUsbDatastore:
             if body.startswith((b"NREK", b"PTTH")):
                 frames.append(body)
                 total += len(body)
-                self.transport.bulk_write(build_ack(self._next_host_seq()))
+                self._write_frame(build_ack(self._next_host_seq()))
                 pending.extend(self._drain_quiet(quiet_reads=1, timeout_ms=120))
                 if total > max_bytes:
                     raise RuntimeError(f"response exceeded {max_bytes} bytes")

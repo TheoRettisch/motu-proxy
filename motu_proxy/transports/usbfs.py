@@ -108,8 +108,15 @@ class UsbFsTransport:
         if self.fd is None:
             raise RuntimeError("transport is not open")
         buf = ctypes.create_string_buffer(data, len(data))
-        transfer = UsbdevfsBulkTransfer(self.device.ep_out, len(data), self.timeout_ms, ctypes.cast(buf, ctypes.c_void_p))
+        transfer = UsbdevfsBulkTransfer(
+            self.device.ep_out,
+            len(data),
+            self.timeout_ms,
+            ctypes.cast(buf, ctypes.c_void_p),
+        )
         ret = _ioctl(self.fd, USBDEVFS_BULK, ctypes.byref(transfer))
+        if ret != len(data):
+            raise OSError(errno.EIO, f"short USB bulk write: wrote {ret} of {len(data)} bytes")
         if self.debug:
             print(f"OUT {ret:4d}: {data[:32].hex(' ')}", file=sys.stderr)
         return ret

@@ -1,0 +1,222 @@
+# motu-proxy
+
+`motu-proxy` is a dependency-light Python CLI and localhost HTTP proxy for
+MOTU AVB USB datastore operations. It talks to the Linux USB vendor-specific
+bulk control interface while leaving the class-compliant ALSA audio interfaces
+alone.
+
+The current validation target is a MOTU 624 exposed as USB VID:PID
+`07fd:0005`, with ALSA owning audio interfaces 0-2 and the datastore control
+path on the unbound vendor-specific interface.
+
+## Scope
+
+- Runtime support is Linux-only. The USB backend uses sysfs and usbfs.
+- Development and hardware-independent tests should work on non-Linux hosts.
+- The package has no runtime Python dependencies beyond the standard library.
+- HTTP writes are disabled by default and require explicit opt-in plus a write
+  token.
+
+## Install
+
+Use an editable install while developing:
+
+```sh
+python -m pip install -e .
+```
+
+You can also run the package without installing:
+
+```sh
+python -m motu_proxy selftest
+```
+
+USB access usually requires root, a suitable udev rule, or device permissions
+for `/dev/bus/usb/...`.
+
+## CLI Usage
+
+Verify the protocol fixture builders without hardware:
+
+```sh
+motu-proxy selftest
+```
+
+Read a datastore path:
+
+```sh
+motu-proxy get /datastore/uid
+```
+
+Probe a few harmless baseline paths:
+
+```sh
+motu-proxy probe --compact
+```
+
+Send an explicit datastore POST over USB:
+
+```sh
+motu-proxy post /datastore/host/os '{"value":"linux"}'
+```
+
+Useful USB selection overrides:
+
+```sh
+motu-proxy get /uid --serial 0001f2fffe00c719
+motu-proxy get /uid --interface 3 --ep-out 0x03 --ep-in 0x83
+```
+
+Paths are normalized for compatibility. For example, `/uid` becomes
+`/datastore/uid`, and a leading 16-hex-character UID segment is stripped.
+
+## HTTP Proxy
+
+Start the read-only localhost proxy:
+
+```sh
+motu-proxy serve
+```
+
+Read through HTTP:
+
+```sh
+curl http://127.0.0.1:1280/datastore/uid
+```
+
+By default the server binds to `127.0.0.1`, serializes access with one
+dispatcher lock, opens the USB datastore per request, and rejects POST/PATCH.
+
+## Write Mode
+
+HTTP writes require `--allow-writes`:
+
+```sh
+motu-proxy serve --allow-writes
+```
+
+When write mode is enabled, `motu-proxy` generates a random token, prints it to
+stderr, and writes it to:
+
+```text
+/run/motu-proxy/write-token
+```
+
+The token file is created with owner-only permissions on Linux. Every HTTP
+POST/PATCH must include the token using either:
+
+```text
+Authorization: Bearer <token>
+```
+
+or:
+
+```text
+X-Motu-Proxy-Token: <token>
+```
+
+Example write:
+
+```sh
+TOKEN="$(cat /run/motu-proxy/write-token)"
+curl \
+  -X POST \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  --data '{"value":"linux"}' \
+  http://127.0.0.1:1280/datastore/host/os
+```
+
+HTTP PATCH is accepted only as a compatibility alias for the same MOTU
+datastore POST operation. It does not implement partial-update semantics.
+
+Additional write-mode protections:
+
+- Missing or incorrect write token is rejected.
+- Non-loopback `Host` headers are rejected by default.
+- Cross-origin browser writes are rejected when an `Origin` header is present.
+- `Origin: null` is rejected.
+- Request bodies larger than `--max-write-body-bytes` are rejected.
+- `--allow-writes` with a non-loopback `--listen` address requires
+  `--unsafe-allow-remote-writes`.
+
+Avoid exposing write mode on a LAN unless the host is otherwise isolated and
+the token is treated as a secret.
+
+## Local Automation
+
+Buildroot or other local scripts can consume the generated token without user
+interaction by reading the token file and sending it as a bearer token:
+
+```python
+from pathlib import Path
+from urllib.request import Request, urlopen
+
+token = Path("/run/motu-proxy/write-token").read_text(encoding="ascii").strip()
+request = Request(
+    "http://127.0.0.1:1280/datastore/host/os",
+    data=b'{"value":"linux"}',
+    headers={
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+    },
+    method="POST",
+)
+
+response = urlopen(request, timeout=2).read()
+```
+
+The token path can be changed:
+
+```sh
+motu-proxy serve --allow-writes --write-token-file /run/my-service/motu-token
+```
+
+or disabled if an operator wants the token only on stderr:
+
+```sh
+motu-proxy serve --allow-writes --no-write-token-file
+```
+
+## Development
+
+Run the hardware-free test suite:
+
+```sh
+pytest -q
+```
+
+Run the fixture self-test:
+
+```sh
+python -m motu_proxy selftest
+```
+
+The tests cover protocol byte fixtures, path normalization, parser helpers,
+fake sysfs discovery, HTTP write gating, token handling, and USB short
+read/write failure paths. Fake Linux sysfs tests are skipped on Windows where
+Linux interface names such as `3-3:1.3` are not valid paths.
+
+## Project Layout
+
+- `motu_proxy/protocol.py`: CRC32, frame builders, ACK/init helpers, host
+  sequence helpers.
+- `motu_proxy/parser.py`: response body helpers and JSON display extraction.
+- `motu_proxy/device.py`: Linux sysfs device/interface/endpoint discovery.
+- `motu_proxy/transports/usbfs.py`: Linux usbfs bulk transport.
+- `motu_proxy/datastore.py`: datastore GET/POST orchestration over a transport.
+- `motu_proxy/http_server.py`: localhost HTTP compatibility layer and write
+  safety checks.
+- `motu_proxy/cli.py`: command-line entry point.
+- `tests/`: hardware-free regression tests.
+- `handover/`: original MVP notes and reference script.
+- `openspec/`: design/specification history for the rebuild.
+
+## Known Follow-Ups
+
+- Validate strict response-frame CRC/message-sequence parsing against live MOTU
+  response captures before making it mandatory.
+- Consider an optional persistent USB session mode for HTTP serving if request
+  latency becomes a problem.
+- Add service packaging and deployment-specific udev/systemd integration when
+  the target image layout is settled.

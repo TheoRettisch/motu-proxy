@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hmac
+import ipaddress
 import json
 import sys
 import threading
@@ -10,13 +12,14 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Callable
 from urllib.parse import parse_qs, urlparse
 
-from .parser import extract_json_bytes
 from .paths import normalize_path
 
 
 DatastoreRead = Callable[[str], bytes]
 DatastoreWrite = Callable[[str, str], bytes]
 WriteLogger = Callable[[str, str, str], None]
+DEFAULT_MAX_WRITE_BODY_BYTES = 64 * 1024
+WRITE_TOKEN_HEADER = "X-Motu-Proxy-Token"
 
 
 class WritesDisabled(RuntimeError):
@@ -24,6 +27,22 @@ class WritesDisabled(RuntimeError):
 
 
 class CrossOriginWrite(RuntimeError):
+    pass
+
+
+class HostNotAllowed(RuntimeError):
+    pass
+
+
+class WriteTokenRequired(RuntimeError):
+    pass
+
+
+class RequestBodyTooLarge(RuntimeError):
+    pass
+
+
+class BadRequest(RuntimeError):
     pass
 
 
@@ -46,11 +65,44 @@ def _origin_matches_host(origin: str, host: str) -> bool:
     return parsed.scheme == "http" and bool(parsed.netloc) and parsed.netloc.lower() == host.lower()
 
 
+def _host_name(host: str | None) -> str:
+    if not host:
+        return ""
+    parsed = urlparse(f"//{host}", allow_fragments=False)
+    return (parsed.hostname or "").lower()
+
+
+def _is_loopback_host(host: str | None) -> bool:
+    name = _host_name(host)
+    if name == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(name).is_loopback
+    except ValueError:
+        return False
+
+
+def validate_write_host(method: str, allow_writes: bool, host: str | None, allow_remote_writes: bool) -> None:
+    if method == "GET" or not allow_writes or allow_remote_writes:
+        return
+    if not _is_loopback_host(host):
+        raise HostNotAllowed("write requests require a loopback Host header")
+
+
 def validate_write_origin(method: str, allow_writes: bool, origin: str | None, host: str | None) -> None:
     if method == "GET" or not allow_writes or not origin:
         return
+    if origin == "null":
+        raise CrossOriginWrite("cross-origin writes are blocked")
     if not host or not _origin_matches_host(origin, host):
         raise CrossOriginWrite("cross-origin writes are blocked")
+
+
+def validate_write_token(method: str, allow_writes: bool, expected_token: str | None, request_token: str | None) -> None:
+    if method == "GET" or not allow_writes:
+        return
+    if not expected_token or not request_token or not hmac.compare_digest(expected_token, request_token):
+        raise WriteTokenRequired("valid write token required")
 
 
 def dispatch_datastore_request(
@@ -64,6 +116,9 @@ def dispatch_datastore_request(
     log_write: WriteLogger | None = None,
     origin: str | None = None,
     host: str | None = None,
+    write_token: str | None = None,
+    request_token: str | None = None,
+    allow_remote_writes: bool = False,
 ) -> DispatchResult:
     path = normalize_path(urlparse(request_path).path)
     if method == "GET":
@@ -73,7 +128,9 @@ def dispatch_datastore_request(
         log_write(method, path, write_body)
     if not allow_writes:
         raise WritesDisabled("writes require --allow-writes")
+    validate_write_host(method, allow_writes, host, allow_remote_writes)
     validate_write_origin(method, allow_writes, origin, host)
+    validate_write_token(method, allow_writes, write_token, request_token)
     # HTTP PATCH is a compatibility alias for the MOTU datastore POST write.
     return DispatchResult(run_post(path, write_body), path)
 
@@ -88,12 +145,16 @@ class DatastoreDispatcher:
         allow_writes: bool,
         run_get: DatastoreRead,
         run_post: DatastoreWrite,
+        write_token: str | None = None,
+        allow_remote_writes: bool = False,
         log_write: WriteLogger | None = log_write_attempt,
         lock: threading.Lock | None = None,
     ) -> None:
         self.allow_writes = allow_writes
         self.run_get = run_get
         self.run_post = run_post
+        self.write_token = write_token
+        self.allow_remote_writes = allow_remote_writes
         self.log_write = log_write
         self.lock = lock if lock is not None else threading.Lock()
 
@@ -105,6 +166,7 @@ class DatastoreDispatcher:
         content_type: str = "",
         origin: str | None = None,
         host: str | None = None,
+        request_token: str | None = None,
     ) -> DispatchResult:
         with self.lock:
             return dispatch_datastore_request(
@@ -118,6 +180,9 @@ class DatastoreDispatcher:
                 log_write=self.log_write,
                 origin=origin,
                 host=host,
+                write_token=self.write_token,
+                request_token=request_token,
+                allow_remote_writes=self.allow_remote_writes,
             )
 
 
@@ -148,26 +213,51 @@ class MotuProxyHandler(BaseHTTPRequestHandler):
                 self.headers.get("Content-Type", ""),
                 origin=self.headers.get("Origin"),
                 host=self.headers.get("Host"),
+                request_token=self.read_write_token(),
             )
-            body = extract_json_bytes(result.response) or result.response
+            body = result.response
             self.send_response(200)
-            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Type", response_content_type(body))
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
-        except (WritesDisabled, CrossOriginWrite) as exc:
-            self.send_error(403, str(exc))
+        except (WritesDisabled, CrossOriginWrite, HostNotAllowed, WriteTokenRequired) as exc:
+            self.send_json_error(403, str(exc))
+        except RequestBodyTooLarge as exc:
+            self.send_json_error(413, str(exc))
+        except BadRequest as exc:
+            self.send_json_error(400, str(exc))
         except Exception as exc:
-            body = json.dumps({"error": str(exc)}).encode("utf-8")
-            self.send_response(502)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
+            self.send_json_error(502, str(exc))
 
     def read_raw_body(self) -> str:
-        length = int(self.headers.get("Content-Length", "0") or "0")
+        try:
+            length = int(self.headers.get("Content-Length", "0") or "0")
+        except ValueError as exc:
+            raise BadRequest("invalid Content-Length") from exc
+        if length < 0:
+            raise BadRequest("invalid Content-Length")
+        if length > self.server.max_write_body_bytes:
+            raise RequestBodyTooLarge(f"request body exceeds {self.server.max_write_body_bytes} bytes")
         return self.rfile.read(length).decode("utf-8", errors="replace")
+
+    def read_write_token(self) -> str | None:
+        token = self.headers.get(WRITE_TOKEN_HEADER)
+        if token:
+            return token.strip()
+        authorization = self.headers.get("Authorization", "")
+        scheme, _, value = authorization.partition(" ")
+        if scheme.lower() == "bearer" and value:
+            return value.strip()
+        return None
+
+    def send_json_error(self, status: int, message: str) -> None:
+        body = json.dumps({"error": message}).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
 
 
 class MotuProxyServer(ThreadingHTTPServer):
@@ -178,16 +268,45 @@ class MotuProxyServer(ThreadingHTTPServer):
         debug: bool,
         run_get: DatastoreRead,
         run_post: DatastoreWrite,
+        write_token: str | None = None,
+        write_token_file: str | None = None,
+        allow_remote_writes: bool = False,
+        max_write_body_bytes: int = DEFAULT_MAX_WRITE_BODY_BYTES,
     ) -> None:
         super().__init__(server_address, MotuProxyHandler)
         self.allow_writes = allow_writes
         self.debug = debug
-        self.dispatcher = DatastoreDispatcher(allow_writes, run_get, run_post)
+        self.write_token = write_token
+        self.write_token_file = write_token_file
+        self.allow_remote_writes = allow_remote_writes
+        self.max_write_body_bytes = max_write_body_bytes
+        self.dispatcher = DatastoreDispatcher(
+            allow_writes,
+            run_get,
+            run_post,
+            write_token=write_token,
+            allow_remote_writes=allow_remote_writes,
+        )
+
+
+def response_content_type(body: bytes) -> str:
+    try:
+        json.loads(body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return "application/octet-stream"
+    return "application/json"
 
 
 def serve(server: MotuProxyServer) -> int:
     host, port = server.server_address[:2]
     print(f"listening on http://{host}:{port} writes={'on' if server.allow_writes else 'off'}", file=sys.stderr)
+    if server.allow_writes:
+        print(f"write token: {server.write_token}", file=sys.stderr)
+        print(f"write token header: {WRITE_TOKEN_HEADER} or Authorization: Bearer", file=sys.stderr)
+        if server.write_token_file:
+            print(f"write token file: {server.write_token_file}", file=sys.stderr)
+        if server.allow_remote_writes:
+            print("WARNING: remote HTTP writes are enabled; keep the token secret", file=sys.stderr)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
