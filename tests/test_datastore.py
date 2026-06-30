@@ -36,6 +36,17 @@ class DatastoreTests(TestCase):
         self.assertEqual(transport.writes[0], build_get_frame(0x20, 2, "/datastore/uid"))
         self.assertEqual(transport.writes[1], bytes.fromhex("21 81 04 00"))
 
+    def test_get_collects_response_frames_read_during_ack_drain(self) -> None:
+        first = b"NREK" + b"\x00" * 16 + b'{"first":true}'
+        second = b"NREK" + b"\x00" * 16 + b'{"second":true}'
+        transport = FakeTransport([logical_packet(first), logical_packet(second)])
+        datastore = MotuUsbDatastore(transport)
+        response = datastore.get("/datastore")
+        self.assertEqual(response, b'{"first":true}{"second":true}')
+        self.assertEqual(transport.writes[0], build_get_frame(0x20, 2, "/datastore"))
+        self.assertEqual(transport.writes[1], bytes.fromhex("21 81 04 00"))
+        self.assertEqual(transport.writes[2], bytes.fromhex("22 81 04 00"))
+
     def test_post_uses_post_frame(self) -> None:
         body = b"NREK" + b"\x00" * 16 + b'{"ok":true}'
         transport = FakeTransport([logical_packet(body)])

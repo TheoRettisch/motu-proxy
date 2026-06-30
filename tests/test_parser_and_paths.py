@@ -30,6 +30,9 @@ class PathTests(TestCase):
     def test_datastore_path_passes_through(self) -> None:
         self.assertEqual(normalize_path("/datastore/uid"), "/datastore/uid")
 
+    def test_datastore_prefix_must_be_complete_path_segment(self) -> None:
+        self.assertEqual(normalize_path("/datastore-foo"), "/datastore/datastore-foo")
+
     def test_bare_path_gets_datastore_prefix(self) -> None:
         self.assertEqual(normalize_path("/uid"), "/datastore/uid")
 

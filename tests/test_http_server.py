@@ -1,7 +1,7 @@
 from unittest import TestCase
 
 from motu_proxy.cli import build_parser
-from motu_proxy.http_server import DatastoreDispatcher, WritesDisabled, dispatch_datastore_request
+from motu_proxy.http_server import CrossOriginWrite, DatastoreDispatcher, WritesDisabled, dispatch_datastore_request
 
 
 class RecordingLock:
@@ -18,7 +18,16 @@ class RecordingLock:
 
 
 class HttpServerTests(TestCase):
-    def dispatch(self, method: str, path: str, body: str = "", content_type: str = "", allow_writes: bool = False):
+    def dispatch(
+        self,
+        method: str,
+        path: str,
+        body: str = "",
+        content_type: str = "",
+        allow_writes: bool = False,
+        origin: str | None = None,
+        host: str | None = None,
+    ):
         calls: list[tuple[str, str, str | None]] = []
 
         def get(path: str) -> bytes:
@@ -29,7 +38,17 @@ class HttpServerTests(TestCase):
             calls.append(("POST", path, body))
             return b'{"ok":true}'
 
-        result = dispatch_datastore_request(method, path, body, content_type, allow_writes, get, post)
+        result = dispatch_datastore_request(
+            method,
+            path,
+            body,
+            content_type,
+            allow_writes,
+            get,
+            post,
+            origin=origin,
+            host=host,
+        )
         return result, calls
 
     def test_get_returns_json_and_normalizes_path(self) -> None:
@@ -55,6 +74,56 @@ class HttpServerTests(TestCase):
 
     def test_patch_is_post_alias_not_partial_update(self) -> None:
         result, calls = self.dispatch("PATCH", "/host/os", body='{"value":"linux"}', allow_writes=True)
+        self.assertEqual(result.response, b'{"ok":true}')
+        self.assertEqual(calls, [("POST", "/datastore/host/os", '{"value":"linux"}')])
+
+    def test_cross_origin_write_is_rejected_when_writes_are_enabled(self) -> None:
+        calls: list[tuple[str, str, str | None]] = []
+
+        def get(path: str) -> bytes:
+            calls.append(("GET", path, None))
+            return b"{}"
+
+        def post(path: str, body: str) -> bytes:
+            calls.append(("POST", path, body))
+            return b"{}"
+
+        with self.assertRaises(CrossOriginWrite):
+            dispatch_datastore_request(
+                "POST",
+                "/host/os",
+                '{"value":"linux"}',
+                "application/json",
+                True,
+                get,
+                post,
+                origin="https://example.test",
+                host="127.0.0.1:1280",
+            )
+        self.assertEqual(calls, [])
+
+    def test_https_origin_is_rejected_for_plain_http_server(self) -> None:
+        with self.assertRaises(CrossOriginWrite):
+            self.dispatch(
+                "POST",
+                "/host/os",
+                body='{"value":"linux"}',
+                content_type="application/json",
+                allow_writes=True,
+                origin="https://127.0.0.1:1280",
+                host="127.0.0.1:1280",
+            )
+
+    def test_same_origin_write_is_allowed_when_writes_are_enabled(self) -> None:
+        result, calls = self.dispatch(
+            "POST",
+            "/host/os",
+            body='{"value":"linux"}',
+            content_type="application/json",
+            allow_writes=True,
+            origin="http://127.0.0.1:1280",
+            host="127.0.0.1:1280",
+        )
         self.assertEqual(result.response, b'{"ok":true}')
         self.assertEqual(calls, [("POST", "/datastore/host/os", '{"value":"linux"}')])
 

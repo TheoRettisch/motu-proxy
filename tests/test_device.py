@@ -1,6 +1,7 @@
+import os
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from unittest import TestCase
+from unittest import TestCase, skipIf
 
 from motu_proxy.device import find_motu_device
 
@@ -37,6 +38,7 @@ def add_device(root: Path, name: str, serial: str, bus: int, dev: int, with_cont
         write(control / "ep_83" / "wMaxPacketSize", "0200")
 
 
+@skipIf(os.name == "nt", "fake sysfs interface names use ':' like Linux")
 class DeviceDiscoveryTests(TestCase):
     def test_single_device_discovers_control_endpoint(self) -> None:
         with TemporaryDirectory() as tmp:

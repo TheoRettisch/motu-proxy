@@ -105,11 +105,12 @@ class MotuUsbDatastore:
 
     def _collect_response(self, max_bytes: int = 1024 * 1024) -> bytes:
         frames: list[bytes] = []
+        pending: list[bytes] = []
         total = 0
         quiet_reads = 0
 
         while quiet_reads < 2:
-            packet = self._read_logical_frame()
+            packet = pending.pop(0) if pending else self._read_logical_frame()
             if not packet:
                 quiet_reads += 1
                 continue
@@ -123,7 +124,7 @@ class MotuUsbDatastore:
                 frames.append(body)
                 total += len(body)
                 self.transport.bulk_write(build_ack(self._next_host_seq()))
-                self._drain_quiet(quiet_reads=1, timeout_ms=120)
+                pending.extend(self._drain_quiet(quiet_reads=1, timeout_ms=120))
                 if total > max_bytes:
                     raise RuntimeError(f"response exceeded {max_bytes} bytes")
 

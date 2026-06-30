@@ -33,11 +33,18 @@ USBDEVFS_CLAIMINTERFACE = _ioc(_IOC_READ, "U", 15, ctypes.sizeof(ctypes.c_uint))
 USBDEVFS_RELEASEINTERFACE = _ioc(_IOC_READ, "U", 16, ctypes.sizeof(ctypes.c_uint))
 
 
-_LIBC = ctypes.CDLL(None, use_errno=True)
+_LIBC = None
+
+
+def _libc():
+    global _LIBC
+    if _LIBC is None:
+        _LIBC = ctypes.CDLL(None, use_errno=True)
+    return _LIBC
 
 
 def _ioctl(fd: int, request: int, arg) -> int:
-    ret = _LIBC.ioctl(fd, request, arg)
+    ret = _libc().ioctl(fd, request, arg)
     if ret < 0:
         err = ctypes.get_errno()
         raise OSError(err, os.strerror(err))

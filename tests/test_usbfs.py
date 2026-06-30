@@ -1,12 +1,18 @@
+import importlib
 from pathlib import Path
 from unittest import TestCase
 from unittest.mock import patch
 
+import motu_proxy.transports.usbfs as usbfs
 from motu_proxy.device import UsbDeviceInfo
 from motu_proxy.transports.usbfs import UsbFsTransport
 
 
 class UsbFsTransportTests(TestCase):
+    def test_module_import_does_not_load_libc(self) -> None:
+        with patch("ctypes.CDLL", side_effect=AssertionError("eager libc load")):
+            importlib.reload(usbfs)
+
     def test_enter_closes_fd_when_claim_fails(self) -> None:
         device = UsbDeviceInfo(
             sysfs_path=Path("/sys/mock"),

@@ -23,6 +23,10 @@ class WritesDisabled(RuntimeError):
     pass
 
 
+class CrossOriginWrite(RuntimeError):
+    pass
+
+
 @dataclass(frozen=True)
 class DispatchResult:
     response: bytes
@@ -37,6 +41,18 @@ def parse_write_body(raw: str, content_type: str) -> str:
     return raw
 
 
+def _origin_matches_host(origin: str, host: str) -> bool:
+    parsed = urlparse(origin)
+    return parsed.scheme == "http" and bool(parsed.netloc) and parsed.netloc.lower() == host.lower()
+
+
+def validate_write_origin(method: str, allow_writes: bool, origin: str | None, host: str | None) -> None:
+    if method == "GET" or not allow_writes or not origin:
+        return
+    if not host or not _origin_matches_host(origin, host):
+        raise CrossOriginWrite("cross-origin writes are blocked")
+
+
 def dispatch_datastore_request(
     method: str,
     request_path: str,
@@ -46,6 +62,8 @@ def dispatch_datastore_request(
     run_get: DatastoreRead,
     run_post: DatastoreWrite,
     log_write: WriteLogger | None = None,
+    origin: str | None = None,
+    host: str | None = None,
 ) -> DispatchResult:
     path = normalize_path(urlparse(request_path).path)
     if method == "GET":
@@ -55,6 +73,7 @@ def dispatch_datastore_request(
         log_write(method, path, write_body)
     if not allow_writes:
         raise WritesDisabled("writes require --allow-writes")
+    validate_write_origin(method, allow_writes, origin, host)
     # HTTP PATCH is a compatibility alias for the MOTU datastore POST write.
     return DispatchResult(run_post(path, write_body), path)
 
@@ -78,7 +97,15 @@ class DatastoreDispatcher:
         self.log_write = log_write
         self.lock = lock if lock is not None else threading.Lock()
 
-    def dispatch(self, method: str, request_path: str, raw_body: str = "", content_type: str = "") -> DispatchResult:
+    def dispatch(
+        self,
+        method: str,
+        request_path: str,
+        raw_body: str = "",
+        content_type: str = "",
+        origin: str | None = None,
+        host: str | None = None,
+    ) -> DispatchResult:
         with self.lock:
             return dispatch_datastore_request(
                 method,
@@ -89,6 +116,8 @@ class DatastoreDispatcher:
                 self.run_get,
                 self.run_post,
                 log_write=self.log_write,
+                origin=origin,
+                host=host,
             )
 
 
@@ -112,15 +141,21 @@ class MotuProxyHandler(BaseHTTPRequestHandler):
     def handle_datastore_request(self, method: str) -> None:
         try:
             raw_body = self.read_raw_body() if method != "GET" else ""
-            result = self.server.dispatcher.dispatch(method, self.path, raw_body, self.headers.get("Content-Type", ""))
+            result = self.server.dispatcher.dispatch(
+                method,
+                self.path,
+                raw_body,
+                self.headers.get("Content-Type", ""),
+                origin=self.headers.get("Origin"),
+                host=self.headers.get("Host"),
+            )
             body = extract_json_bytes(result.response) or result.response
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
-            self.send_header("Access-Control-Allow-Origin", "*")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
-        except WritesDisabled as exc:
+        except (WritesDisabled, CrossOriginWrite) as exc:
             self.send_error(403, str(exc))
         except Exception as exc:
             body = json.dumps({"error": str(exc)}).encode("utf-8")
@@ -147,8 +182,6 @@ class MotuProxyServer(ThreadingHTTPServer):
         super().__init__(server_address, MotuProxyHandler)
         self.allow_writes = allow_writes
         self.debug = debug
-        self.run_datastore_get = run_get
-        self.run_datastore_post = run_post
         self.dispatcher = DatastoreDispatcher(allow_writes, run_get, run_post)
 
 
