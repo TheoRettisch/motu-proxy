@@ -212,6 +212,10 @@ Linux interface names such as `3-3:1.3` are not valid paths.
 - `handover/`: original MVP notes and reference script.
 - `openspec/`: design/specification history for the rebuild.
 
+## License
+
+This project is licensed under the MIT License. See `LICENSE`.
+
 ## Known Follow-Ups
 
 - Validate strict response-frame CRC/message-sequence parsing against live MOTU

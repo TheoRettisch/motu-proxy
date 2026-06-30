@@ -7,6 +7,12 @@ name = "motu-proxy"
 version = "0.1.0"
 description = "Dependency-light MOTU AVB USB datastore proxy"
 requires-python = ">=3.11"
+license = {file = "LICENSE"}
+classifiers = [
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+]
 dependencies = []
 
 [project.scripts]
