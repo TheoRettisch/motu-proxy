@@ -101,6 +101,39 @@ The system SHALL accept the `client` query-string parameter on HTTP reads and wr
 - **WHEN** a client issues a datastore request with a `client=<number>` query parameter
 - **THEN** the proxy forwards that client identifier to the underlying datastore read or write
 
+### Requirement: Datastore write permission enforcement
+The system SHALL reject writes to datastore paths documented as read-only before performing any USB write.
+
+#### Scenario: Write to a read-only path
+- **WHEN** a client attempts to write to a datastore path whose documented permission is read-only
+- **THEN** the proxy rejects the request with an HTTP `403` and does not send a USB write
+
+### Requirement: Datastore write value validation
+The system SHALL validate write values against the documented type, numeric range, and enum values for known datastore paths, and SHALL reject values that do not conform.
+
+#### Scenario: Out-of-range value
+- **WHEN** a client writes a value outside the documented range for a known path, such as a channel fader greater than the documented maximum
+- **THEN** the proxy rejects the request with an HTTP `422` and does not send a USB write
+
+#### Scenario: Invalid enum value
+- **WHEN** a client writes a value that is not one of the documented enum values for a known path
+- **THEN** the proxy rejects the request with an HTTP `422` and does not send a USB write
+
+#### Scenario: CLI post validates before USB write
+- **WHEN** the user runs CLI `post` with a value that violates the documented type, range, enum, or permission for a known path
+- **THEN** the command fails with a nonzero exit and does not send a USB write
+
+### Requirement: Forward-compatible passthrough for unknown paths
+The system SHALL forward writes to datastore paths that are not present in its embedded schema, so that newer firmware paths are not blocked, and SHALL provide a way to disable validation entirely.
+
+#### Scenario: Undocumented path is forwarded
+- **WHEN** a client writes to a datastore path that is not in the embedded schema and writes are enabled
+- **THEN** the proxy forwards the write to the device
+
+#### Scenario: Validation disabled
+- **WHEN** HTTP or CLI writes are run with validation disabled
+- **THEN** the system forwards writes without checking type, range, enum, or permission
+
 ### Requirement: Datastore long-polling
 The system SHALL support datastore long-polling by accepting a client ETag via HTTP `If-None-Match`, comparing it against coordinated datastore state maintained by USB long-polling, and returning either the changed datastore payload with the new ETag or `304 Not Modified` when no change occurs within the wait window.
 

@@ -103,6 +103,16 @@ class FakeServeDatastore:
         raise AssertionError("unexpected post")
 
 
+class FakePostDatastore:
+    def __init__(self, response: bytes = b'{"ok":true}') -> None:
+        self.response = response
+        self.calls: list[tuple[str, str]] = []
+
+    def post(self, path: str, json_body: str) -> bytes:
+        self.calls.append((path, json_body))
+        return self.response
+
+
 class CliServeSecurityTests(TestCase):
     def test_serve_write_token_file_defaults_to_run_path(self) -> None:
         args = build_parser().parse_args(["serve"])
@@ -160,6 +170,7 @@ class CliServeSecurityTests(TestCase):
                 allow_remote_writes=False,
                 max_write_body_bytes=64 * 1024,
                 serialize_dispatch=True,
+                validate_writes=True,
             ) -> None:
                 self.server_address = server_address
                 self.allow_writes = allow_writes
@@ -175,6 +186,7 @@ class CliServeSecurityTests(TestCase):
                     write_token=write_token,
                     allow_remote_writes=allow_remote_writes,
                     serialize_dispatch=serialize_dispatch,
+                    validate_writes=validate_writes,
                 )
 
             def server_close(self) -> None:
@@ -198,6 +210,78 @@ class CliServeSecurityTests(TestCase):
         self.assertEqual(result, 0)
         self.assertEqual(captured["result"].response, b'{"first":true}{"second":true}')
         self.assertIn(("/datastore", None), datastore.calls)
+
+    def test_serve_no_validate_disables_dispatch_validation(self) -> None:
+        datastore = FakeServeDatastore(b'{"value":"ok"}')
+        captured = {}
+
+        class FakeServer:
+            def __init__(
+                self,
+                server_address,
+                allow_writes,
+                debug,
+                run_get,
+                run_post,
+                write_token=None,
+                write_token_file=None,
+                allow_remote_writes=False,
+                max_write_body_bytes=64 * 1024,
+                serialize_dispatch=True,
+                validate_writes=True,
+            ) -> None:
+                captured["validate_writes"] = validate_writes
+                self.server_address = server_address
+                self.allow_writes = allow_writes
+                self.debug = debug
+                self.write_token = write_token
+                self.write_token_file = write_token_file
+                self.allow_remote_writes = allow_remote_writes
+                self.max_write_body_bytes = max_write_body_bytes
+                self.dispatcher = DatastoreDispatcher(
+                    allow_writes,
+                    run_get,
+                    run_post,
+                    write_token=write_token,
+                    allow_remote_writes=allow_remote_writes,
+                    serialize_dispatch=serialize_dispatch,
+                    validate_writes=validate_writes,
+                )
+
+            def server_close(self) -> None:
+                pass
+
+        args = build_parser().parse_args(["serve", "--no-validate", "--port", "0"])
+        with (
+            patch("motu_proxy.cli.open_datastore", return_value=FakeOpenDatastore(datastore)),
+            patch("motu_proxy.cli.MotuProxyServer", FakeServer),
+            patch("motu_proxy.cli.serve", return_value=0),
+        ):
+            result = args.func(args)
+
+        self.assertEqual(result, 0)
+        self.assertFalse(captured["validate_writes"])
+
+
+class CliPostValidationTests(TestCase):
+    def test_post_validation_failure_happens_before_opening_datastore(self) -> None:
+        args = build_parser().parse_args(["post", "/uid", '{"value":"changed"}'])
+        with patch("motu_proxy.cli.open_datastore", side_effect=AssertionError("opened USB")):
+            with self.assertRaisesRegex(RuntimeError, "read-only"):
+                args.func(args)
+
+    def test_post_no_validate_bypasses_schema_validation(self) -> None:
+        datastore = FakePostDatastore()
+        args = build_parser().parse_args(["post", "--no-validate", "/uid", '{"value":"changed"}', "--compact"])
+        stdout = StringIO()
+        with (
+            patch("motu_proxy.cli.open_datastore", return_value=FakeOpenDatastore(datastore)),
+            redirect_stdout(stdout),
+        ):
+            result = args.func(args)
+
+        self.assertEqual(result, 0)
+        self.assertEqual(datastore.calls, [("/datastore/uid", '{"value":"changed"}')])
 
 
 @skipIf(os.name == "nt", "fake sysfs interface names use ':' like Linux")

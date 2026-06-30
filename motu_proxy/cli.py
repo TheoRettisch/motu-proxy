@@ -29,6 +29,7 @@ from .protocol import (
     build_post_frame,
     crc32,
 )
+from .schema import validate_datastore_write
 
 
 DEFAULT_WRITE_TOKEN_FILE = Path("/run/motu-proxy/write-token")
@@ -138,6 +139,8 @@ def command_get(args) -> int:
 def command_post(args) -> int:
     path = normalize_path(args.path)
     validate_json_body(args.json_body)
+    if not args.no_validate:
+        validate_datastore_write(path, args.json_body)
     with open_datastore(config_from_args(args)) as datastore:
         response = datastore.post(path, args.json_body)
     if args.raw:
@@ -214,6 +217,7 @@ def command_serve(args) -> int:
                 allow_remote_writes=args.unsafe_allow_remote_writes,
                 max_write_body_bytes=args.max_write_body_bytes,
                 serialize_dispatch=False,
+                validate_writes=not args.no_validate,
             )
             return serve(server)
         finally:
@@ -275,6 +279,11 @@ def build_parser() -> argparse.ArgumentParser:
     post_parser.add_argument("json_body")
     post_parser.add_argument("--raw", action="store_true")
     post_parser.add_argument("--compact", action="store_true")
+    post_parser.add_argument(
+        "--no-validate",
+        action="store_true",
+        help="forward the datastore write without checking documented type, range, enum, or permission",
+    )
     post_parser.set_defaults(func=command_post)
 
     probe_parser = sub.add_parser("probe", help="read a few harmless baseline paths")
@@ -326,6 +335,11 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=DEFAULT_MAX_WRITE_BODY_BYTES,
         help="maximum accepted HTTP write body size",
+    )
+    serve_parser.add_argument(
+        "--no-validate",
+        action="store_true",
+        help="forward HTTP writes without checking documented type, range, enum, or permission",
     )
     serve_parser.set_defaults(func=command_serve)
 

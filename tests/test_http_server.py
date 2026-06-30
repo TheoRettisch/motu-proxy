@@ -22,6 +22,7 @@ from motu_proxy.http_server import (
 from motu_proxy.json_body import InvalidJsonBody
 from motu_proxy.parser import DatastorePayload
 from motu_proxy.protocol import ProtocolFrameTooLarge, max_post_json_body_bytes
+from motu_proxy.schema import DatastorePermissionError, DatastoreValidationError
 
 
 WRITE_TOKEN = "test-write-token"
@@ -469,6 +470,84 @@ class HttpServerTests(TestCase):
                     )
         self.assertEqual(calls, [])
 
+    def test_read_only_write_is_rejected_before_usb_call(self) -> None:
+        calls: list[tuple[str, str]] = []
+
+        def post(path: str, body: str, client: str | None = None) -> bytes:
+            calls.append((path, body))
+            return b"{}"
+
+        with self.assertRaisesRegex(DatastorePermissionError, "read-only"):
+            dispatch_datastore_request(
+                "POST",
+                "/uid",
+                '{"value":"changed"}',
+                "application/json",
+                True,
+                lambda path, client=None: b"{}",
+                post,
+                host="127.0.0.1:1280",
+                write_token=WRITE_TOKEN,
+                request_token=WRITE_TOKEN,
+            )
+        self.assertEqual(calls, [])
+
+    def test_invalid_known_write_value_is_rejected_before_usb_call(self) -> None:
+        calls: list[tuple[str, str]] = []
+
+        def post(path: str, body: str, client: str | None = None) -> bytes:
+            calls.append((path, body))
+            return b"{}"
+
+        with self.assertRaisesRegex(DatastoreValidationError, "<= 4"):
+            dispatch_datastore_request(
+                "POST",
+                "/mix/chan/0/matrix/fader",
+                '{"value":5}',
+                "application/json",
+                True,
+                lambda path, client=None: b"{}",
+                post,
+                host="127.0.0.1:1280",
+                write_token=WRITE_TOKEN,
+                request_token=WRITE_TOKEN,
+            )
+        self.assertEqual(calls, [])
+
+    def test_unknown_path_is_forwarded_by_default(self) -> None:
+        result, calls = self.dispatch(
+            "POST",
+            "/future/path",
+            body='{"value":{"new":true}}',
+            content_type="application/json",
+            allow_writes=True,
+        )
+        self.assertEqual(result.response, b'{"ok":true}')
+        self.assertEqual(calls, [("POST", "/datastore/future/path", '{"value":{"new":true}}')])
+
+    def test_no_validate_bypasses_read_only_and_value_checks(self) -> None:
+        calls: list[tuple[str, str]] = []
+
+        def post(path: str, body: str, client: str | None = None) -> bytes:
+            calls.append((path, body))
+            return b'{"ok":true}'
+
+        result = dispatch_datastore_request(
+            "POST",
+            "/uid",
+            '{"value":"changed"}',
+            "application/json",
+            True,
+            lambda path, client=None: b"{}",
+            post,
+            host="127.0.0.1:1280",
+            write_token=WRITE_TOKEN,
+            request_token=WRITE_TOKEN,
+            validate_writes=False,
+        )
+        self.assertEqual(result.response, b'{"ok":true}')
+        self.assertEqual(calls, [("/datastore/uid", '{"value":"changed"}')])
+
     def test_serve_defaults_are_read_only_localhost(self) -> None:
         args = build_parser().parse_args(["serve"])
         self.assertEqual(args.listen, "127.0.0.1")
@@ -557,6 +636,26 @@ class HttpHandlerTests(TestCase):
         self.assertEqual(handler.statuses, [403])
         self.assertIn(("Content-Type", "application/json"), handler.sent_headers)
         self.assertIn("valid write token required", json.loads(handler.wfile.getvalue().decode("utf-8"))["error"])
+
+    def test_handler_returns_json_403_for_read_only_path(self) -> None:
+        class Dispatcher:
+            def dispatch(self, *args, **kwargs):
+                raise DatastorePermissionError("/datastore/uid is read-only")
+
+        handler = self.make_handler({"Content-Length": "17"}, b'{"value":"linux"}', Dispatcher())
+        handler.handle_datastore_request("POST")
+        self.assertEqual(handler.statuses, [403])
+        self.assertIn("read-only", json.loads(handler.wfile.getvalue().decode("utf-8"))["error"])
+
+    def test_handler_returns_json_422_for_value_validation(self) -> None:
+        class Dispatcher:
+            def dispatch(self, *args, **kwargs):
+                raise DatastoreValidationError("/datastore/mix/chan/0/matrix/fader must be <= 4")
+
+        handler = self.make_handler({"Content-Length": "17"}, b'{"value":"linux"}', Dispatcher())
+        handler.handle_datastore_request("POST")
+        self.assertEqual(handler.statuses, [422])
+        self.assertIn("<= 4", json.loads(handler.wfile.getvalue().decode("utf-8"))["error"])
 
     def test_handler_returns_504_for_missing_datastore_response(self) -> None:
         class Dispatcher:

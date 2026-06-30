@@ -24,6 +24,7 @@ from .json_body import InvalidJsonBody, validate_json_body
 from .paths import normalize_path
 from .parser import DatastorePayload, ResponseFrameError
 from .protocol import ProtocolFrameTooLarge, validate_post_frame_size
+from .schema import DatastorePermissionError, DatastoreValidationError, validate_datastore_write
 
 
 DatastoreRead = Callable[..., bytes | DatastorePayload]
@@ -157,6 +158,7 @@ def dispatch_datastore_request(
     request_token: str | None = None,
     allow_remote_writes: bool = False,
     if_none_match: str | None = None,
+    validate_writes: bool = True,
 ) -> DispatchResult:
     path = normalize_path(urlparse(request_path).path)
     client = parse_client_query(request_path)
@@ -174,6 +176,8 @@ def dispatch_datastore_request(
     validate_write_token(method, allow_writes, write_token, request_token)
     write_body = parse_write_body(raw_body, content_type)
     validate_json_body(write_body)
+    if validate_writes:
+        validate_datastore_write(path, write_body)
     validate_post_frame_size(path, write_body, client=client)
     if log_write is not None:
         log_write(method, path, write_body)
@@ -211,6 +215,7 @@ class DatastoreDispatcher:
         log_write: WriteLogger | None = log_write_attempt,
         lock: threading.Lock | _NullLock | None = None,
         serialize_dispatch: bool = True,
+        validate_writes: bool = True,
     ) -> None:
         self.allow_writes = allow_writes
         self.run_get = run_get
@@ -219,6 +224,7 @@ class DatastoreDispatcher:
         self.allow_remote_writes = allow_remote_writes
         self.log_write = log_write
         self.lock = lock if lock is not None else (threading.Lock() if serialize_dispatch else _NullLock())
+        self.validate_writes = validate_writes
 
     def dispatch(
         self,
@@ -247,6 +253,7 @@ class DatastoreDispatcher:
                 request_token=request_token,
                 allow_remote_writes=self.allow_remote_writes,
                 if_none_match=if_none_match,
+                validate_writes=self.validate_writes,
             )
 
 
@@ -290,8 +297,10 @@ class MotuProxyHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
-        except (WritesDisabled, CrossOriginWrite, HostNotAllowed, WriteTokenRequired) as exc:
+        except (WritesDisabled, CrossOriginWrite, HostNotAllowed, WriteTokenRequired, DatastorePermissionError) as exc:
             self.send_json_error(403, str(exc))
+        except DatastoreValidationError as exc:
+            self.send_json_error(422, str(exc))
         except RequestBodyTooLarge as exc:
             self.send_json_error(413, str(exc))
         except ProtocolFrameTooLarge as exc:
@@ -360,6 +369,7 @@ class MotuProxyServer(ThreadingHTTPServer):
         allow_remote_writes: bool = False,
         max_write_body_bytes: int = DEFAULT_MAX_WRITE_BODY_BYTES,
         serialize_dispatch: bool = True,
+        validate_writes: bool = True,
     ) -> None:
         super().__init__(server_address, MotuProxyHandler)
         self.allow_writes = allow_writes
@@ -367,6 +377,7 @@ class MotuProxyServer(ThreadingHTTPServer):
         self.write_token = write_token
         self.write_token_file = write_token_file
         self.allow_remote_writes = allow_remote_writes
+        self.validate_writes = validate_writes
         self.max_write_body_bytes = max_write_body_bytes
         self.dispatcher = DatastoreDispatcher(
             allow_writes,
@@ -375,6 +386,7 @@ class MotuProxyServer(ThreadingHTTPServer):
             write_token=write_token,
             allow_remote_writes=allow_remote_writes,
             serialize_dispatch=serialize_dispatch,
+            validate_writes=validate_writes,
         )
 
 
@@ -396,6 +408,8 @@ def serve(server: MotuProxyServer) -> int:
             print(f"write token file: {server.write_token_file}", file=sys.stderr)
         if server.allow_remote_writes:
             print("WARNING: remote HTTP writes are enabled; keep the token secret", file=sys.stderr)
+        if not server.validate_writes:
+            print("WARNING: datastore write validation is disabled", file=sys.stderr)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
