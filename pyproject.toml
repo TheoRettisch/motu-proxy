@@ -15,8 +15,26 @@ classifiers = [
 ]
 dependencies = []
 
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "ruff",
+]
+
 [project.scripts]
 motu-proxy = "motu_proxy.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["motu_proxy*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 88
+src = ["motu_proxy", "tests", "tools"]
+extend-exclude = ["research"]
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F"]

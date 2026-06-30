@@ -25,6 +25,12 @@ Use an editable install while developing:
 python -m pip install -e .
 ```
 
+Install development tools for tests and lint checks:
+
+```sh
+python -m pip install -e ".[dev]"
+```
+
 You can also run the package without installing:
 
 ```sh
@@ -206,10 +212,22 @@ motu-proxy serve --allow-writes --no-write-token-file
 
 ## Development
 
+Install development tools:
+
+```sh
+python -m pip install -e ".[dev]"
+```
+
 Run the hardware-free test suite:
 
 ```sh
-pytest -q
+python -m pytest -q
+```
+
+Run lint checks:
+
+```sh
+python -m ruff check .
 ```
 
 Run the fixture self-test:

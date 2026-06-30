@@ -19,6 +19,6 @@ The test suite has grown beyond a one-off hardware-free check, but the repositor
 
 ## Impact
 
-- Affected files: `pyproject.toml`, `.github/workflows/*.yml`.
+- Affected files: `README.md`, `pyproject.toml`, `.github/workflows/*.yml`.
 - Affected systems: local contributors and GitHub pull request/push validation.
 - Dependencies: optional development-only packages `pytest` and `ruff`; no new runtime dependency.

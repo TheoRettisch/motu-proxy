@@ -34,7 +34,7 @@ Alternative considered: add Black, isort, mypy, and Ruff together. Rejected beca
 
 ### Run CI only for hardware-free checks
 
-The GitHub Actions workflow will install dev dependencies and run `python -m pytest -q`. It may also run `python -m ruff check .` once Ruff configuration is present. It will not run `tools/live_validate_response_frames.py` against a device because that requires a reachable MOTU and USB permissions.
+The GitHub Actions workflow will install dev dependencies and run `python -m pytest -q` and `python -m ruff check .`. It will not run `tools/live_validate_response_frames.py` against a device because that requires a reachable MOTU and USB permissions.
 
 Alternative considered: add opt-in live validation behind secrets or self-hosted runners. Rejected for this change because the current need is basic regression feedback for ordinary pull requests.
 

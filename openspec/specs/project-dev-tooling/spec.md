@@ -1,5 +1,8 @@
-## ADDED Requirements
+# project-dev-tooling Specification
 
+## Purpose
+Define the development dependencies, local hardware-free checks, and GitHub Actions validation baseline for contributor changes.
+## Requirements
 ### Requirement: Development dependency declaration
 The system SHALL declare development-only dependencies needed to run tests and lint checks without adding runtime dependencies to the installed proxy package.
 
@@ -28,6 +31,18 @@ The system SHALL run hardware-free validation in GitHub Actions for pushes and p
 #### Scenario: Pull request validation
 - **WHEN** a pull request updates repository code
 - **THEN** GitHub Actions installs development dependencies and runs the hardware-free test suite
+
+#### Scenario: Pull request lint validation
+- **WHEN** a pull request updates repository code
+- **THEN** GitHub Actions runs `python -m ruff check .` using the project's Ruff configuration
+
+#### Scenario: Supported Python versions are checked
+- **WHEN** GitHub Actions runs hardware-free validation
+- **THEN** it runs on Python 3.11 and 3.12
+
+#### Scenario: Push validation
+- **WHEN** code is pushed to a CI-enabled branch
+- **THEN** GitHub Actions installs development dependencies and runs the hardware-free checks
 
 #### Scenario: CI avoids live USB hardware
 - **WHEN** the GitHub Actions workflow runs
