@@ -39,12 +39,15 @@ _LIBC = None
 def _libc():
     global _LIBC
     if _LIBC is None:
-        _LIBC = ctypes.CDLL(None, use_errno=True)
+        libc = ctypes.CDLL(None, use_errno=True)
+        libc.ioctl.argtypes = (ctypes.c_int, ctypes.c_ulong, ctypes.c_void_p)
+        libc.ioctl.restype = ctypes.c_int
+        _LIBC = libc
     return _LIBC
 
 
 def _ioctl(fd: int, request: int, arg) -> int:
-    ret = _libc().ioctl(fd, request, arg)
+    ret = _libc().ioctl(fd, ctypes.c_ulong(request), arg)
     if ret < 0:
         err = ctypes.get_errno()
         raise OSError(err, os.strerror(err))

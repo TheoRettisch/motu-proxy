@@ -159,6 +159,7 @@ def dispatch_datastore_request(
     allow_remote_writes: bool = False,
     if_none_match: str | None = None,
     validate_writes: bool = True,
+    allow_unknown_writes: bool = False,
 ) -> DispatchResult:
     path = normalize_path(urlparse(request_path).path)
     client = parse_client_query(request_path)
@@ -177,7 +178,7 @@ def dispatch_datastore_request(
     write_body = parse_write_body(raw_body, content_type)
     validate_json_body(write_body)
     if validate_writes:
-        validate_datastore_write(path, write_body)
+        validate_datastore_write(path, write_body, allow_unknown=allow_unknown_writes)
     validate_post_frame_size(path, write_body, client=client)
     if log_write is not None:
         log_write(method, path, write_body)
@@ -216,6 +217,7 @@ class DatastoreDispatcher:
         lock: threading.Lock | _NullLock | None = None,
         serialize_dispatch: bool = True,
         validate_writes: bool = True,
+        allow_unknown_writes: bool = False,
     ) -> None:
         self.allow_writes = allow_writes
         self.run_get = run_get
@@ -225,6 +227,7 @@ class DatastoreDispatcher:
         self.log_write = log_write
         self.lock = lock if lock is not None else (threading.Lock() if serialize_dispatch else _NullLock())
         self.validate_writes = validate_writes
+        self.allow_unknown_writes = allow_unknown_writes
 
     def dispatch(
         self,
@@ -254,6 +257,7 @@ class DatastoreDispatcher:
                 allow_remote_writes=self.allow_remote_writes,
                 if_none_match=if_none_match,
                 validate_writes=self.validate_writes,
+                allow_unknown_writes=self.allow_unknown_writes,
             )
 
 
@@ -357,6 +361,9 @@ class MotuProxyHandler(BaseHTTPRequestHandler):
 
 
 class MotuProxyServer(ThreadingHTTPServer):
+    daemon_threads = True
+    block_on_close = False
+
     def __init__(
         self,
         server_address,
@@ -370,6 +377,7 @@ class MotuProxyServer(ThreadingHTTPServer):
         max_write_body_bytes: int = DEFAULT_MAX_WRITE_BODY_BYTES,
         serialize_dispatch: bool = True,
         validate_writes: bool = True,
+        allow_unknown_writes: bool = False,
     ) -> None:
         super().__init__(server_address, MotuProxyHandler)
         self.allow_writes = allow_writes
@@ -378,6 +386,7 @@ class MotuProxyServer(ThreadingHTTPServer):
         self.write_token_file = write_token_file
         self.allow_remote_writes = allow_remote_writes
         self.validate_writes = validate_writes
+        self.allow_unknown_writes = allow_unknown_writes
         self.max_write_body_bytes = max_write_body_bytes
         self.dispatcher = DatastoreDispatcher(
             allow_writes,
@@ -387,6 +396,7 @@ class MotuProxyServer(ThreadingHTTPServer):
             allow_remote_writes=allow_remote_writes,
             serialize_dispatch=serialize_dispatch,
             validate_writes=validate_writes,
+            allow_unknown_writes=allow_unknown_writes,
         )
 
 
@@ -398,7 +408,7 @@ def response_content_type(body: bytes) -> str:
     return "application/json"
 
 
-def serve(server: MotuProxyServer) -> int:
+def serve(server: MotuProxyServer, before_close: Callable[[], None] | None = None) -> int:
     host, port = server.server_address[:2]
     print(f"listening on http://{host}:{port} writes={'on' if server.allow_writes else 'off'}", file=sys.stderr)
     if server.allow_writes:
@@ -410,10 +420,14 @@ def serve(server: MotuProxyServer) -> int:
             print("WARNING: remote HTTP writes are enabled; keep the token secret", file=sys.stderr)
         if not server.validate_writes:
             print("WARNING: datastore write validation is disabled", file=sys.stderr)
+        elif server.allow_unknown_writes:
+            print("WARNING: unknown datastore write paths are allowed", file=sys.stderr)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         print("\nshutting down", file=sys.stderr)
     finally:
+        if before_close is not None:
+            before_close()
         server.server_close()
     return 0

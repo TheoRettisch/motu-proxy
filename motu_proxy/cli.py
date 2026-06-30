@@ -151,7 +151,7 @@ def command_post(args) -> int:
     path = normalize_path(args.path)
     validate_json_body(args.json_body)
     if not args.no_validate:
-        validate_datastore_write(path, args.json_body)
+        validate_datastore_write(path, args.json_body, allow_unknown=args.allow_unknown_writes)
     with open_datastore(config_from_args(args)) as datastore:
         response = datastore.post(path, args.json_body)
     if args.raw:
@@ -229,8 +229,9 @@ def command_serve(args) -> int:
                 max_write_body_bytes=args.max_write_body_bytes,
                 serialize_dispatch=False,
                 validate_writes=not args.no_validate,
+                allow_unknown_writes=args.allow_unknown_writes,
             )
-            return serve(server)
+            return serve(server, before_close=coordinator.close)
         finally:
             coordinator.close()
 
@@ -294,7 +295,12 @@ def build_parser() -> argparse.ArgumentParser:
     post_parser.add_argument(
         "--no-validate",
         action="store_true",
-        help="forward the datastore write without checking documented type, range, enum, or permission",
+        help="forward the datastore write without checking type, range, enum, permission, or unknown paths",
+    )
+    post_parser.add_argument(
+        "--allow-unknown-writes",
+        action="store_true",
+        help="allow writes to paths absent from the embedded schema while still validating known paths",
     )
     post_parser.set_defaults(func=command_post)
 
@@ -351,7 +357,12 @@ def build_parser() -> argparse.ArgumentParser:
     serve_parser.add_argument(
         "--no-validate",
         action="store_true",
-        help="forward HTTP writes without checking documented type, range, enum, or permission",
+        help="forward HTTP writes without checking type, range, enum, permission, or unknown paths",
+    )
+    serve_parser.add_argument(
+        "--allow-unknown-writes",
+        action="store_true",
+        help="allow writes to paths absent from the embedded schema while still validating known paths",
     )
     serve_parser.set_defaults(func=command_serve)
 

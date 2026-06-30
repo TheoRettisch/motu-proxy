@@ -3,7 +3,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest import TestCase, skipIf
 
-from motu_proxy.device import find_motu_device
+from motu_proxy.device import DeviceDiscoveryError, NoDeviceFound, find_motu_device
 
 
 def write(path: Path, value: str) -> None:
@@ -99,3 +99,21 @@ class DeviceDiscoveryTests(TestCase):
             self.assertEqual(device.interface, 3)
             self.assertEqual(device.ep_out, 0x03)
             self.assertEqual(device.ep_in, 0x83)
+
+    def test_missing_sysfs_root_reports_discovery_error(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp) / "missing"
+            with self.assertRaisesRegex(DeviceDiscoveryError, "sysfs root"):
+                find_motu_device(0x07FD, 0x0005, sysfs_root=root, devfs_root=root / "dev")
+
+    def test_disappearing_candidate_is_skipped(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            device = root / "3-3"
+            device.mkdir()
+            write(device / "idVendor", "07fd")
+            write(device / "idProduct", "0005")
+            write(device / "serial", "aaa")
+
+            with self.assertRaises(NoDeviceFound):
+                find_motu_device(0x07FD, 0x0005, sysfs_root=root, devfs_root=root / "dev")

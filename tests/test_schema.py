@@ -35,6 +35,20 @@ class DatastoreSchemaTests(TestCase):
         with self.assertRaisesRegex(DatastoreValidationError, "integer"):
             validate_datastore_write("/datastore/mix/chan/0/hpf/freq", '{"value":440.5}')
 
+    def test_validates_boolean_numeric_range(self) -> None:
+        validate_datastore_write("/datastore/ext/enableHostVolControls", '{"value":1}')
+        validate_datastore_write("/datastore/mix/chan/0/hpf/enable", '{"value":1.0}')
+        with self.assertRaisesRegex(DatastoreValidationError, "0 or 1"):
+            validate_datastore_write("/datastore/ext/enableHostVolControls", '{"value":2}')
+        with self.assertRaisesRegex(DatastoreValidationError, "0 or 1"):
+            validate_datastore_write("/datastore/mix/chan/0/hpf/enable", '{"value":0.5}')
+
+    def test_boolean_schema_rejects_json_bool_values(self) -> None:
+        with self.assertRaisesRegex(DatastoreValidationError, "integer"):
+            validate_datastore_write("/datastore/ext/enableHostVolControls", '{"value":true}')
+        with self.assertRaisesRegex(DatastoreValidationError, "number"):
+            validate_datastore_write("/datastore/mix/chan/0/hpf/enable", '{"value":false}')
+
     def test_validates_enum_membership(self) -> None:
         validate_datastore_write("/datastore/mix/chan/0/eq/highshelf/mode", '{"value":1}')
         with self.assertRaisesRegex(DatastoreValidationError, "one of"):
@@ -45,11 +59,16 @@ class DatastoreSchemaTests(TestCase):
         with self.assertRaisesRegex(DatastoreValidationError, ">= -1"):
             validate_datastore_write("/datastore/mix/chan/0", '{"matrix/pan":-2}')
 
-    def test_forwards_unknown_paths_with_optional_warning(self) -> None:
+    def test_rejects_unknown_paths_by_default(self) -> None:
+        with self.assertRaisesRegex(DatastoreValidationError, "known writable schema"):
+            validate_datastore_write("/datastore/future/path", '{"value":{"anything":true}}')
+
+    def test_allows_unknown_paths_with_explicit_opt_in_and_warning(self) -> None:
         warnings: list[str] = []
         validate_datastore_write(
             "/datastore/future/path",
             '{"value":{"anything":true}}',
             warn_unknown=warnings.append,
+            allow_unknown=True,
         )
         self.assertEqual(warnings, ["/datastore/future/path"])

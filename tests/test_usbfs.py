@@ -1,3 +1,4 @@
+import ctypes
 import importlib
 from pathlib import Path
 from unittest import TestCase
@@ -25,6 +26,47 @@ class UsbFsTransportTests(TestCase):
     def test_module_import_does_not_load_libc(self) -> None:
         with patch("ctypes.CDLL", side_effect=AssertionError("eager libc load")):
             importlib.reload(usbfs)
+
+    def test_libc_ioctl_signature_is_pinned(self) -> None:
+        class FakeIoctl:
+            argtypes = None
+            restype = None
+
+            def __call__(self, fd, request, arg):
+                return 0
+
+        class FakeLibc:
+            ioctl = FakeIoctl()
+
+        fake_libc = FakeLibc()
+        with patch("ctypes.CDLL", return_value=fake_libc):
+            usbfs._LIBC = None
+            self.assertIs(usbfs._libc(), fake_libc)
+
+        self.assertEqual(fake_libc.ioctl.argtypes, (ctypes.c_int, ctypes.c_ulong, ctypes.c_void_p))
+        self.assertIs(fake_libc.ioctl.restype, ctypes.c_int)
+
+    def test_ioctl_casts_request_to_unsigned_long(self) -> None:
+        calls = []
+
+        class FakeIoctl:
+            argtypes = None
+            restype = None
+
+            def __call__(self, fd, request, arg):
+                calls.append((fd, request, arg))
+                return 0
+
+        class FakeLibc:
+            ioctl = FakeIoctl()
+
+        with patch("ctypes.CDLL", return_value=FakeLibc()):
+            usbfs._LIBC = None
+            arg = ctypes.c_uint(3)
+            usbfs._ioctl(77, usbfs.USBDEVFS_CLAIMINTERFACE, ctypes.byref(arg))
+
+        self.assertEqual(calls[0][0], 77)
+        self.assertIsInstance(calls[0][1], ctypes.c_ulong)
 
     def test_enter_closes_fd_when_claim_fails(self) -> None:
         transport = UsbFsTransport(device_info())

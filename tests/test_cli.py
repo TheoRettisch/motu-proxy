@@ -185,6 +185,7 @@ class CliServeSecurityTests(TestCase):
                 max_write_body_bytes=64 * 1024,
                 serialize_dispatch=True,
                 validate_writes=True,
+                allow_unknown_writes=False,
             ) -> None:
                 self.server_address = server_address
                 self.allow_writes = allow_writes
@@ -201,15 +202,18 @@ class CliServeSecurityTests(TestCase):
                     allow_remote_writes=allow_remote_writes,
                     serialize_dispatch=serialize_dispatch,
                     validate_writes=validate_writes,
+                    allow_unknown_writes=allow_unknown_writes,
                 )
 
             def server_close(self) -> None:
                 pass
 
-        def fake_serve(server) -> int:
+        def fake_serve(server, before_close=None) -> int:
             try:
                 captured["result"] = server.dispatcher.dispatch("GET", "/datastore")
             finally:
+                if before_close is not None:
+                    before_close()
                 server.server_close()
             return 0
 
@@ -243,8 +247,10 @@ class CliServeSecurityTests(TestCase):
                 max_write_body_bytes=64 * 1024,
                 serialize_dispatch=True,
                 validate_writes=True,
+                allow_unknown_writes=False,
             ) -> None:
                 captured["validate_writes"] = validate_writes
+                captured["allow_unknown_writes"] = allow_unknown_writes
                 self.server_address = server_address
                 self.allow_writes = allow_writes
                 self.debug = debug
@@ -260,6 +266,7 @@ class CliServeSecurityTests(TestCase):
                     allow_remote_writes=allow_remote_writes,
                     serialize_dispatch=serialize_dispatch,
                     validate_writes=validate_writes,
+                    allow_unknown_writes=allow_unknown_writes,
                 )
 
             def server_close(self) -> None:
@@ -275,6 +282,62 @@ class CliServeSecurityTests(TestCase):
 
         self.assertEqual(result, 0)
         self.assertFalse(captured["validate_writes"])
+        self.assertFalse(captured["allow_unknown_writes"])
+
+    def test_serve_allow_unknown_writes_passes_dispatch_validation_policy(self) -> None:
+        datastore = FakeServeDatastore(b'{"value":"ok"}')
+        captured = {}
+
+        class FakeServer:
+            def __init__(
+                self,
+                server_address,
+                allow_writes,
+                debug,
+                run_get,
+                run_post,
+                write_token=None,
+                write_token_file=None,
+                allow_remote_writes=False,
+                max_write_body_bytes=64 * 1024,
+                serialize_dispatch=True,
+                validate_writes=True,
+                allow_unknown_writes=False,
+            ) -> None:
+                captured["validate_writes"] = validate_writes
+                captured["allow_unknown_writes"] = allow_unknown_writes
+                self.server_address = server_address
+                self.allow_writes = allow_writes
+                self.debug = debug
+                self.write_token = write_token
+                self.write_token_file = write_token_file
+                self.allow_remote_writes = allow_remote_writes
+                self.max_write_body_bytes = max_write_body_bytes
+                self.dispatcher = DatastoreDispatcher(
+                    allow_writes,
+                    run_get,
+                    run_post,
+                    write_token=write_token,
+                    allow_remote_writes=allow_remote_writes,
+                    serialize_dispatch=serialize_dispatch,
+                    validate_writes=validate_writes,
+                    allow_unknown_writes=allow_unknown_writes,
+                )
+
+            def server_close(self) -> None:
+                pass
+
+        args = build_parser().parse_args(["serve", "--allow-unknown-writes", "--port", "0"])
+        with (
+            patch("motu_proxy.cli.open_datastore", return_value=FakeOpenDatastore(datastore)),
+            patch("motu_proxy.cli.MotuProxyServer", FakeServer),
+            patch("motu_proxy.cli.serve", return_value=0),
+        ):
+            result = args.func(args)
+
+        self.assertEqual(result, 0)
+        self.assertTrue(captured["validate_writes"])
+        self.assertTrue(captured["allow_unknown_writes"])
 
 
 class CliPostValidationTests(TestCase):
@@ -296,6 +359,27 @@ class CliPostValidationTests(TestCase):
 
         self.assertEqual(result, 0)
         self.assertEqual(datastore.calls, [("/datastore/uid", '{"value":"changed"}')])
+
+    def test_post_unknown_path_rejected_before_opening_datastore(self) -> None:
+        args = build_parser().parse_args(["post", "/future/path", '{"value":{"new":true}}'])
+        with patch("motu_proxy.cli.open_datastore", side_effect=AssertionError("opened USB")):
+            with self.assertRaisesRegex(RuntimeError, "known writable schema"):
+                args.func(args)
+
+    def test_post_allow_unknown_writes_forwards_unknown_path(self) -> None:
+        datastore = FakePostDatastore()
+        args = build_parser().parse_args(
+            ["post", "--allow-unknown-writes", "/future/path", '{"value":{"new":true}}', "--compact"]
+        )
+        stdout = StringIO()
+        with (
+            patch("motu_proxy.cli.open_datastore", return_value=FakeOpenDatastore(datastore)),
+            redirect_stdout(stdout),
+        ):
+            result = args.func(args)
+
+        self.assertEqual(result, 0)
+        self.assertEqual(datastore.calls, [("/datastore/future/path", '{"value":{"new":true}}')])
 
 
 class CliInfoTests(TestCase):

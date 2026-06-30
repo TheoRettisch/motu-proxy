@@ -42,6 +42,7 @@ class PathSchema:
 
 RAW_SCHEMA: tuple[tuple[str, str, str, int | float | None, int | float | None, str | None], ...] = (
     ("uid", "string", "r", None, None, None),
+    ("host/os", "string", "rw", None, None, None),
     ("ext/caps/avb", "semver_opt", "r", None, None, None),
     ("ext/caps/router", "semver_opt", "r", None, None, None),
     ("ext/caps/mixer", "semver_opt", "r", None, None, None),
@@ -291,6 +292,7 @@ def validate_datastore_write(
     path: str,
     json_body: str,
     warn_unknown: Callable[[str], None] | None = None,
+    allow_unknown: bool = False,
 ) -> None:
     try:
         body = json.loads(json_body)
@@ -301,9 +303,11 @@ def validate_datastore_write(
     for target_path, value in _iter_write_values(path, body):
         entry = find_path_schema(target_path)
         if entry is None:
-            if warn_unknown is not None:
-                warn_unknown(target_path)
-            continue
+            if allow_unknown:
+                if warn_unknown is not None:
+                    warn_unknown(target_path)
+                continue
+            raise DatastoreValidationError(f"{target_path} is not in the known writable schema")
         if entry.permission != "rw":
             raise DatastorePermissionError(f"{target_path} is read-only")
         _validate_value(target_path, entry, value)
@@ -378,6 +382,8 @@ def _validate_value(path: str, entry: PathSchema, value: object) -> None:
             raise DatastoreValidationError(f"{path} must be one of: {allowed}")
     else:
         _validate_scalar(path, value, base_type)
+    if "bool" in modifiers and value != 0 and value != 1:
+        raise DatastoreValidationError(f"{path} must be 0 or 1")
     if entry.minimum is not None or entry.maximum is not None:
         assert isinstance(value, Real)
         if entry.minimum is not None and value < entry.minimum:
@@ -432,4 +438,3 @@ def _validate_string_parts(
             except ValueError as exc:
                 raise DatastoreValidationError(f"{path} contains a non-integer list value") from exc
         _validate_scalar(path, parsed, base_type)
-

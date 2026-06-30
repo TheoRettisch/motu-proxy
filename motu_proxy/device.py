@@ -81,20 +81,28 @@ def _parse_endpoint(path: Path) -> _Endpoint | None:
 def _discover_control_interface(device_path: Path, sysfs_root: Path) -> tuple[int, int, int, int] | None:
     prefix = f"{device_path.name}:1."
     candidates: list[tuple[int, int, int, int]] = []
-    for interface_path in sorted(sysfs_root.iterdir()):
+    try:
+        interface_paths = sorted(sysfs_root.iterdir())
+    except (FileNotFoundError, PermissionError):
+        return None
+    for interface_path in interface_paths:
         if not interface_path.name.startswith(prefix):
             continue
         try:
             interface_class = _parse_hex_file(interface_path / "bInterfaceClass")
             interface_number = _parse_hex_file(interface_path / "bInterfaceNumber")
-        except (FileNotFoundError, ValueError):
+        except (FileNotFoundError, PermissionError, ValueError):
             continue
         if interface_class != 0xFF:
             continue
         if (interface_path / "driver").exists():
             continue
 
-        endpoints = [ep for ep in (_parse_endpoint(path) for path in interface_path.iterdir()) if ep is not None]
+        try:
+            endpoint_paths = sorted(interface_path.iterdir())
+        except (FileNotFoundError, PermissionError):
+            continue
+        endpoints = [ep for ep in (_parse_endpoint(path) for path in endpoint_paths) if ep is not None]
         bulk_in = sorted((ep for ep in endpoints if ep.address & 0x80), key=lambda ep: ep.address)
         bulk_out = sorted((ep for ep in endpoints if not ep.address & 0x80), key=lambda ep: ep.address)
         if not bulk_in or not bulk_out:
@@ -121,21 +129,31 @@ def find_motu_device(
     devfs_root = Path(devfs_root)
     matches: list[UsbDeviceInfo] = []
 
-    for path in sorted(sysfs_root.iterdir()):
+    try:
+        device_paths = sorted(sysfs_root.iterdir())
+    except FileNotFoundError as exc:
+        raise DeviceDiscoveryError(f"USB sysfs root does not exist: {sysfs_root}") from exc
+    except PermissionError as exc:
+        raise DeviceDiscoveryError(f"USB sysfs root is not readable: {sysfs_root}") from exc
+
+    for path in device_paths:
         try:
             device_vid = _parse_hex_file(path / "idVendor")
             device_pid = _parse_hex_file(path / "idProduct")
-        except (FileNotFoundError, ValueError):
+        except (FileNotFoundError, PermissionError, ValueError):
             continue
         if device_vid != vid or device_pid != pid:
             continue
 
-        device_serial = _read_optional_text(path / "serial")
-        if serial and device_serial != serial:
+        try:
+            device_serial = _read_optional_text(path / "serial")
+            if serial and device_serial != serial:
+                continue
+            device_product = _read_optional_text(path / "product")
+            bus = int(read_text(path / "busnum"))
+            dev = int(read_text(path / "devnum"))
+        except (FileNotFoundError, PermissionError, ValueError):
             continue
-        device_product = _read_optional_text(path / "product")
-        bus = int(read_text(path / "busnum"))
-        dev = int(read_text(path / "devnum"))
 
         discovered = _discover_control_interface(path, sysfs_root)
         if discovered is None:

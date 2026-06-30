@@ -160,6 +160,9 @@ Additional write-mode protections:
 - Request bodies larger than `--max-write-body-bytes` are rejected, and writes
   that cannot fit in one current MOTU USB datastore frame are rejected before
   USB I/O.
+- Writes to paths absent from the embedded schema are rejected unless
+  `--allow-unknown-writes` is set. `--no-validate` disables all datastore
+  type, range, enum, permission, and unknown-path checks.
 - `--allow-writes` with a non-loopback `--listen` address requires
   `--unsafe-allow-remote-writes`.
 

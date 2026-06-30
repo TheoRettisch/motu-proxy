@@ -115,6 +115,13 @@ class ParserTests(TestCase):
         response = b"HTTP/1.1 200 OK\r\nETag: 5678\r\nCache-Control: no-cache\r\n\r\n{}"
         self.assertEqual(extract_response_etag(response), "5678")
 
+    def test_extract_response_etag_ignores_text_body_lines(self) -> None:
+        response = b"HTTP/1.1 200 OK\r\nCache-Control: no-cache\r\n\r\nETag: body-value\n{}"
+        self.assertIsNone(extract_response_etag(response))
+
+    def test_extract_response_etag_ignores_non_http_text(self) -> None:
+        self.assertIsNone(extract_response_etag(b"ETag: body-value\n{}"))
+
     def test_datastore_payload_keeps_json_body_and_etag(self) -> None:
         payload = datastore_payload(b"HTTP/1.1 200 OK\r\nETag: 5678\r\n\r\n{\"value\":\"ok\"}")
         self.assertEqual(payload.body, b'{"value":"ok"}')

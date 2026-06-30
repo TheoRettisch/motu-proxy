@@ -122,12 +122,16 @@ The system SHALL validate write values against the documented type, numeric rang
 - **WHEN** the user runs CLI `post` with a value that violates the documented type, range, enum, or permission for a known path
 - **THEN** the command fails with a nonzero exit and does not send a USB write
 
-### Requirement: Forward-compatible passthrough for unknown paths
-The system SHALL forward writes to datastore paths that are not present in its embedded schema, so that newer firmware paths are not blocked, and SHALL provide a way to disable validation entirely.
+### Requirement: Unknown datastore write protection
+The system SHALL reject writes to datastore paths that are not present in its embedded schema while validation is enabled, SHALL provide an explicit option to allow unknown paths while keeping validation for known paths, and SHALL provide a way to disable validation entirely.
 
-#### Scenario: Undocumented path is forwarded
+#### Scenario: Undocumented path is rejected by default
 - **WHEN** a client writes to a datastore path that is not in the embedded schema and writes are enabled
-- **THEN** the proxy forwards the write to the device
+- **THEN** the proxy rejects the request with an HTTP `422` and does not send a USB write
+
+#### Scenario: Undocumented path is explicitly allowed
+- **WHEN** HTTP or CLI writes are run with unknown writes explicitly allowed and a client writes to a datastore path that is not in the embedded schema
+- **THEN** the system forwards the write to the device while continuing to validate documented paths
 
 #### Scenario: Validation disabled
 - **WHEN** HTTP or CLI writes are run with validation disabled

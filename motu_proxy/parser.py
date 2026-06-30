@@ -262,13 +262,27 @@ def _read_sized_value(data: bytes, offset: int, end: int) -> tuple[bytes | None,
 
 
 def _extract_text_header_value(response: bytes, header_name: str) -> str | None:
-    text = response.decode("iso-8859-1", errors="ignore")
+    header_block = _extract_text_http_header_block(response)
+    if header_block is None:
+        return None
+    text = header_block.decode("iso-8859-1", errors="ignore")
     wanted = header_name.lower()
     for line in text.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
         name, separator, value = line.partition(":")
         if separator and name.strip().lower() == wanted:
             value = value.strip()
             return value or None
+    return None
+
+
+def _extract_text_http_header_block(response: bytes) -> bytes | None:
+    if not response.startswith(b"HTTP/"):
+        return None
+    separators = (b"\r\n\r\n", b"\n\n")
+    for separator in separators:
+        index = response.find(separator)
+        if index >= 0:
+            return response[:index]
     return None
 
 

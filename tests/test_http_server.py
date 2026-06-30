@@ -13,11 +13,13 @@ from motu_proxy.http_server import (
     DispatchResult,
     HostNotAllowed,
     MotuProxyHandler,
+    MotuProxyServer,
     RequestBodyTooLarge,
     WriteTokenRequired,
     WritesDisabled,
     dispatch_datastore_request,
     response_content_type,
+    serve,
 )
 from motu_proxy.json_body import InvalidJsonBody
 from motu_proxy.parser import DatastorePayload
@@ -55,6 +57,7 @@ class HttpServerTests(TestCase):
         write_token: str | None = WRITE_TOKEN,
         request_token: str | None | object = _UNSET,
         allow_remote_writes: bool = False,
+        allow_unknown_writes: bool = False,
     ):
         calls: list[tuple[str, str, str | None]] = []
 
@@ -83,6 +86,7 @@ class HttpServerTests(TestCase):
             write_token=write_token,
             request_token=request_token,
             allow_remote_writes=allow_remote_writes,
+            allow_unknown_writes=allow_unknown_writes,
         )
         return result, calls
 
@@ -423,7 +427,7 @@ class HttpServerTests(TestCase):
         calls: list[tuple[str, str]] = []
         logs: list[tuple[str, str, str]] = []
         max_body = max_post_json_body_bytes("/datastore/host/os")
-        body = '{"v":"' + ("x" * (max_body - 7)) + '"}'
+        body = '{"value":"' + ("x" * (max_body - 11)) + '"}'
 
         def post(path: str, body: str, client: str | None = None) -> bytes:
             calls.append((path, body))
@@ -514,13 +518,36 @@ class HttpServerTests(TestCase):
             )
         self.assertEqual(calls, [])
 
-    def test_unknown_path_is_forwarded_by_default(self) -> None:
+    def test_unknown_path_is_rejected_by_default(self) -> None:
+        calls: list[tuple[str, str]] = []
+
+        def post(path: str, body: str, client: str | None = None) -> bytes:
+            calls.append((path, body))
+            return b"{}"
+
+        with self.assertRaisesRegex(DatastoreValidationError, "known writable schema"):
+            dispatch_datastore_request(
+                "POST",
+                "/future/path",
+                '{"value":{"new":true}}',
+                "application/json",
+                True,
+                lambda path, client=None: b"{}",
+                post,
+                host="127.0.0.1:1280",
+                write_token=WRITE_TOKEN,
+                request_token=WRITE_TOKEN,
+            )
+        self.assertEqual(calls, [])
+
+    def test_unknown_path_is_forwarded_with_explicit_opt_in(self) -> None:
         result, calls = self.dispatch(
             "POST",
             "/future/path",
             body='{"value":{"new":true}}',
             content_type="application/json",
             allow_writes=True,
+            allow_unknown_writes=True,
         )
         self.assertEqual(result.response, b'{"ok":true}')
         self.assertEqual(calls, [("POST", "/datastore/future/path", '{"value":{"new":true}}')])
@@ -555,6 +582,33 @@ class HttpServerTests(TestCase):
 
     def test_response_content_type_uses_octet_stream_for_concatenated_json(self) -> None:
         self.assertEqual(response_content_type(b'{"first":true}{"second":true}'), "application/octet-stream")
+
+    def test_server_close_does_not_wait_on_worker_threads(self) -> None:
+        self.assertTrue(MotuProxyServer.daemon_threads)
+        self.assertFalse(MotuProxyServer.block_on_close)
+
+    def test_serve_runs_shutdown_callback_before_server_close(self) -> None:
+        calls = []
+
+        class Server:
+            server_address = ("127.0.0.1", 0)
+            allow_writes = False
+            write_token = None
+            write_token_file = None
+            allow_remote_writes = False
+            validate_writes = True
+
+            def serve_forever(self):
+                calls.append("serve")
+                raise KeyboardInterrupt
+
+            def server_close(self):
+                calls.append("close")
+
+        result = serve(Server(), before_close=lambda: calls.append("before_close"))
+
+        self.assertEqual(result, 0)
+        self.assertEqual(calls, ["serve", "before_close", "close"])
 
 
 class HttpHandlerTests(TestCase):
