@@ -25,7 +25,7 @@ from .paths import normalize_path
 from .parser import DatastorePayload, ResponseFrameError
 
 
-DatastoreRead = Callable[[str, str | None], bytes | DatastorePayload]
+DatastoreRead = Callable[..., bytes | DatastorePayload]
 DatastoreWrite = Callable[[str, str, str | None], bytes | DatastorePayload]
 WriteLogger = Callable[[str, str, str], None]
 DEFAULT_MAX_WRITE_BODY_BYTES = 64 * 1024
@@ -62,6 +62,7 @@ class DispatchResult:
     response: bytes
     path: str
     etag: str | None = None
+    status: int = 200
 
 
 def parse_write_body(raw: str, content_type: str) -> str:
@@ -152,12 +153,17 @@ def dispatch_datastore_request(
     write_token: str | None = None,
     request_token: str | None = None,
     allow_remote_writes: bool = False,
+    if_none_match: str | None = None,
 ) -> DispatchResult:
     path = normalize_path(urlparse(request_path).path)
     client = parse_client_query(request_path)
     if method == "GET":
-        payload = _datastore_payload(run_get(path, client))
-        return DispatchResult(payload.body, path, payload.etag)
+        if if_none_match is None:
+            payload = _datastore_payload(run_get(path, client))
+        else:
+            payload = _datastore_payload(run_get(path, client, if_none_match.strip()))
+        status = 304 if payload.not_modified else 200
+        return DispatchResult(payload.body, path, payload.etag, status=status)
     if not allow_writes:
         raise WritesDisabled("writes require --allow-writes")
     validate_write_host(method, allow_writes, host, allow_remote_writes)
@@ -178,6 +184,14 @@ def _datastore_payload(value: bytes | DatastorePayload) -> DatastorePayload:
     return DatastorePayload(value)
 
 
+class _NullLock:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        return None
+
+
 def log_write_attempt(method: str, path: str, body: str) -> None:
     print(f"write attempt method={method} path={path} body={body!r}", file=sys.stderr)
 
@@ -191,7 +205,8 @@ class DatastoreDispatcher:
         write_token: str | None = None,
         allow_remote_writes: bool = False,
         log_write: WriteLogger | None = log_write_attempt,
-        lock: threading.Lock | None = None,
+        lock: threading.Lock | _NullLock | None = None,
+        serialize_dispatch: bool = True,
     ) -> None:
         self.allow_writes = allow_writes
         self.run_get = run_get
@@ -199,7 +214,7 @@ class DatastoreDispatcher:
         self.write_token = write_token
         self.allow_remote_writes = allow_remote_writes
         self.log_write = log_write
-        self.lock = lock if lock is not None else threading.Lock()
+        self.lock = lock if lock is not None else (threading.Lock() if serialize_dispatch else _NullLock())
 
     def dispatch(
         self,
@@ -210,6 +225,7 @@ class DatastoreDispatcher:
         origin: str | None = None,
         host: str | None = None,
         request_token: str | None = None,
+        if_none_match: str | None = None,
     ) -> DispatchResult:
         with self.lock:
             return dispatch_datastore_request(
@@ -226,6 +242,7 @@ class DatastoreDispatcher:
                 write_token=self.write_token,
                 request_token=request_token,
                 allow_remote_writes=self.allow_remote_writes,
+                if_none_match=if_none_match,
             )
 
 
@@ -257,10 +274,12 @@ class MotuProxyHandler(BaseHTTPRequestHandler):
                 origin=self.headers.get("Origin"),
                 host=self.headers.get("Host"),
                 request_token=self.read_write_token(),
+                if_none_match=self.headers.get("If-None-Match") if method == "GET" else None,
             )
             body = result.response
-            self.send_response(200)
-            self.send_header("Content-Type", response_content_type(body))
+            self.send_response(result.status)
+            if result.status != 304:
+                self.send_header("Content-Type", response_content_type(body))
             self.send_header("Cache-Control", "no-cache")
             if method == "GET" and result.etag is not None:
                 self.send_header("ETag", result.etag)
@@ -334,6 +353,7 @@ class MotuProxyServer(ThreadingHTTPServer):
         write_token_file: str | None = None,
         allow_remote_writes: bool = False,
         max_write_body_bytes: int = DEFAULT_MAX_WRITE_BODY_BYTES,
+        serialize_dispatch: bool = True,
     ) -> None:
         super().__init__(server_address, MotuProxyHandler)
         self.allow_writes = allow_writes
@@ -348,6 +368,7 @@ class MotuProxyServer(ThreadingHTTPServer):
             run_post,
             write_token=write_token,
             allow_remote_writes=allow_remote_writes,
+            serialize_dispatch=serialize_dispatch,
         )
 
 

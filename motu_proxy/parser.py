@@ -29,6 +29,7 @@ class ResponseFrame:
 class DatastorePayload:
     body: bytes
     etag: str | None = None
+    not_modified: bool = False
 
 
 def is_device_ack(packet: bytes) -> bool:
@@ -158,7 +159,32 @@ def extract_response_etag(response: bytes) -> str | None:
 
 
 def datastore_payload(response: bytes) -> DatastorePayload:
-    return DatastorePayload(body=extract_datastore_body(response), etag=extract_response_etag(response))
+    return DatastorePayload(
+        body=extract_datastore_body(response),
+        etag=extract_response_etag(response),
+        not_modified=response_status_code(response) == 304,
+    )
+
+
+def response_status_code(response: bytes) -> int | None:
+    if len(response) >= 28 and response.startswith(b"UTOM"):
+        metadata_len = _u32(response, 16)
+        metadata_end = 20 + metadata_len
+        if metadata_len >= 8 and metadata_end <= len(response):
+            status = _u32(response, 20)
+            if 100 <= status <= 599:
+                return status
+    if not response.startswith(b"HTTP/"):
+        return None
+    line_end = response.find(b"\n")
+    first_line = response[:line_end] if line_end >= 0 else response
+    parts = first_line.strip().split(None, 2)
+    if len(parts) < 2:
+        return None
+    try:
+        return int(parts[1])
+    except ValueError:
+        return None
 
 
 def extract_datastore_body(response: bytes) -> bytes:

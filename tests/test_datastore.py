@@ -1,13 +1,16 @@
+import threading
+import time
 from unittest import TestCase
 
 from motu_proxy.datastore import (
+    DatastoreCoordinator,
     DatastoreNoResponse,
     DatastoreTimeout,
     MotuUsbDatastore,
     ShortUsbFrame,
     ShortUsbWrite,
 )
-from motu_proxy.parser import ResponseFrameError
+from motu_proxy.parser import DatastorePayload, ResponseFrameError
 from motu_proxy.protocol import build_get_frame, build_post_frame
 
 from tests.helpers import response_packet
@@ -31,6 +34,58 @@ class FakeTransport:
         if self.reads:
             return self.reads.pop(0)
         return b""
+
+
+class BlockingTransport:
+    max_packet_size = 512
+
+    def __init__(self, reads: list[bytes] | None = None) -> None:
+        self.reads = list(reads or [])
+        self.writes: list[bytes] = []
+        self.read_timeouts: list[int | None] = []
+        self._condition = threading.Condition()
+
+    def bulk_write(self, data: bytes) -> int:
+        with self._condition:
+            self.writes.append(data)
+            self._condition.notify_all()
+        return len(data)
+
+    def bulk_read(self, size: int | None = None, timeout_ms: int | None = None) -> bytes:
+        deadline = None if timeout_ms is None else time.monotonic() + (timeout_ms / 1000)
+        with self._condition:
+            self.read_timeouts.append(timeout_ms)
+            while not self.reads:
+                if deadline is None:
+                    self._condition.wait()
+                    continue
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return b""
+                self._condition.wait(remaining)
+            return self.reads.pop(0)
+
+    def push(self, *packets: bytes) -> None:
+        with self._condition:
+            self.reads.extend(packets)
+            self._condition.notify_all()
+
+    def wait_for_writes(self, count: int, timeout: float = 1.0) -> bool:
+        deadline = time.monotonic() + timeout
+        with self._condition:
+            while len(self.writes) < count:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self._condition.wait(remaining)
+            return True
+
+
+class SizeCheckingTransport(FakeTransport):
+    def bulk_read(self, size: int | None = None, timeout_ms: int | None = None) -> bytes:
+        if self.reads and size is not None and len(self.reads[0]) > size:
+            raise OSError(75, "Value too large for defined data type")
+        return super().bulk_read(size=size, timeout_ms=timeout_ms)
 
 
 class DatastoreTests(TestCase):
@@ -136,3 +191,138 @@ class DatastoreTests(TestCase):
         transport = FakeTransport([response_packet(b'{"value":"ok"}', padding=b"\x00")])
         datastore = MotuUsbDatastore(transport)
         self.assertEqual(datastore.get("/datastore/uid"), b'{"value":"ok"}')
+
+    def test_get_allows_padded_final_usb_packet_for_split_logical_frame(self) -> None:
+        packet = response_packet(b'{"value":"' + (b"x" * 80) + b'"}', padding=b"\x00" * 8)
+        transport = SizeCheckingTransport([packet[:64], packet[64:]], short_writes=False)
+        datastore = MotuUsbDatastore(transport)
+        self.assertEqual(datastore.get("/datastore/uid"), b'{"value":"' + (b"x" * 80) + b'"}')
+
+
+class DatastoreCoordinatorTests(TestCase):
+    def test_background_poller_fans_out_to_multiple_waiters(self) -> None:
+        initial = response_packet(b'HTTP/1.1 200 OK\r\nETag: 1\r\n\r\n{"state":1}')
+        changed = response_packet(
+            b'HTTP/1.1 200 OK\r\nETag: 2\r\n\r\n{"changed":true}',
+            message_seq=3,
+        )
+        transport = BlockingTransport([initial])
+        coordinator = DatastoreCoordinator(
+            MotuUsbDatastore(transport),
+            long_poll_timeout_ms=500,
+            http_wait_timeout_ms=1000,
+            poll_interval_s=0,
+        )
+        try:
+            self.assertEqual(coordinator.read("/datastore").etag, "1")
+            coordinator.start()
+            self.assertTrue(transport.wait_for_writes(3))
+            self.assertIn(build_get_frame(0x22, 3, "/datastore", etag="1"), transport.writes)
+
+            results: list[DatastorePayload] = []
+
+            def wait_for_change() -> None:
+                results.append(coordinator.wait_for_change("/datastore", "1"))
+
+            threads = [threading.Thread(target=wait_for_change) for _ in range(2)]
+            for thread in threads:
+                thread.start()
+            transport.push(changed)
+            for thread in threads:
+                thread.join(timeout=1)
+
+            self.assertEqual([result.body for result in results], [b'{"changed":true}', b'{"changed":true}'])
+            self.assertEqual([result.etag for result in results], ["2", "2"])
+        finally:
+            coordinator.close()
+
+    def test_wait_timeout_returns_not_modified(self) -> None:
+        coordinator = DatastoreCoordinator(
+            MotuUsbDatastore(FakeTransport([])),
+            http_wait_timeout_ms=1,
+        )
+        result = coordinator.wait_for_change("/datastore", "5678")
+        self.assertTrue(result.not_modified)
+        self.assertEqual(result.etag, "5678")
+        self.assertEqual(result.body, b"")
+
+    def test_history_returns_adjacent_delta_and_stale_refreshes(self) -> None:
+        transport = FakeTransport(
+            [
+                response_packet(b'HTTP/1.1 200 OK\r\nETag: 1\r\n\r\n{"state":1}'),
+                response_packet(
+                    b'HTTP/1.1 200 OK\r\nETag: 4\r\n\r\n{"state":4}',
+                    message_seq=3,
+                ),
+            ]
+        )
+        coordinator = DatastoreCoordinator(MotuUsbDatastore(transport), history_size=1)
+        self.assertEqual(coordinator.read("/datastore").etag, "1")
+        coordinator._publish_payload(DatastorePayload(b'{"delta":2}', etag="2"), None, from_etag="1")
+
+        adjacent = coordinator.wait_for_change("/datastore", "1")
+        self.assertEqual(adjacent.body, b'{"delta":2}')
+        self.assertEqual(adjacent.etag, "2")
+
+        coordinator._publish_payload(DatastorePayload(b'{"delta":3}', etag="3"), None, from_etag="2")
+        stale = coordinator.wait_for_change("/datastore", "1")
+        self.assertEqual(stale.body, b'{"state":4}')
+        self.assertEqual(stale.etag, "4")
+
+    def test_client_filter_suppresses_proxy_originated_own_change(self) -> None:
+        transport = FakeTransport([response_packet(b'HTTP/1.1 200 OK\r\nETag: 1\r\n\r\n{"state":1}')])
+        coordinator = DatastoreCoordinator(
+            MotuUsbDatastore(transport),
+            http_wait_timeout_ms=1,
+        )
+        coordinator.read("/datastore")
+        coordinator._publish_payload(
+            DatastorePayload(b'{"own":true}', etag="2"),
+            origin_client="1479701624",
+            from_etag="1",
+        )
+
+        own = coordinator.wait_for_change("/datastore", "1", client="1479701624")
+        other = coordinator.wait_for_change("/datastore", "1", client="9")
+
+        self.assertTrue(own.not_modified)
+        self.assertEqual(own.etag, "1")
+        self.assertEqual(other.body, b'{"own":true}')
+        self.assertEqual(other.etag, "2")
+
+    def test_ordinary_read_serializes_behind_active_poller(self) -> None:
+        initial = response_packet(b'HTTP/1.1 200 OK\r\nETag: 1\r\n\r\n{"state":1}')
+        no_change = response_packet(
+            b'HTTP/1.1 304 Not Modified\r\nETag: 1\r\n\r\n',
+            message_seq=3,
+        )
+        read_response = response_packet(
+            b'HTTP/1.1 200 OK\r\nETag: 1\r\n\r\n{"value":"ok"}',
+            message_seq=4,
+        )
+        transport = BlockingTransport([initial])
+        coordinator = DatastoreCoordinator(
+            MotuUsbDatastore(transport),
+            long_poll_timeout_ms=500,
+            http_wait_timeout_ms=1000,
+            poll_interval_s=0.2,
+        )
+        try:
+            coordinator.read("/datastore")
+            coordinator.start()
+            self.assertTrue(transport.wait_for_writes(3))
+
+            results: list[DatastorePayload] = []
+            thread = threading.Thread(target=lambda: results.append(coordinator.read("/datastore/uid")))
+            thread.start()
+            time.sleep(0.02)
+            self.assertEqual(results, [])
+
+            transport.push(no_change)
+            self.assertTrue(transport.wait_for_writes(5))
+            transport.push(read_response)
+            thread.join(timeout=1)
+
+            self.assertEqual([result.body for result in results], [b'{"value":"ok"}'])
+        finally:
+            coordinator.close()

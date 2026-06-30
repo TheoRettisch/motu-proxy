@@ -249,6 +249,8 @@ def capture_get(
                 raise RuntimeError(f"response exceeded {max_response_frames} frames for {path}")
             if total > max_bytes:
                 raise RuntimeError(f"response exceeded {max_bytes} bytes")
+            if response_frame_is_final(packet):
+                break
             continue
 
         result.unexpected_packets.append(packet)
@@ -261,6 +263,18 @@ def capture_get(
     ]
     result.joined_response = b"".join(response_payload(packet) for packet in result.response_packets)
     return result
+
+
+def response_frame_is_final(packet: bytes) -> bool:
+    if len(packet) < 20:
+        return False
+    wrapper_len = _u16(packet, 2)
+    if wrapper_len > len(packet):
+        return False
+    body = packet[:wrapper_len][4:]
+    if len(body) < 16:
+        return False
+    return _u32(body, 12) == 1
 
 
 def _preview(data: bytes, limit: int = 96) -> str:

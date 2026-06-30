@@ -9,6 +9,7 @@ from motu_proxy.parser import (
     is_device_ack,
     join_response_frames,
     parse_response_frame,
+    response_status_code,
     response_to_text,
 )
 from motu_proxy.protocol import sized_word, u32
@@ -118,6 +119,17 @@ class ParserTests(TestCase):
         payload = datastore_payload(b"HTTP/1.1 200 OK\r\nETag: 5678\r\n\r\n{\"value\":\"ok\"}")
         self.assertEqual(payload.body, b'{"value":"ok"}')
         self.assertEqual(payload.etag, "5678")
+
+    def test_datastore_payload_marks_text_304_not_modified(self) -> None:
+        payload = datastore_payload(b"HTTP/1.1 304 Not Modified\r\nETag: 5678\r\n\r\n")
+        self.assertTrue(payload.not_modified)
+        self.assertEqual(payload.etag, "5678")
+        self.assertEqual(payload.body, b"")
+
+    def test_response_status_code_reads_utom_metadata_status(self) -> None:
+        metadata = u32(304) + u32(1) + sized_word("ETag") + sized_word("5678")
+        response = b"UTOM" + u32(8) + u32(1) + u32(0) + u32(len(metadata)) + metadata
+        self.assertEqual(response_status_code(response), 304)
 
     def test_datastore_payload_does_not_truncate_raw_concatenated_json(self) -> None:
         response = b'{"first":true}{"second":true}'

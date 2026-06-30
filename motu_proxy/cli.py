@@ -11,7 +11,7 @@ import sys
 import time
 from pathlib import Path
 
-from .datastore import DatastoreConfig, ResponseStats, open_datastore
+from .datastore import DatastoreConfig, DatastoreCoordinator, ResponseStats, open_datastore
 from .device import DEFAULT_DEVFS_ROOT, DEFAULT_SYSFS_ROOT, UsbDeviceInfo, find_motu_device
 from .fixtures import EXPECTED_GET_DATASTORE, EXPECTED_POST_HOST_OS
 from .http_server import DEFAULT_MAX_WRITE_BODY_BYTES, MotuProxyServer, serve
@@ -187,31 +187,28 @@ def command_serve(args) -> int:
     config = config_from_args(args)
     validate_serve_write_safety(args.listen, args.allow_writes, args.unsafe_allow_remote_writes)
 
-    def run_get(path: str, client: str | None = None) -> DatastorePayload:
-        with open_datastore(config) as datastore:
-            response = datastore.get(path, client=client)
-            return datastore_payload(response)
-
-    def run_post(path: str, json_body: str, client: str | None = None) -> DatastorePayload:
-        with open_datastore(config) as datastore:
-            response = datastore.post(path, json_body, client=client)
-            return datastore_payload(response)
-
     write_token, write_token_file_path = (
         prepare_write_token(args.write_token_file) if args.allow_writes else (None, None)
     )
-    server = MotuProxyServer(
-        (args.listen, args.port),
-        args.allow_writes,
-        args.debug,
-        run_get,
-        run_post,
-        write_token=write_token,
-        write_token_file=write_token_file_path,
-        allow_remote_writes=args.unsafe_allow_remote_writes,
-        max_write_body_bytes=args.max_write_body_bytes,
-    )
-    return serve(server)
+    with open_datastore(config) as datastore:
+        coordinator = DatastoreCoordinator(datastore)
+        coordinator.start()
+        try:
+            server = MotuProxyServer(
+                (args.listen, args.port),
+                args.allow_writes,
+                args.debug,
+                coordinator.get,
+                coordinator.post,
+                write_token=write_token,
+                write_token_file=write_token_file_path,
+                allow_remote_writes=args.unsafe_allow_remote_writes,
+                max_write_body_bytes=args.max_write_body_bytes,
+                serialize_dispatch=False,
+            )
+            return serve(server)
+        finally:
+            coordinator.close()
 
 
 def command_selftest(_args) -> int:

@@ -3,14 +3,23 @@
 from __future__ import annotations
 
 import struct
+import threading
 import time
+from collections import deque
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator, Protocol
 
 from .device import DEFAULT_DEVFS_ROOT, DEFAULT_SYSFS_ROOT, find_motu_device
-from .parser import extract_response_etag, is_device_ack, join_response_frames, parse_response_frame
+from .parser import (
+    DatastorePayload,
+    datastore_payload,
+    extract_response_etag,
+    is_device_ack,
+    join_response_frames,
+    parse_response_frame,
+)
 from .protocol import (
     DEFAULT_MAX_USB_CHUNK,
     DEFAULT_MESSAGE_SEQ,
@@ -28,9 +37,13 @@ from .transports.usbfs import UsbFsTransport
 
 
 DEFAULT_RESPONSE_TIMEOUT_MS = DEFAULT_TIMEOUT_MS * 2
+DEFAULT_LONG_POLL_TIMEOUT_MS = 16_000
+DEFAULT_HTTP_LONG_POLL_WAIT_MS = 15_500
+DEFAULT_ETAG_HISTORY_SIZE = 64
 DEFAULT_MAX_RESPONSE_READS = 256
 DEFAULT_MAX_IGNORED_PACKETS = 32
 DEFAULT_MAX_RESPONSE_FRAMES = 256
+DEFAULT_POLL_PATH = "/datastore"
 
 
 class Transport(Protocol):
@@ -91,6 +104,14 @@ class DatastoreConfig:
     devfs_root: Path = DEFAULT_DEVFS_ROOT
 
 
+@dataclass(frozen=True)
+class DatastoreTransition:
+    from_etag: str
+    to_etag: str
+    body: bytes
+    origin_client: str | None = None
+
+
 class MotuUsbDatastore:
     def __init__(
         self,
@@ -116,19 +137,31 @@ class MotuUsbDatastore:
         self._write_frame(build_init(self._next_host_seq()))
         self._drain_quiet(quiet_reads=1, timeout_ms=200)
 
-    def get(self, path: str, etag: str = "0", client: str | int | None = None) -> bytes:
+    def get(
+        self,
+        path: str,
+        etag: str = "0",
+        client: str | int | None = None,
+        timeout_ms: int = DEFAULT_RESPONSE_TIMEOUT_MS,
+    ) -> bytes:
         message_seq = self.message_seq
         frame = build_get_frame(self._next_host_seq(), message_seq, path, etag=etag, client=client)
         self._write_frame(frame)
         self.message_seq += 1
-        return self._collect_response(message_seq)
+        return self._collect_response(message_seq, timeout_ms=timeout_ms)
 
-    def post(self, path: str, json_body: str, client: str | int | None = None) -> bytes:
+    def post(
+        self,
+        path: str,
+        json_body: str,
+        client: str | int | None = None,
+        timeout_ms: int = DEFAULT_RESPONSE_TIMEOUT_MS,
+    ) -> bytes:
         message_seq = self.message_seq
         frame = build_post_frame(self._next_host_seq(), message_seq, path, json_body, client=client)
         self._write_frame(frame)
         self.message_seq += 1
-        return self._collect_response(message_seq)
+        return self._collect_response(message_seq, timeout_ms=timeout_ms)
 
     def _read_logical_frame(self, timeout_ms: int | None = None) -> bytes:
         max_chunk = getattr(self.transport, "max_packet_size", DEFAULT_MAX_USB_CHUNK) or DEFAULT_MAX_USB_CHUNK
@@ -143,7 +176,7 @@ class MotuUsbDatastore:
         chunks = [first]
         got = len(first)
         while got < expected:
-            chunk = self.transport.bulk_read(min(max_chunk, expected - got), timeout_ms=timeout_ms)
+            chunk = self.transport.bulk_read(max_chunk, timeout_ms=timeout_ms)
             if not chunk:
                 break
             chunks.append(chunk)
@@ -358,6 +391,211 @@ class MotuUsbDatastore:
         return packets
 
 
+class DatastoreCoordinator:
+    def __init__(
+        self,
+        datastore: MotuUsbDatastore,
+        poll_path: str = DEFAULT_POLL_PATH,
+        long_poll_timeout_ms: int = DEFAULT_LONG_POLL_TIMEOUT_MS,
+        http_wait_timeout_ms: int = DEFAULT_HTTP_LONG_POLL_WAIT_MS,
+        history_size: int = DEFAULT_ETAG_HISTORY_SIZE,
+        poll_interval_s: float = 0.05,
+    ) -> None:
+        self.datastore = datastore
+        self.poll_path = poll_path
+        self.long_poll_timeout_ms = long_poll_timeout_ms
+        self.http_wait_timeout_ms = http_wait_timeout_ms
+        self.poll_interval_s = poll_interval_s
+        self._io_lock = threading.Lock()
+        self._condition = threading.Condition()
+        self._history: deque[DatastoreTransition] = deque(maxlen=history_size)
+        self._latest_etag: str | None = None
+        self._closed = False
+        self._worker: threading.Thread | None = None
+        self.last_poller_error: Exception | None = None
+
+    @property
+    def latest_etag(self) -> str | None:
+        with self._condition:
+            return self._latest_etag
+
+    @property
+    def history(self) -> tuple[DatastoreTransition, ...]:
+        with self._condition:
+            return tuple(self._history)
+
+    def start(self) -> None:
+        with self._condition:
+            if self._worker is not None:
+                return
+            self._worker = threading.Thread(
+                target=self._poll_loop,
+                name="motu-datastore-long-poll",
+                daemon=True,
+            )
+            self._worker.start()
+
+    def close(self, timeout: float | None = 1.0) -> None:
+        with self._condition:
+            self._closed = True
+            self._condition.notify_all()
+            worker = self._worker
+        if worker is not None:
+            worker.join(timeout=timeout)
+
+    def get(
+        self,
+        path: str,
+        client: str | int | None = None,
+        if_none_match: str | None = None,
+    ) -> DatastorePayload:
+        etag = _clean_etag(if_none_match)
+        if etag is not None:
+            return self.wait_for_change(path, etag, client=client)
+        return self.read(path, client=client)
+
+    def read(
+        self,
+        path: str,
+        etag: str = "0",
+        client: str | int | None = None,
+        timeout_ms: int = DEFAULT_RESPONSE_TIMEOUT_MS,
+    ) -> DatastorePayload:
+        with self._io_lock:
+            response = self.datastore.get(path, etag=etag, client=client, timeout_ms=timeout_ms)
+            payload = self._payload_from_response(response)
+        self._publish_payload(payload, origin_client=None, record_transition=path == self.poll_path)
+        return payload
+
+    def post(self, path: str, json_body: str, client: str | int | None = None) -> DatastorePayload:
+        origin_client = _client_string(client)
+        with self._io_lock:
+            response = self.datastore.post(path, json_body, client=client)
+            payload = self._payload_from_response(response)
+            needs_refresh = payload.etag is None or payload.not_modified
+            if needs_refresh:
+                refresh = self._read_locked(self.poll_path, etag="0", client=None)
+            else:
+                refresh = None
+        if refresh is not None:
+            self._publish_payload(refresh, origin_client=origin_client)
+        else:
+            self._publish_payload(payload, origin_client=origin_client)
+        return payload
+
+    def wait_for_change(
+        self,
+        path: str,
+        etag: str,
+        client: str | int | None = None,
+    ) -> DatastorePayload:
+        deadline = time.monotonic() + (self.http_wait_timeout_ms / 1000)
+        client_id = _client_string(client)
+        while True:
+            with self._condition:
+                transition, should_refresh = self._find_wait_outcome_locked(etag, client_id)
+                if transition is not None:
+                    if path == self.poll_path:
+                        return DatastorePayload(transition.body, etag=transition.to_etag)
+                    should_refresh = True
+                if should_refresh:
+                    break
+                remaining = deadline - time.monotonic()
+                if remaining <= 0 or self._closed:
+                    return DatastorePayload(b"", etag=etag, not_modified=True)
+                self._condition.wait(remaining)
+        return self.read(path, etag="0", client=client)
+
+    def _poll_loop(self) -> None:
+        while True:
+            with self._condition:
+                if self._closed:
+                    return
+                etag = self._latest_etag or "0"
+            try:
+                with self._io_lock:
+                    response = self.datastore.get(
+                        self.poll_path,
+                        etag=etag,
+                        timeout_ms=self.long_poll_timeout_ms,
+                    )
+                    payload = self._payload_from_response(response)
+                self.last_poller_error = None
+                self._publish_payload(payload, origin_client=None, from_etag=etag)
+            except (DatastoreNoResponse, DatastoreTimeout) as exc:
+                self.last_poller_error = exc
+            except Exception as exc:
+                self.last_poller_error = exc
+            with self._condition:
+                if self._closed:
+                    return
+                self._condition.wait(self.poll_interval_s)
+
+    def _read_locked(
+        self,
+        path: str,
+        etag: str = "0",
+        client: str | int | None = None,
+        timeout_ms: int = DEFAULT_RESPONSE_TIMEOUT_MS,
+    ) -> DatastorePayload:
+        response = self.datastore.get(path, etag=etag, client=client, timeout_ms=timeout_ms)
+        return self._payload_from_response(response)
+
+    def _payload_from_response(self, response: bytes) -> DatastorePayload:
+        payload = datastore_payload(response)
+        return DatastorePayload(
+            payload.body,
+            etag=payload.etag or getattr(self.datastore, "last_response_etag", None),
+            not_modified=payload.not_modified,
+        )
+
+    def _publish_payload(
+        self,
+        payload: DatastorePayload,
+        origin_client: str | None,
+        from_etag: str | None = None,
+        record_transition: bool = True,
+    ) -> None:
+        if payload.etag is None:
+            return
+        with self._condition:
+            if payload.not_modified:
+                self._latest_etag = payload.etag
+                self._condition.notify_all()
+                return
+            previous = from_etag if from_etag is not None else self._latest_etag
+            if record_transition and previous is not None and previous != payload.etag:
+                self._history.append(
+                    DatastoreTransition(
+                        from_etag=previous,
+                        to_etag=payload.etag,
+                        body=payload.body,
+                        origin_client=origin_client,
+                    )
+                )
+            self._latest_etag = payload.etag
+            self._condition.notify_all()
+
+    def _find_wait_outcome_locked(
+        self,
+        etag: str,
+        client: str | None,
+    ) -> tuple[DatastoreTransition | None, bool]:
+        suppressed: DatastoreTransition | None = None
+        for transition in reversed(self._history):
+            if transition.from_etag != etag:
+                continue
+            if client is not None and transition.origin_client == client:
+                suppressed = transition
+                continue
+            return transition, False
+        if suppressed is not None:
+            return None, self._latest_etag != suppressed.to_etag
+        if self._latest_etag is not None and self._latest_etag != etag:
+            return None, True
+        return None, False
+
+
 @contextmanager
 def open_datastore(config: DatastoreConfig) -> Iterator[MotuUsbDatastore]:
     device = find_motu_device(
@@ -389,3 +627,16 @@ def _response_wait_message(
         f"{reason}; timeout_ms={timeout_ms} reads={reads} "
         f"accepted={accepted} ignored={ignored} ack={ack}"
     )
+
+
+def _clean_etag(value: str | None) -> str | None:
+    if value is None:
+        return None
+    value = value.strip()
+    return value or None
+
+
+def _client_string(value: str | int | None) -> str | None:
+    if value is None:
+        return None
+    return str(value)

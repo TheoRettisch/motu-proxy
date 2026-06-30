@@ -83,11 +83,23 @@ class FakeServeDatastore:
         self.response = response
         self.calls: list[tuple[str, str | None]] = []
 
-    def get(self, path: str, client: str | None = None) -> bytes:
+    def get(
+        self,
+        path: str,
+        etag: str = "0",
+        client: str | None = None,
+        timeout_ms: int = 1200,
+    ) -> bytes:
         self.calls.append((path, client))
         return self.response
 
-    def post(self, path: str, json_body: str, client: str | None = None) -> bytes:
+    def post(
+        self,
+        path: str,
+        json_body: str,
+        client: str | None = None,
+        timeout_ms: int = 1200,
+    ) -> bytes:
         raise AssertionError("unexpected post")
 
 
@@ -134,6 +146,7 @@ class CliServeSecurityTests(TestCase):
                 write_token_file=None,
                 allow_remote_writes=False,
                 max_write_body_bytes=64 * 1024,
+                serialize_dispatch=True,
             ) -> None:
                 self.server_address = server_address
                 self.allow_writes = allow_writes
@@ -148,6 +161,7 @@ class CliServeSecurityTests(TestCase):
                     run_post,
                     write_token=write_token,
                     allow_remote_writes=allow_remote_writes,
+                    serialize_dispatch=serialize_dispatch,
                 )
 
             def server_close(self) -> None:
@@ -170,7 +184,7 @@ class CliServeSecurityTests(TestCase):
 
         self.assertEqual(result, 0)
         self.assertEqual(captured["result"].response, b'{"first":true}{"second":true}')
-        self.assertEqual(datastore.calls, [("/datastore", None)])
+        self.assertIn(("/datastore", None), datastore.calls)
 
 
 @skipIf(os.name == "nt", "fake sysfs interface names use ':' like Linux")

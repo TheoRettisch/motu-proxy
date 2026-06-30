@@ -128,6 +128,47 @@ class HttpServerTests(TestCase):
         self.assertEqual(result.path, "/datastore/uid")
         self.assertEqual(calls, [("/datastore/uid", "1479701624")])
 
+    def test_get_forwards_if_none_match(self) -> None:
+        calls: list[tuple[str, str | None, str | None]] = []
+
+        def get(path: str, client: str | None = None, if_none_match: str | None = None) -> DatastorePayload:
+            calls.append((path, client, if_none_match))
+            return DatastorePayload(b'{"changed":true}', etag="5679")
+
+        result = dispatch_datastore_request(
+            "GET",
+            "/datastore?client=1479701624",
+            "",
+            "",
+            False,
+            get,
+            lambda path, body, client=None: b"{}",
+            if_none_match="5678",
+        )
+        self.assertEqual(result.status, 200)
+        self.assertEqual(result.response, b'{"changed":true}')
+        self.assertEqual(result.etag, "5679")
+        self.assertEqual(calls, [("/datastore", "1479701624", "5678")])
+
+    def test_get_maps_not_modified_payload_to_304(self) -> None:
+        result = dispatch_datastore_request(
+            "GET",
+            "/datastore",
+            "",
+            "",
+            False,
+            lambda path, client=None, if_none_match=None: DatastorePayload(
+                b"",
+                etag=if_none_match,
+                not_modified=True,
+            ),
+            lambda path, body, client=None: b"{}",
+            if_none_match="5678",
+        )
+        self.assertEqual(result.status, 304)
+        self.assertEqual(result.response, b"")
+        self.assertEqual(result.etag, "5678")
+
     def test_invalid_client_identifier_is_rejected(self) -> None:
         with self.assertRaisesRegex(BadRequest, "client"):
             dispatch_datastore_request(
@@ -426,6 +467,20 @@ class HttpHandlerTests(TestCase):
         self.assertEqual(handler.statuses, [200])
         self.assertIn(("Cache-Control", "no-cache"), handler.sent_headers)
         self.assertIn(("ETag", "5678"), handler.sent_headers)
+
+    def test_handler_sends_304_without_body(self) -> None:
+        class Dispatcher:
+            def dispatch(self, *args, **kwargs):
+                return DispatchResult(b"", "/datastore", etag="5678", status=304)
+
+        handler = self.make_handler(dispatcher=Dispatcher())
+        handler.handle_datastore_request("GET")
+        self.assertEqual(handler.statuses, [304])
+        self.assertIn(("Cache-Control", "no-cache"), handler.sent_headers)
+        self.assertIn(("ETag", "5678"), handler.sent_headers)
+        self.assertIn(("Content-Length", "0"), handler.sent_headers)
+        self.assertNotIn(("Content-Type", "application/json"), handler.sent_headers)
+        self.assertEqual(handler.wfile.getvalue(), b"")
 
     def test_dispatch_accepts_datastore_payload_metadata(self) -> None:
         result = dispatch_datastore_request(

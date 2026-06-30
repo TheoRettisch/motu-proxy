@@ -17,6 +17,10 @@ class ProtocolTests(TestCase):
         self.assertIn(sized_word("client") + sized_word("1479701624"), frame)
         self.assertNotIn(b"/datastore?client", frame)
 
+    def test_get_frame_can_forward_non_default_etag(self) -> None:
+        frame = build_get_frame(0x24, 2, "/datastore", etag="5678")
+        self.assertIn(sized_word("If-None-Match") + sized_word("5678"), frame)
+
     def test_post_frame_matches_fixture(self) -> None:
         self.assertEqual(
             build_post_frame(0x23, 2, "/datastore/host/os", '{"value": "win"}', header="PTTH"),
