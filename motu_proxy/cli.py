@@ -16,7 +16,7 @@ from .device import DEFAULT_DEVFS_ROOT, DEFAULT_SYSFS_ROOT, UsbDeviceInfo, find_
 from .fixtures import EXPECTED_GET_DATASTORE, EXPECTED_POST_HOST_OS
 from .http_server import DEFAULT_MAX_WRITE_BODY_BYTES, MotuProxyServer, serve
 from .json_body import validate_json_body
-from .parser import DatastorePayload, datastore_payload, response_to_text
+from .parser import response_to_text
 from .paths import normalize_path
 from .protocol import (
     DEFAULT_MESSAGE_SEQ,

@@ -406,8 +406,9 @@ class DatastoreCoordinator:
         self.long_poll_timeout_ms = long_poll_timeout_ms
         self.http_wait_timeout_ms = http_wait_timeout_ms
         self.poll_interval_s = poll_interval_s
-        self._io_lock = threading.Lock()
         self._condition = threading.Condition()
+        self._io_busy = False
+        self._foreground_waiters = 0
         self._history: deque[DatastoreTransition] = deque(maxlen=history_size)
         self._latest_etag: str | None = None
         self._closed = False
@@ -461,26 +462,25 @@ class DatastoreCoordinator:
         client: str | int | None = None,
         timeout_ms: int = DEFAULT_RESPONSE_TIMEOUT_MS,
     ) -> DatastorePayload:
-        with self._io_lock:
+        self._acquire_foreground_io()
+        try:
             response = self.datastore.get(path, etag=etag, client=client, timeout_ms=timeout_ms)
             payload = self._payload_from_response(response)
+        finally:
+            self._release_io()
         self._publish_payload(payload, origin_client=None, record_transition=path == self.poll_path)
         return payload
 
     def post(self, path: str, json_body: str, client: str | int | None = None) -> DatastorePayload:
         origin_client = _client_string(client)
-        with self._io_lock:
+        self._acquire_foreground_io()
+        try:
             response = self.datastore.post(path, json_body, client=client)
             payload = self._payload_from_response(response)
-            needs_refresh = payload.etag is None or payload.not_modified
-            if needs_refresh:
-                refresh = self._read_locked(self.poll_path, etag="0", client=None)
-            else:
-                refresh = None
-        if refresh is not None:
-            self._publish_payload(refresh, origin_client=origin_client)
-        else:
-            self._publish_payload(payload, origin_client=origin_client)
+            refresh = self._read_locked(self.poll_path, etag="0", client=None)
+        finally:
+            self._release_io()
+        self._publish_payload(refresh, origin_client=origin_client)
         return payload
 
     def wait_for_change(
@@ -513,13 +513,17 @@ class DatastoreCoordinator:
                     return
                 etag = self._latest_etag or "0"
             try:
-                with self._io_lock:
+                if not self._acquire_poller_io():
+                    return
+                try:
                     response = self.datastore.get(
                         self.poll_path,
                         etag=etag,
                         timeout_ms=self.long_poll_timeout_ms,
                     )
                     payload = self._payload_from_response(response)
+                finally:
+                    self._release_io()
                 self.last_poller_error = None
                 self._publish_payload(payload, origin_client=None, from_etag=etag)
             except (DatastoreNoResponse, DatastoreTimeout) as exc:
@@ -540,6 +544,34 @@ class DatastoreCoordinator:
     ) -> DatastorePayload:
         response = self.datastore.get(path, etag=etag, client=client, timeout_ms=timeout_ms)
         return self._payload_from_response(response)
+
+    def _acquire_foreground_io(self) -> None:
+        with self._condition:
+            self._foreground_waiters += 1
+            self._condition.notify_all()
+            try:
+                while self._io_busy:
+                    self._condition.wait()
+                self._io_busy = True
+            finally:
+                self._foreground_waiters -= 1
+                self._condition.notify_all()
+
+    def _acquire_poller_io(self) -> bool:
+        with self._condition:
+            while self._io_busy or self._foreground_waiters > 0:
+                if self._closed:
+                    return False
+                self._condition.wait()
+            if self._closed:
+                return False
+            self._io_busy = True
+            return True
+
+    def _release_io(self) -> None:
+        with self._condition:
+            self._io_busy = False
+            self._condition.notify_all()
 
     def _payload_from_response(self, response: bytes) -> DatastorePayload:
         payload = datastore_payload(response)

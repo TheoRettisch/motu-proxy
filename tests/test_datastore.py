@@ -269,6 +269,35 @@ class DatastoreCoordinatorTests(TestCase):
         self.assertEqual(stale.body, b'{"state":4}')
         self.assertEqual(stale.etag, "4")
 
+    def test_post_publishes_refreshed_datastore_instead_of_post_body(self) -> None:
+        transport = FakeTransport(
+            [
+                response_packet(b'HTTP/1.1 200 OK\r\nETag: 1\r\n\r\n{"state":1}'),
+                response_packet(
+                    b'HTTP/1.1 200 OK\r\nETag: 2\r\n\r\n{"post":true}',
+                    message_seq=3,
+                ),
+                response_packet(
+                    b'HTTP/1.1 200 OK\r\nETag: 2\r\n\r\n{"full":true}',
+                    message_seq=4,
+                ),
+            ]
+        )
+        coordinator = DatastoreCoordinator(
+            MotuUsbDatastore(transport),
+            http_wait_timeout_ms=1,
+        )
+        coordinator.read("/datastore")
+
+        returned = coordinator.post("/datastore/host/os", '{"value":"linux"}', client="7")
+        other = coordinator.wait_for_change("/datastore", "1", client="8")
+        own = coordinator.wait_for_change("/datastore", "1", client="7")
+
+        self.assertEqual(returned.body, b'{"post":true}')
+        self.assertEqual(other.body, b'{"full":true}')
+        self.assertEqual(other.etag, "2")
+        self.assertTrue(own.not_modified)
+
     def test_client_filter_suppresses_proxy_originated_own_change(self) -> None:
         transport = FakeTransport([response_packet(b'HTTP/1.1 200 OK\r\nETag: 1\r\n\r\n{"state":1}')])
         coordinator = DatastoreCoordinator(
@@ -320,6 +349,53 @@ class DatastoreCoordinatorTests(TestCase):
 
             transport.push(no_change)
             self.assertTrue(transport.wait_for_writes(5))
+            transport.push(read_response)
+            thread.join(timeout=1)
+
+            self.assertEqual([result.body for result in results], [b'{"value":"ok"}'])
+        finally:
+            coordinator.close()
+
+    def test_poller_yields_to_waiting_foreground_read_between_cycles(self) -> None:
+        initial = response_packet(b'HTTP/1.1 200 OK\r\nETag: 1\r\n\r\n{"state":1}')
+        no_change = response_packet(
+            b'HTTP/1.1 304 Not Modified\r\nETag: 1\r\n\r\n',
+            message_seq=3,
+        )
+        read_response = response_packet(
+            b'HTTP/1.1 200 OK\r\nETag: 1\r\n\r\n{"value":"ok"}',
+            message_seq=4,
+        )
+        transport = BlockingTransport([initial])
+        coordinator = DatastoreCoordinator(
+            MotuUsbDatastore(transport),
+            long_poll_timeout_ms=500,
+            http_wait_timeout_ms=1000,
+            poll_interval_s=0,
+        )
+        try:
+            coordinator.read("/datastore")
+            coordinator.start()
+            self.assertTrue(transport.wait_for_writes(3))
+
+            results: list[DatastorePayload] = []
+            thread = threading.Thread(target=lambda: results.append(coordinator.read("/datastore/uid")))
+            thread.start()
+            deadline = time.monotonic() + 1
+            while time.monotonic() < deadline:
+                with coordinator._condition:
+                    if coordinator._foreground_waiters > 0:
+                        break
+                time.sleep(0.005)
+            else:
+                self.fail("foreground read did not queue behind active poller")
+
+            transport.push(no_change)
+            self.assertTrue(transport.wait_for_writes(5))
+            self.assertEqual(
+                transport.writes[4],
+                build_get_frame(0x24, 4, "/datastore/uid"),
+            )
             transport.push(read_response)
             thread.join(timeout=1)
 

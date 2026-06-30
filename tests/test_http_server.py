@@ -417,6 +417,30 @@ class HttpServerTests(TestCase):
             )
         self.assertEqual(calls, [])
 
+    def test_non_object_write_json_is_rejected_before_usb_call(self) -> None:
+        calls: list[tuple[str, str]] = []
+
+        def post(path: str, body: str, client: str | None = None) -> bytes:
+            calls.append((path, body))
+            return b"{}"
+
+        for body in ("[]", "5", "true", '"x"'):
+            with self.subTest(body=body):
+                with self.assertRaisesRegex(InvalidJsonBody, "JSON object"):
+                    dispatch_datastore_request(
+                        "POST",
+                        "/host/os",
+                        body,
+                        "application/json",
+                        True,
+                        lambda path, client=None: b"{}",
+                        post,
+                        host="127.0.0.1:1280",
+                        write_token=WRITE_TOKEN,
+                        request_token=WRITE_TOKEN,
+                    )
+        self.assertEqual(calls, [])
+
     def test_serve_defaults_are_read_only_localhost(self) -> None:
         args = build_parser().parse_args(["serve"])
         self.assertEqual(args.listen, "127.0.0.1")
