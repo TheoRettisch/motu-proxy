@@ -719,6 +719,23 @@ class DatastoreCoordinatorTests(TestCase):
         self.assertEqual(coordinator.latest_etag, "1")
         self.assertEqual(coordinator.history, ())
 
+    def test_read_publishes_poll_path_before_releasing_foreground_io(self) -> None:
+        transport = FakeTransport([response_packet(b'HTTP/1.1 200 OK\r\nETag: 1\r\n\r\n{"state":1}')])
+        coordinator = DatastoreCoordinator(MotuUsbDatastore(transport))
+        release_etags: list[str | None] = []
+        release_io = coordinator._release_io
+
+        def record_release_etag() -> None:
+            release_etags.append(coordinator.latest_etag)
+            release_io()
+
+        coordinator._release_io = record_release_etag
+
+        payload = coordinator.read("/datastore")
+
+        self.assertEqual(payload.etag, "1")
+        self.assertEqual(release_etags, ["1"])
+
     def test_background_poller_fans_out_to_multiple_waiters(self) -> None:
         initial = response_packet(b'HTTP/1.1 200 OK\r\nETag: 1\r\n\r\n{"state":1}')
         changed = response_packet(
@@ -752,6 +769,41 @@ class DatastoreCoordinatorTests(TestCase):
 
             self.assertEqual([result.body for result in results], [b'{"changed":true}', b'{"changed":true}'])
             self.assertEqual([result.etag for result in results], ["2", "2"])
+        finally:
+            coordinator.close()
+
+    def test_poller_publishes_payload_before_releasing_io(self) -> None:
+        initial = response_packet(b'HTTP/1.1 200 OK\r\nETag: 1\r\n\r\n{"state":1}')
+        changed = response_packet(
+            b'HTTP/1.1 200 OK\r\nETag: 2\r\n\r\n{"changed":true}',
+            message_seq=3,
+        )
+        transport = BlockingTransport([initial])
+        coordinator = DatastoreCoordinator(
+            MotuUsbDatastore(transport),
+            long_poll_timeout_ms=5000,
+            http_wait_timeout_ms=1000,
+            poll_interval_s=10,
+        )
+        release_etags: list[str | None] = []
+        release_io = coordinator._release_io
+
+        def record_release_etag() -> None:
+            release_etags.append(coordinator.latest_etag)
+            release_io()
+
+        try:
+            self.assertEqual(coordinator.read("/datastore").etag, "1")
+            coordinator._release_io = record_release_etag
+            coordinator.start()
+            self.assertTrue(transport.wait_for_writes(3))
+
+            transport.push(changed)
+            deadline = time.monotonic() + 1
+            while not release_etags and time.monotonic() < deadline:
+                time.sleep(0.01)
+
+            self.assertEqual(release_etags[:1], ["2"])
         finally:
             coordinator.close()
 

@@ -80,6 +80,8 @@ class BufferedSocket:
     def __init__(self, request: bytes) -> None:
         self.request = BytesIO(request)
         self.response = BytesIO()
+        self.timeout: float | None = None
+        self.timeouts: list[float | None] = []
 
     def makefile(self, mode: str, *args, **kwargs):
         if "r" in mode:
@@ -87,6 +89,13 @@ class BufferedSocket:
         if "w" in mode:
             return self.response
         raise ValueError(f"unsupported mode {mode!r}")
+
+    def gettimeout(self) -> float | None:
+        return self.timeout
+
+    def settimeout(self, timeout: float | None) -> None:
+        self.timeout = timeout
+        self.timeouts.append(timeout)
 
     def sendall(self, data: bytes) -> None:
         self.response.write(data)
@@ -597,6 +606,16 @@ class HttpServerTests(TestCase):
     def test_missing_write_token_is_rejected_when_writes_are_enabled(self) -> None:
         with self.assertRaises(WriteTokenRequired):
             self.dispatch("POST", "/host/os", body='{"value":"linux"}', allow_writes=True, request_token=None)
+
+    def test_non_ascii_write_token_is_rejected_without_type_error(self) -> None:
+        with self.assertRaises(WriteTokenRequired):
+            self.dispatch(
+                "POST",
+                "/host/os",
+                body='{"value":"linux"}',
+                allow_writes=True,
+                request_token="tést-write-token",
+            )
 
     def test_unknown_host_is_rejected_when_writes_are_enabled(self) -> None:
         with self.assertRaises(HostNotAllowed):
@@ -1148,6 +1167,29 @@ class HttpHandlerTests(TestCase):
     def test_handler_protocol_version_is_http_11(self) -> None:
         self.assertEqual(MotuProxyHandler.protocol_version, "HTTP/1.1")
 
+    def test_handler_sets_idle_socket_timeout(self) -> None:
+        class Dispatcher:
+            def dispatch(self, *args, **kwargs):
+                return DispatchResult(b'{"value":"ok"}', "/datastore/uid")
+
+        request = (
+            "GET /datastore/uid HTTP/1.1\r\n"
+            "Host: 127.0.0.1\r\n"
+            "Connection: close\r\n"
+            "\r\n"
+        ).encode("ascii")
+        request_socket = BufferedSocket(request)
+        server = SimpleNamespace(
+            debug=False,
+            dispatcher=Dispatcher(),
+            max_write_body_bytes=64 * 1024,
+            write_body_read_timeout_s=5.0,
+        )
+
+        MotuProxyHandler(request_socket, ("127.0.0.1", 0), server)
+
+        self.assertEqual(request_socket.timeouts[:1], [MotuProxyHandler.timeout])
+
     def test_handler_length_frames_success_without_unconditional_close(self) -> None:
         body = b'{"value":"ok"}'
 
@@ -1396,6 +1438,16 @@ class HttpHandlerTests(TestCase):
                 "bad token",
                 DatastoreDispatcher(True, get, post, write_token=WRITE_TOKEN, log_write=None),
                 {"Content-Length": "17", "Host": "127.0.0.1:1280"},
+                "valid write token required",
+            ),
+            (
+                "non-ascii token",
+                DatastoreDispatcher(True, get, post, write_token=WRITE_TOKEN, log_write=None),
+                {
+                    "Content-Length": "17",
+                    "Host": "127.0.0.1:1280",
+                    WRITE_TOKEN_HEADER: "tést-write-token",
+                },
                 "valid write token required",
             ),
         ]

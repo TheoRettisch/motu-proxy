@@ -44,6 +44,7 @@ StatusProvider = Callable[[], dict[str, object | None]]
 DEFAULT_MAX_WRITE_BODY_BYTES = 60 * 1024
 MAX_CONFIGURABLE_WRITE_BODY_BYTES = max_post_json_body_bytes("/datastore")
 DEFAULT_WRITE_BODY_READ_TIMEOUT_S = 5.0
+DEFAULT_IDLE_CONNECTION_TIMEOUT_S = 65.0
 WRITE_TOKEN_HEADER = "X-Motu-Proxy-Token"
 MAX_CLIENT_ID = 0xFFFFFFFF
 STATUS_PATH = "/__motu_proxy/status"
@@ -183,8 +184,14 @@ def validate_write_origin(method: str, allow_writes: bool, origin: str | None, h
 def validate_write_token(method: str, allow_writes: bool, expected_token: str | None, request_token: str | None) -> None:
     if method == "GET" or not allow_writes:
         return
-    if not expected_token or not request_token or not hmac.compare_digest(expected_token, request_token):
+    if not expected_token or not request_token:
         raise WriteTokenRequired("valid write token required")
+    if not hmac.compare_digest(_token_bytes(expected_token), _token_bytes(request_token)):
+        raise WriteTokenRequired("valid write token required")
+
+
+def _token_bytes(token: str) -> bytes:
+    return token.encode("utf-8", "surrogateescape")
 
 
 def dispatch_datastore_request(
@@ -355,6 +362,7 @@ class DatastoreDispatcher:
 class MotuProxyHandler(BaseHTTPRequestHandler):
     server_version = "MotuProxy/0.1"
     protocol_version = "HTTP/1.1"
+    timeout = DEFAULT_IDLE_CONNECTION_TIMEOUT_S
 
     def do_GET(self) -> None:
         self.handle_datastore_request("GET")

@@ -1102,9 +1102,9 @@ class DatastoreCoordinator:
                     query_fields=device_query_fields,
                 )
             payload = self._payload_from_response(response)
+            self._publish_payload(payload, origin_client=None, record_transition=path == self.poll_path)
         finally:
             self._release_io()
-        self._publish_payload(payload, origin_client=None, record_transition=path == self.poll_path)
         return payload
 
     def post(self, path: str, json_body: str, client: str | int | None = None) -> DatastorePayload:
@@ -1205,10 +1205,10 @@ class DatastoreCoordinator:
                         read_started=None if initial_refresh else self._set_active_poll_read,
                     )
                     payload = self._payload_from_response(response)
+                    self._clear_poller_error()
+                    self._publish_payload(payload, origin_client=None, from_etag=etag)
                 finally:
                     self._release_io()
-                self._clear_poller_error()
-                self._publish_payload(payload, origin_client=None, from_etag=etag)
             except DatastoreCancelled:
                 if self._is_closed():
                     return

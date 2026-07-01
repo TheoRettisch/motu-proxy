@@ -132,6 +132,7 @@ class UsbFsCancellableBulkRead:
         self._cancel_requested = False
         self._discard_submitted = False
         self._discard_failed_without_reap = False
+        self._discard_failure_errno: int | None = None
         self._timed_out = False
         self._cancel_event = threading.Event()
 
@@ -175,6 +176,7 @@ class UsbFsCancellableBulkRead:
             if exc.errno not in (errno.EINVAL, errno.ENODEV, errno.ENOENT):
                 raise
             self._discard_failed_without_reap = True
+            self._discard_failure_errno = exc.errno
 
     def _submit(self) -> None:
         if self._submitted:
@@ -213,9 +215,23 @@ class UsbFsCancellableBulkRead:
 
     def _finish_cancelled_reap(self) -> None:
         if self._discard_failed_without_reap:
+            if self._discard_failure_errno in (errno.EINVAL, errno.ENOENT):
+                self._reap_discard_race_completion()
+                return
             self._reaped = True
             return
         self._reap_blocking()
+
+    def _reap_discard_race_completion(self) -> None:
+        reaped = ctypes.c_void_p()
+        try:
+            _ioctl(self.fd, USBDEVFS_REAPURBNDELAY, ctypes.byref(reaped))
+        except OSError as exc:
+            if exc.errno != errno.EAGAIN:
+                raise
+            self._reaped = True
+            return
+        self._accept_reaped_urb(reaped)
 
     def _accept_reaped_urb(self, reaped: ctypes.c_void_p) -> None:
         if reaped.value != ctypes.addressof(self._urb):
