@@ -15,6 +15,7 @@ from typing import Callable, Iterator, Protocol
 from .device import DEFAULT_DEVFS_ROOT, DEFAULT_SYSFS_ROOT, find_motu_device
 from .parser import (
     DatastorePayload,
+    ResponseFrameError,
     datastore_payload,
     extract_response_etag,
     is_device_ack,
@@ -49,6 +50,7 @@ DEFAULT_POLL_PATH = "/datastore"
 DEFAULT_POLL_READ_TIMEOUT_SLICE_MS = 250
 DEFAULT_FOREGROUND_PREEMPTION_BUDGET_MS = 500
 DEFAULT_DEGRADED_REFRESH_INTERVAL_S = 0.5
+MAX_MESSAGE_SEQ = 0xFFFFFFFF
 CAPABILITY_SECTIONS = ("avb", "router", "mixer")
 IDENTITY_KEYS = ("uid", "model_name", "firmware_version", "serial_number")
 
@@ -185,6 +187,12 @@ class MotuUsbDatastore:
     def _next_host_seq(self) -> int:
         return self.host_seq.take()
 
+    def _current_message_seq(self) -> int:
+        return self.message_seq & MAX_MESSAGE_SEQ
+
+    def _advance_message_seq(self) -> None:
+        self.message_seq = (self._current_message_seq() + 1) & MAX_MESSAGE_SEQ
+
     def _write_frame(self, frame: bytes) -> None:
         written = self.transport.bulk_write(frame)
         if written != len(frame):
@@ -205,10 +213,10 @@ class MotuUsbDatastore:
         use_cancellable_read: bool = False,
         read_started: Callable[[CancellableBulkRead | None], None] | None = None,
     ) -> bytes:
-        message_seq = self.message_seq
+        message_seq = self._current_message_seq()
         frame = build_get_frame(self._next_host_seq(), message_seq, path, etag=etag, client=client)
         self._write_frame(frame)
-        self.message_seq += 1
+        self._advance_message_seq()
         return self._collect_response(
             message_seq,
             timeout_ms=timeout_ms,
@@ -225,10 +233,10 @@ class MotuUsbDatastore:
         client: str | int | None = None,
         timeout_ms: int = DEFAULT_RESPONSE_TIMEOUT_MS,
     ) -> bytes:
-        message_seq = self.message_seq
+        message_seq = self._current_message_seq()
         frame = build_post_frame(self._next_host_seq(), message_seq, path, json_body, client=client)
         self._write_frame(frame)
-        self.message_seq += 1
+        self._advance_message_seq()
         return self._collect_response(message_seq, timeout_ms=timeout_ms)
 
     def _read_logical_frame(
@@ -433,7 +441,31 @@ class MotuUsbDatastore:
                             )
                         )
                     continue
-                parsed = parse_response_frame(packet, expected_message_seq)
+                try:
+                    parsed = parse_response_frame(packet, expected_message_seq)
+                except ResponseFrameError:
+                    ignored_packets += 1
+                    if ignored_packets > max_ignored_packets:
+                        self._record_response_stats(
+                            timeout_ms,
+                            started,
+                            reads,
+                            len(frames),
+                            ignored_packets,
+                            ack_packets,
+                            total,
+                        )
+                        raise DatastoreTimeout(
+                            _response_wait_message(
+                                f"response ignored packet limit exceeded after {max_ignored_packets} packets",
+                                timeout_ms,
+                                reads,
+                                len(frames),
+                                ignored_packets,
+                                ack_packets,
+                            )
+                        )
+                    continue
                 frames.append(packet)
                 total += len(packet)
                 if len(frames) > max_response_frames:
@@ -507,7 +539,19 @@ class MotuUsbDatastore:
                     ack_packets,
                 )
             )
-        response = join_response_frames(frames, expected_message_seq)
+        try:
+            response = join_response_frames(frames, expected_message_seq)
+        except ResponseFrameError:
+            self._record_response_stats(
+                timeout_ms,
+                started,
+                reads,
+                len(frames),
+                ignored_packets,
+                ack_packets,
+                total,
+            )
+            raise
         self.last_response_etag = extract_response_etag(response)
         self._record_response_stats(
             timeout_ms,
@@ -643,6 +687,8 @@ class DatastoreCoordinator:
         self._foreground_waiters = 0
         self._active_poll_read: CancellableBulkRead | None = None
         self._active_poll_cancel_requested = False
+        self._degraded_refresh_in_progress = False
+        self._next_degraded_refresh = 0.0
         self._history: deque[DatastoreTransition] = deque(maxlen=history_size)
         self._latest_etag: str | None = None
         self._closed = False
@@ -742,7 +788,6 @@ class DatastoreCoordinator:
     ) -> DatastorePayload:
         deadline = time.monotonic() + (self.http_wait_timeout_ms / 1000)
         client_id = _client_string(client)
-        next_degraded_refresh = 0.0
         while True:
             refresh_poll_path = False
             refresh_timeout_ms = DEFAULT_RESPONSE_TIMEOUT_MS
@@ -759,12 +804,16 @@ class DatastoreCoordinator:
                     return DatastorePayload(b"", etag=etag, not_modified=True)
                 if not self.foreground_preemptive_native_long_poll_available:
                     now = time.monotonic()
-                    if now >= next_degraded_refresh:
-                        next_degraded_refresh = now + self.degraded_refresh_interval_s
+                    if self._degraded_refresh_in_progress:
+                        self._condition.wait(remaining)
+                        continue
+                    if now >= self._next_degraded_refresh:
+                        self._degraded_refresh_in_progress = True
+                        self._next_degraded_refresh = now + self.degraded_refresh_interval_s
                         refresh_timeout_ms = max(1, int(remaining * 1000))
                         refresh_poll_path = True
                     else:
-                        self._condition.wait(min(remaining, max(0.001, next_degraded_refresh - now)))
+                        self._condition.wait(min(remaining, max(0.001, self._next_degraded_refresh - now)))
                     if not refresh_poll_path:
                         continue
                 else:
@@ -773,9 +822,14 @@ class DatastoreCoordinator:
             if refresh_poll_path:
                 try:
                     self.read(self.poll_path, etag="0", client=None, timeout_ms=refresh_timeout_ms)
+                    self.last_poller_error = None
                 except (DatastoreNoResponse, DatastoreTimeout) as exc:
                     self.last_poller_error = exc
                     continue
+                finally:
+                    with self._condition:
+                        self._degraded_refresh_in_progress = False
+                        self._condition.notify_all()
         return self.read(path, etag="0", client=client)
 
     def _poll_loop(self) -> None:

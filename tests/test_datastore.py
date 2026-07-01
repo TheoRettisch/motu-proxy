@@ -133,6 +133,10 @@ class BlockingCancellableRead:
             self.transport._condition.notify_all()
 
 
+class BlockingNonCancellableTransport(BlockingTransport):
+    begin_cancellable_bulk_read = None
+
+
 class SizeCheckingTransport(FakeTransport):
     def bulk_read(self, size: int | None = None, timeout_ms: int | None = None) -> bytes:
         if self.reads and size is not None and len(self.reads[0]) > size:
@@ -162,6 +166,22 @@ class DatastoreTests(TestCase):
             transport.writes[0],
             build_get_frame(0x20, 2, "/datastore/uid", client=1479701624),
         )
+
+    def test_get_wraps_message_sequence_after_u32_max(self) -> None:
+        transport = FakeTransport(
+            [
+                response_packet(b'{"value":"last"}', message_seq=0xFFFFFFFF),
+                response_packet(b'{"value":"wrapped"}', message_seq=0),
+            ]
+        )
+        datastore = MotuUsbDatastore(transport, message_seq=0xFFFFFFFF)
+
+        self.assertEqual(datastore.get("/datastore/uid"), b'{"value":"last"}')
+        self.assertEqual(datastore.get("/datastore/uid"), b'{"value":"wrapped"}')
+
+        self.assertEqual(transport.writes[0], build_get_frame(0x20, 0xFFFFFFFF, "/datastore/uid"))
+        self.assertEqual(transport.writes[2], build_get_frame(0x22, 0, "/datastore/uid"))
+        self.assertEqual(datastore.message_seq, 1)
 
     def test_get_records_response_etag(self) -> None:
         transport = FakeTransport([response_packet(b'HTTP/1.1 200 OK\r\nETag: 5678\r\n\r\n{"value":"ok"}')])
@@ -209,6 +229,21 @@ class DatastoreTests(TestCase):
         with self.assertRaises(DatastoreTimeout):
             datastore.get("/datastore/uid")
         self.assertEqual(transport.writes, [build_get_frame(0x20, 2, "/datastore/uid")])
+
+    def test_get_ignores_corrupt_response_frame_and_collects_retry(self) -> None:
+        corrupt = bytearray(response_packet(b'{"value":"bad"}'))
+        corrupt[24] ^= 0x01
+        valid = response_packet(b'{"value":"ok"}')
+        transport = FakeTransport([bytes(corrupt), valid])
+        datastore = MotuUsbDatastore(transport)
+
+        self.assertEqual(datastore.get("/datastore/uid"), b'{"value":"ok"}')
+
+        self.assertIsNotNone(datastore.last_response_stats)
+        assert datastore.last_response_stats is not None
+        self.assertEqual(datastore.last_response_stats.ignored_packets, 1)
+        self.assertEqual(datastore.last_response_stats.accepted_frames, 1)
+        self.assertEqual(transport.writes, [build_get_frame(0x20, 2, "/datastore/uid"), build_ack(0x21)])
 
     def test_post_uses_post_frame(self) -> None:
         transport = FakeTransport([response_packet(b'{"ok":true}')])
@@ -441,6 +476,65 @@ class DatastoreCoordinatorTests(TestCase):
             transport.writes[2],
             build_get_frame(0x22, 3, "/datastore"),
         )
+
+    def test_degraded_refresh_is_shared_across_concurrent_waiters(self) -> None:
+        initial = response_packet(b'HTTP/1.1 200 OK\r\nETag: 1\r\n\r\n{"state":1}')
+        changed = response_packet(
+            b'HTTP/1.1 200 OK\r\nETag: 2\r\n\r\n{"changed":true}',
+            message_seq=3,
+        )
+        transport = BlockingNonCancellableTransport([initial])
+        coordinator = DatastoreCoordinator(
+            MotuUsbDatastore(transport),
+            http_wait_timeout_ms=1000,
+            degraded_refresh_interval_s=10,
+        )
+        first: threading.Thread | None = None
+        second: threading.Thread | None = None
+        released = False
+        try:
+            coordinator.read("/datastore")
+
+            waiter_results: list[DatastorePayload] = []
+            first = threading.Thread(
+                target=lambda: waiter_results.append(coordinator.wait_for_change("/datastore", "1"))
+            )
+            first.start()
+            self.assertTrue(transport.wait_for_writes(3))
+
+            second = threading.Thread(
+                target=lambda: waiter_results.append(coordinator.wait_for_change("/datastore", "1"))
+            )
+            second.start()
+            time.sleep(0.05)
+            self.assertTrue(first.is_alive())
+            self.assertTrue(second.is_alive())
+
+            transport.push(changed)
+            released = True
+            first.join(timeout=1)
+            second.join(timeout=1)
+
+            self.assertFalse(first.is_alive())
+            self.assertFalse(second.is_alive())
+            self.assertEqual([result.body for result in waiter_results], [b'{"changed":true}', b'{"changed":true}'])
+            self.assertEqual([result.etag for result in waiter_results], ["2", "2"])
+            get_writes = [write for write in transport.writes if len(write) > 1 and write[1] == 0x80]
+            self.assertEqual(
+                get_writes,
+                [
+                    build_get_frame(0x20, 2, "/datastore"),
+                    build_get_frame(0x22, 3, "/datastore"),
+                ],
+            )
+        finally:
+            if not released:
+                transport.push(changed)
+            if first is not None:
+                first.join(timeout=1)
+            if second is not None:
+                second.join(timeout=1)
+            coordinator.close()
 
     def test_client_filter_suppresses_proxy_originated_own_change(self) -> None:
         transport = FakeTransport([response_packet(b'HTTP/1.1 200 OK\r\nETag: 1\r\n\r\n{"state":1}')])

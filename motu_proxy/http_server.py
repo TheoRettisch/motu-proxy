@@ -476,11 +476,48 @@ class MotuProxyServer(ThreadingHTTPServer):
 
 
 def response_content_type(body: bytes) -> str:
-    try:
-        json.loads(body.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError):
-        return "application/octet-stream"
-    return "application/json"
+    if _is_single_json_container(body):
+        return "application/json"
+    return "application/octet-stream"
+
+
+def _is_single_json_container(body: bytes) -> bool:
+    stripped = body.strip()
+    if not stripped:
+        return False
+    if stripped[0] == ord("{"):
+        expected_stack = [ord("}")]
+    elif stripped[0] == ord("["):
+        expected_stack = [ord("]")]
+    else:
+        return False
+
+    in_string = False
+    escaped = False
+    for index, byte in enumerate(stripped[1:], start=1):
+        if in_string:
+            if escaped:
+                escaped = False
+            elif byte == ord("\\"):
+                escaped = True
+            elif byte == ord('"'):
+                in_string = False
+            continue
+        if byte == ord('"'):
+            in_string = True
+            continue
+        if byte == ord("{"):
+            expected_stack.append(ord("}"))
+            continue
+        if byte == ord("["):
+            expected_stack.append(ord("]"))
+            continue
+        if byte in (ord("}"), ord("]")):
+            if not expected_stack or byte != expected_stack.pop():
+                return False
+            if not expected_stack:
+                return index == len(stripped) - 1
+    return False
 
 
 def serve(server: MotuProxyServer, before_close: Callable[[], None] | None = None) -> int:

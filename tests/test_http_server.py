@@ -634,6 +634,13 @@ class HttpServerTests(TestCase):
     def test_response_content_type_uses_octet_stream_for_concatenated_json(self) -> None:
         self.assertEqual(response_content_type(b'{"first":true}{"second":true}'), "application/octet-stream")
 
+    def test_response_content_type_uses_json_for_single_json_container(self) -> None:
+        self.assertEqual(response_content_type(b'  {"value":"ok"}\n'), "application/json")
+        self.assertEqual(response_content_type(b'[{"value":"ok"}]'), "application/json")
+
+    def test_response_content_type_ignores_json_braces_inside_strings(self) -> None:
+        self.assertEqual(response_content_type(b'{"value":"}{ still text"}'), "application/json")
+
     def test_server_close_does_not_wait_on_worker_threads(self) -> None:
         self.assertTrue(MotuProxyServer.daemon_threads)
         self.assertFalse(MotuProxyServer.block_on_close)

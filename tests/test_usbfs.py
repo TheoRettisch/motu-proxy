@@ -1,4 +1,5 @@
 import ctypes
+import errno
 import importlib
 from pathlib import Path
 from unittest import TestCase
@@ -86,3 +87,19 @@ class UsbFsTransportTests(TestCase):
         with patch("motu_proxy.transports.usbfs._ioctl", return_value=3):
             with self.assertRaisesRegex(OSError, "short USB bulk write"):
                 transport.bulk_write(b"1234")
+
+    def test_cancellable_read_surfaces_device_disconnect(self) -> None:
+        def no_submit() -> None:
+            return None
+
+        def no_reap(_deadline) -> None:
+            return None
+
+        read = usbfs.UsbFsCancellableBulkRead(77, 0x83, 64, None)
+        read._submit = no_submit
+        read._reap = no_reap
+        read._urb.status = -errno.ENODEV
+
+        with self.assertRaises(OSError) as raised:
+            read.read()
+        self.assertEqual(raised.exception.errno, errno.ENODEV)

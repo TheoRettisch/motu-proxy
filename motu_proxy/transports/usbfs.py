@@ -25,7 +25,6 @@ _CANCELLED_URB_STATUSES = {
     -errno.ENOENT,
     -errno.ECONNRESET,
     -getattr(errno, "ECANCELED", 125),
-    -errno.ENODEV,
 }
 
 
