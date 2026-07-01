@@ -8,7 +8,7 @@ import sys
 import threading
 import time
 from collections import deque
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -33,6 +33,7 @@ from .protocol import (
     MOTU_AVB_PID,
     MOTU_VID,
     HostSequencer,
+    QueryField,
     build_ack,
     build_get_frame,
     build_init,
@@ -48,6 +49,7 @@ DEFAULT_MAX_RESPONSE_FRAMES = 256
 DEFAULT_MAX_IGNORED_PACKETS = 32
 DEFAULT_MAX_RESPONSE_READS = (DEFAULT_MAX_RESPONSE_FRAMES * 2) + DEFAULT_MAX_IGNORED_PACKETS + 2
 DEFAULT_POLL_PATH = "/datastore"
+METERS_PATH = "/meters"
 DEFAULT_POLL_READ_TIMEOUT_SLICE_MS = 250
 DEFAULT_FOREGROUND_PREEMPTION_BUDGET_MS = 500
 DEFAULT_DEGRADED_REFRESH_INTERVAL_S = 0.5
@@ -214,9 +216,17 @@ class MotuUsbDatastore:
         read_timeout_slice_ms: int | None = None,
         use_cancellable_read: bool = False,
         read_started: Callable[[CancellableBulkRead | None], None] | None = None,
+        query_fields: Iterable[QueryField] | None = None,
     ) -> bytes:
         message_seq = self._current_message_seq()
-        frame = build_get_frame(self._next_host_seq(), message_seq, path, etag=etag, client=client)
+        frame = build_get_frame(
+            self._next_host_seq(),
+            message_seq,
+            path,
+            etag=etag,
+            client=client,
+            query_fields=query_fields,
+        )
         self._write_frame(frame)
         self._advance_message_seq()
         return self._collect_response(
@@ -817,11 +827,14 @@ class DatastoreCoordinator:
         path: str,
         client: str | int | None = None,
         if_none_match: str | None = None,
+        query_fields: Iterable[QueryField] | None = None,
     ) -> DatastorePayload:
         etag = _clean_etag(if_none_match)
         if etag is not None:
-            return self.wait_for_change(path, etag, client=client)
-        return self.read(path, client=client)
+            if path == METERS_PATH:
+                return self.read(path, etag=etag, client=client, query_fields=query_fields)
+            return self.wait_for_change(path, etag, client=client, query_fields=query_fields)
+        return self.read(path, client=client, query_fields=query_fields)
 
     def read(
         self,
@@ -829,10 +842,20 @@ class DatastoreCoordinator:
         etag: str = "0",
         client: str | int | None = None,
         timeout_ms: int = DEFAULT_RESPONSE_TIMEOUT_MS,
+        query_fields: Iterable[QueryField] | None = None,
     ) -> DatastorePayload:
+        device_query_fields = _device_query_fields(query_fields, client)
         self._acquire_foreground_io()
         try:
-            response = self.datastore.get(path, etag=etag, client=client, timeout_ms=timeout_ms)
+            if device_query_fields is None:
+                response = self.datastore.get(path, etag=etag, client=client, timeout_ms=timeout_ms)
+            else:
+                response = self.datastore.get(
+                    path,
+                    etag=etag,
+                    timeout_ms=timeout_ms,
+                    query_fields=device_query_fields,
+                )
             payload = self._payload_from_response(response)
         finally:
             self._release_io()
@@ -862,6 +885,7 @@ class DatastoreCoordinator:
         path: str,
         etag: str,
         client: str | int | None = None,
+        query_fields: Iterable[QueryField] | None = None,
     ) -> DatastorePayload:
         deadline = time.monotonic() + (self.http_wait_timeout_ms / 1000)
         client_id = _client_string(client)
@@ -907,7 +931,7 @@ class DatastoreCoordinator:
                     with self._condition:
                         self._degraded_refresh_in_progress = False
                         self._condition.notify_all()
-        return self.read(path, etag="0", client=client)
+        return self.read(path, etag="0", client=client, query_fields=query_fields)
 
     def _poll_loop(self) -> None:
         while True:
@@ -974,8 +998,18 @@ class DatastoreCoordinator:
         etag: str = "0",
         client: str | int | None = None,
         timeout_ms: int = DEFAULT_RESPONSE_TIMEOUT_MS,
+        query_fields: Iterable[QueryField] | None = None,
     ) -> DatastorePayload:
-        response = self.datastore.get(path, etag=etag, client=client, timeout_ms=timeout_ms)
+        device_query_fields = _device_query_fields(query_fields, client)
+        if device_query_fields is None:
+            response = self.datastore.get(path, etag=etag, client=client, timeout_ms=timeout_ms)
+        else:
+            response = self.datastore.get(
+                path,
+                etag=etag,
+                timeout_ms=timeout_ms,
+                query_fields=device_query_fields,
+            )
         return self._payload_from_response(response)
 
     def _acquire_foreground_io(self) -> None:
@@ -1157,6 +1191,18 @@ def _client_string(value: str | int | None) -> str | None:
     if value is None:
         return None
     return str(value)
+
+
+def _device_query_fields(
+    query_fields: Iterable[QueryField] | None,
+    client: str | int | None,
+) -> tuple[QueryField, ...] | None:
+    if query_fields is None:
+        return None
+    fields = tuple(query_fields)
+    if client is not None and not any(name == "client" for name, _value in fields):
+        return (*fields, ("client", client))
+    return fields
 
 
 def _exception_status(exc: Exception | None) -> dict[str, str] | None:

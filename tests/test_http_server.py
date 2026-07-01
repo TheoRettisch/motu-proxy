@@ -182,6 +182,221 @@ class HttpServerTests(TestCase):
         self.assertEqual(result.path, "/datastore/uid")
         self.assertEqual(calls, [("/datastore/uid", "1479701624")])
 
+    def test_get_forwards_ordered_query_fields(self) -> None:
+        calls: list[tuple[str, str | None, str | None, tuple[tuple[str, str], ...]]] = []
+
+        def get(
+            path: str,
+            client: str | None = None,
+            if_none_match: str | None = None,
+            query_fields: tuple[tuple[str, str], ...] = (),
+        ) -> bytes:
+            calls.append((path, client, if_none_match, query_fields))
+            return b'{"mix/level/1":[0]}'
+
+        result = dispatch_datastore_request(
+            "GET",
+            "/meters?meters=mix/level&client=1479701624",
+            "",
+            "",
+            False,
+            get,
+            lambda path, body, client=None: b"{}",
+        )
+
+        self.assertEqual(result.path, "/meters")
+        self.assertEqual(result.response, b'{"mix/level/1":[0]}')
+        self.assertEqual(
+            calls,
+            [
+                (
+                    "/meters",
+                    "1479701624",
+                    None,
+                    (("meters", "mix/level"), ("client", "1479701624")),
+                )
+            ],
+        )
+
+    def test_get_preserves_repeated_query_fields_and_blank_values(self) -> None:
+        calls: list[tuple[tuple[tuple[str, str], ...]]] = []
+
+        def get(
+            path: str,
+            client: str | None = None,
+            if_none_match: str | None = None,
+            query_fields: tuple[tuple[str, str], ...] = (),
+        ) -> bytes:
+            calls.append((query_fields,))
+            return b"{}"
+
+        dispatch_datastore_request(
+            "GET",
+            "/meters?meters=mix/level&meters=ext/input&label=",
+            "",
+            "",
+            False,
+            get,
+            lambda path, body, client=None: b"{}",
+        )
+
+        self.assertEqual(
+            calls,
+            [((("meters", "mix/level"), ("meters", "ext/input"), ("label", "")),)],
+        )
+
+    def test_get_rejects_empty_query_field_name_before_usb_call(self) -> None:
+        calls: list[str] = []
+
+        def get(
+            path: str,
+            client: str | None = None,
+            if_none_match: str | None = None,
+            query_fields: tuple[tuple[str, str], ...] = (),
+        ) -> bytes:
+            calls.append(path)
+            return b"{}"
+
+        with self.assertRaisesRegex(BadRequest, "query field name"):
+            dispatch_datastore_request(
+                "GET",
+                "/meters?=mix/level",
+                "",
+                "",
+                False,
+                get,
+                lambda path, body, client=None: b"{}",
+            )
+        self.assertEqual(calls, [])
+
+    def test_get_forwards_unknown_datastore_query_field(self) -> None:
+        calls: list[tuple[str, tuple[tuple[str, str], ...]]] = []
+
+        def get(
+            path: str,
+            client: str | None = None,
+            if_none_match: str | None = None,
+            query_fields: tuple[tuple[str, str], ...] = (),
+        ) -> bytes:
+            calls.append((path, query_fields))
+            return b'{"value":"ok"}'
+
+        result = dispatch_datastore_request(
+            "GET",
+            "/uid?future=raw",
+            "",
+            "",
+            False,
+            get,
+            lambda path, body, client=None: b"{}",
+        )
+
+        self.assertEqual(result.path, "/datastore/uid")
+        self.assertEqual(calls, [("/datastore/uid", (("future", "raw"),))])
+
+    def test_get_validates_client_before_general_query_passthrough(self) -> None:
+        calls: list[str] = []
+
+        def get(
+            path: str,
+            client: str | None = None,
+            if_none_match: str | None = None,
+            query_fields: tuple[tuple[str, str], ...] = (),
+        ) -> bytes:
+            calls.append(path)
+            return b"{}"
+
+        with self.assertRaisesRegex(BadRequest, "client"):
+            dispatch_datastore_request(
+                "GET",
+                "/meters?meters=mix/level&client=-1",
+                "",
+                "",
+                False,
+                get,
+                lambda path, body, client=None: b"{}",
+            )
+        self.assertEqual(calls, [])
+
+    def test_meters_response_body_and_etag_are_forwarded(self) -> None:
+        body = b'{"unknown/future":[123,456]}'
+        calls: list[tuple[tuple[tuple[str, str], ...]]] = []
+
+        def get(
+            path: str,
+            client: str | None = None,
+            if_none_match: str | None = None,
+            query_fields: tuple[tuple[str, str], ...] = (),
+        ) -> DatastorePayload:
+            calls.append((query_fields,))
+            return DatastorePayload(body, etag="3197889")
+
+        result = dispatch_datastore_request(
+            "GET",
+            "/meters?meters=unknown/future",
+            "",
+            "",
+            False,
+            get,
+            lambda path, body, client=None: b"{}",
+        )
+
+        self.assertEqual(result.path, "/meters")
+        self.assertEqual(result.response, body)
+        self.assertEqual(result.etag, "3197889")
+        self.assertEqual(calls, [((("meters", "unknown/future"),),)])
+
+    def test_meter_if_none_match_is_forwarded_to_device_read(self) -> None:
+        calls: list[tuple[str, str | None, tuple[tuple[str, str], ...]]] = []
+
+        def get(
+            path: str,
+            client: str | None = None,
+            if_none_match: str | None = None,
+            query_fields: tuple[tuple[str, str], ...] = (),
+        ) -> DatastorePayload:
+            calls.append((path, if_none_match, query_fields))
+            return DatastorePayload(b'{"mix/level/1":[1]}', etag="3197890")
+
+        result = dispatch_datastore_request(
+            "GET",
+            "/meters?meters=mix/level",
+            "",
+            "",
+            False,
+            get,
+            lambda path, body, client=None: b"{}",
+            if_none_match=" 3197889 ",
+        )
+
+        self.assertEqual(result.status, 200)
+        self.assertEqual(result.etag, "3197890")
+        self.assertEqual(calls, [("/meters", "3197889", (("meters", "mix/level"),))])
+
+    def test_meter_no_change_response_is_forwarded(self) -> None:
+        def get(
+            path: str,
+            client: str | None = None,
+            if_none_match: str | None = None,
+            query_fields: tuple[tuple[str, str], ...] = (),
+        ) -> DatastorePayload:
+            return DatastorePayload(b"", etag=if_none_match, not_modified=True)
+
+        result = dispatch_datastore_request(
+            "GET",
+            "/meters?meters=mix/level",
+            "",
+            "",
+            False,
+            get,
+            lambda path, body, client=None: b"{}",
+            if_none_match="3197890",
+        )
+
+        self.assertEqual(result.status, 304)
+        self.assertEqual(result.response, b"")
+        self.assertEqual(result.etag, "3197890")
+
     def test_get_forwards_if_none_match(self) -> None:
         calls: list[tuple[str, str | None, str | None]] = []
 
@@ -299,6 +514,28 @@ class HttpServerTests(TestCase):
             request_token=WRITE_TOKEN,
         )
         self.assertEqual(result.path, "/datastore/host/os")
+        self.assertEqual(calls, [("/datastore/host/os", '{"value":"linux"}', "1479701624")])
+
+    def test_post_ignores_non_client_query_fields(self) -> None:
+        calls: list[tuple[str, str, str | None]] = []
+
+        def post(path: str, body: str, client: str | None = None) -> bytes:
+            calls.append((path, body, client))
+            return b'{"ok":true}'
+
+        dispatch_datastore_request(
+            "POST",
+            "/host/os?meters=mix/level&client=1479701624",
+            '{"value":"linux"}',
+            "application/json",
+            True,
+            lambda path, client=None: b"{}",
+            post,
+            host="127.0.0.1:1280",
+            write_token=WRITE_TOKEN,
+            request_token=WRITE_TOKEN,
+        )
+
         self.assertEqual(calls, [("/datastore/host/os", '{"value":"linux"}', "1479701624")])
 
     def test_patch_is_post_alias_not_partial_update(self) -> None:

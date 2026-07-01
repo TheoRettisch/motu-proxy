@@ -190,6 +190,20 @@ def command_get(args) -> int:
     return 0
 
 
+def command_meters(args) -> int:
+    with open_datastore(config_from_args(args)) as datastore:
+        response = datastore.get(
+            "/meters",
+            etag=args.etag,
+            query_fields=(("meters", args.group),),
+        )
+    if args.raw:
+        sys.stdout.buffer.write(response)
+    else:
+        print(response_to_text(response, pretty=not args.compact))
+    return 0
+
+
 def command_post(args) -> int:
     path = normalize_path(args.path)
     validate_json_body(args.json_body)
@@ -390,6 +404,14 @@ def build_parser() -> argparse.ArgumentParser:
     get_parser.add_argument("--raw", action="store_true")
     get_parser.add_argument("--compact", action="store_true")
     get_parser.set_defaults(func=command_get)
+
+    meters_parser = sub.add_parser("meters", help="read one meters group over USB")
+    add_usb_args(meters_parser)
+    meters_parser.add_argument("group", help="meter group to request, for example mix/level")
+    meters_parser.add_argument("--etag", default="0")
+    meters_parser.add_argument("--raw", action="store_true")
+    meters_parser.add_argument("--compact", action="store_true")
+    meters_parser.set_defaults(func=command_meters)
 
     info_parser = sub.add_parser("info", help="show datastore API, capability, and identity details")
     add_usb_args(info_parser)

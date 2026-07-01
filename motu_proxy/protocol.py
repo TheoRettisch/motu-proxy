@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import struct
+from collections.abc import Iterable
 
 MOTU_VID = 0x07FD
 MOTU_AVB_PID = 0x0005
@@ -76,16 +77,52 @@ def sized_word_len(value: str | bytes) -> int:
     return 4 + len(value)
 
 
-def query_fields(client: str | int | None = None) -> bytes:
-    if client is None:
-        return u32(0)
-    return u32(1) + sized_word("client") + sized_word(str(client))
+QueryFieldValue = str | int
+QueryField = tuple[str, QueryFieldValue]
 
 
-def query_fields_len(client: str | int | None = None) -> int:
-    if client is None:
-        return 4
-    return 4 + sized_word_len("client") + sized_word_len(str(client))
+def _normalize_query_fields(
+    fields: Iterable[QueryField] | str | int | None = None,
+    client: str | int | None = None,
+) -> tuple[tuple[str, str], ...]:
+    if fields is None:
+        normalized: list[tuple[str, str]] = []
+    elif isinstance(fields, str | int):
+        normalized = [("client", str(fields))]
+    else:
+        normalized = [(name, str(value)) for name, value in fields]
+    if client is not None:
+        normalized.append(("client", str(client)))
+    return tuple(normalized)
+
+
+def encode_query_fields(
+    fields: Iterable[QueryField] | str | int | None = None,
+    client: str | int | None = None,
+) -> bytes:
+    normalized = _normalize_query_fields(fields, client)
+    return u32(len(normalized)) + b"".join(
+        sized_word(name) + sized_word(value)
+        for name, value in normalized
+    )
+
+
+def query_fields(
+    fields: Iterable[QueryField] | str | int | None = None,
+    client: str | int | None = None,
+) -> bytes:
+    return encode_query_fields(fields, client)
+
+
+def query_fields_len(
+    fields: Iterable[QueryField] | str | int | None = None,
+    client: str | int | None = None,
+) -> int:
+    normalized = _normalize_query_fields(fields, client)
+    return 4 + sum(
+        sized_word_len(name) + sized_word_len(value)
+        for name, value in normalized
+    )
 
 
 def next_host_seq(seq: int) -> int:
@@ -181,6 +218,7 @@ def build_get_frame(
     etag: str = "0",
     header: str = "NREK",
     client: str | int | None = None,
+    query_fields: Iterable[QueryField] | None = None,
 ) -> bytes:
     request = (
         sized_word("GET")
@@ -188,7 +226,7 @@ def build_get_frame(
         + u32(1)
         + sized_word("If-None-Match")
         + sized_word(etag)
-        + query_fields(client)
+        + encode_query_fields(query_fields, client=client)
     )
     motu_payload = b"UTOM" + u32(8) + u32(1) + u32(0) + u32(len(request)) + request
     return build_motu_frame(seq, header, message_seq, motu_payload)

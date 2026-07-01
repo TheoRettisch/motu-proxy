@@ -10,7 +10,7 @@ import threading
 from collections.abc import Callable
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, parse_qsl, urlparse
 
 from .datastore import (
     DatastoreNoResponse,
@@ -100,17 +100,44 @@ def parse_write_body(raw: str, content_type: str) -> str:
     return raw
 
 
-def parse_client_query(request_path: str) -> str | None:
-    values = parse_qs(urlparse(request_path).query, keep_blank_values=True).get("client")
-    if not values:
-        return None
-    value = values[0].strip()
+def validate_client_query_value(value: str) -> str:
+    value = value.strip()
     if not value.isdecimal():
         raise BadRequest("client must be a 32-bit unsigned integer")
     client = int(value, 10)
     if client > MAX_CLIENT_ID:
         raise BadRequest("client must be a 32-bit unsigned integer")
     return str(client)
+
+
+def parse_client_query(request_path: str) -> str | None:
+    values = parse_qs(urlparse(request_path).query, keep_blank_values=True).get("client")
+    if not values:
+        return None
+    return validate_client_query_value(values[0])
+
+
+def parse_get_query_fields(request_path: str) -> tuple[tuple[tuple[str, str], ...], str | None]:
+    try:
+        pairs = parse_qsl(
+            urlparse(request_path).query,
+            keep_blank_values=True,
+            encoding="utf-8",
+            errors="strict",
+        )
+    except UnicodeDecodeError as exc:
+        raise BadRequest("query string must be valid UTF-8") from exc
+    fields: list[tuple[str, str]] = []
+    client: str | None = None
+    for name, value in pairs:
+        if not name:
+            raise BadRequest("query field name must not be empty")
+        if name == "client":
+            value = validate_client_query_value(value)
+            if client is None:
+                client = value
+        fields.append((name, value))
+    return tuple(fields), client
 
 
 def _origin_matches_host(origin: str, host: str) -> bool:
@@ -182,14 +209,12 @@ def dispatch_datastore_request(
         body = json.dumps(status_provider(), sort_keys=True).encode("utf-8")
         return DispatchResult(body, STATUS_PATH)
     path = normalize_path(request_url.path)
-    client = parse_client_query(request_path)
     if method == "GET":
-        if if_none_match is None:
-            payload = _datastore_payload(run_get(path, client))
-        else:
-            payload = _datastore_payload(run_get(path, client, if_none_match.strip()))
+        query_fields, client = parse_get_query_fields(request_path)
+        payload = _datastore_payload(_run_get(run_get, path, client, if_none_match, query_fields))
         status = 304 if payload.not_modified else 200
         return DispatchResult(payload.body, path, payload.etag, status=status)
+    client = parse_client_query(request_path)
     if not allow_writes:
         raise WritesDisabled("writes require --allow-writes")
     validate_write_host(method, allow_writes, host, allow_remote_writes)
@@ -205,6 +230,27 @@ def dispatch_datastore_request(
     # HTTP PATCH is a compatibility alias for the MOTU datastore POST write.
     payload = _datastore_payload(run_post(path, write_body, client))
     return DispatchResult(payload.body, path, payload.etag)
+
+
+def _run_get(
+    run_get: DatastoreRead,
+    path: str,
+    client: str | None,
+    if_none_match: str | None,
+    query_fields: tuple[tuple[str, str], ...],
+) -> bytes | DatastorePayload:
+    if _uses_legacy_get_signature(query_fields):
+        if if_none_match is None:
+            return run_get(path, client)
+        return run_get(path, client, if_none_match.strip())
+    etag = if_none_match.strip() if if_none_match is not None else None
+    return run_get(path, client, etag, query_fields)
+
+
+def _uses_legacy_get_signature(query_fields: tuple[tuple[str, str], ...]) -> bool:
+    return not query_fields or (
+        len(query_fields) == 1 and query_fields[0][0] == "client"
+    )
 
 
 def _datastore_payload(value: bytes | DatastorePayload) -> DatastorePayload:

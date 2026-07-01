@@ -129,6 +129,23 @@ class FakePostDatastore:
         return self.response
 
 
+class FakeMetersDatastore:
+    def __init__(self, response: bytes = b'{"mix/level/1":[0]}') -> None:
+        self.response = response
+        self.calls: list[tuple[str, str, tuple[tuple[str, str], ...] | None]] = []
+
+    def get(
+        self,
+        path: str,
+        etag: str = "0",
+        client: str | None = None,
+        timeout_ms: int = 1200,
+        query_fields: tuple[tuple[str, str], ...] | None = None,
+    ) -> bytes:
+        self.calls.append((path, etag, query_fields))
+        return self.response
+
+
 class CliUsbOverrideTests(TestCase):
     def test_partial_manual_usb_override_is_rejected(self) -> None:
         args = build_parser().parse_args(["get", "--interface", "4"])
@@ -538,6 +555,22 @@ class CliPostValidationTests(TestCase):
 
         self.assertEqual(result, 0)
         self.assertEqual(datastore.calls, [("/datastore/future/path", '{"value":{"new":true}}')])
+
+
+class CliMetersTests(TestCase):
+    def test_meters_reads_one_group(self) -> None:
+        datastore = FakeMetersDatastore()
+        args = build_parser().parse_args(["meters", "--compact", "mix/level"])
+        stdout = StringIO()
+        with (
+            patch("motu_proxy.cli.open_datastore", return_value=FakeOpenDatastore(datastore)),
+            redirect_stdout(stdout),
+        ):
+            result = args.func(args)
+
+        self.assertEqual(result, 0)
+        self.assertEqual(datastore.calls, [("/meters", "0", (("meters", "mix/level"),))])
+        self.assertIn('"mix/level/1"', stdout.getvalue())
 
 
 class CliInfoTests(TestCase):

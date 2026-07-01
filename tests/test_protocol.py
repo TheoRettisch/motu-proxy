@@ -10,7 +10,9 @@ from motu_proxy.protocol import (
     build_post_frame,
     crc32,
     max_post_json_body_bytes,
+    query_fields,
     sized_word,
+    u32,
 )
 
 
@@ -26,6 +28,56 @@ class ProtocolTests(TestCase):
         self.assertIn(sized_word("/datastore"), frame)
         self.assertIn(sized_word("client") + sized_word("1479701624"), frame)
         self.assertNotIn(b"/datastore?client", frame)
+
+    def test_single_client_query_field_encoding_is_unchanged(self) -> None:
+        expected = u32(1) + sized_word("client") + sized_word("1479701624")
+        self.assertEqual(query_fields(client=1479701624), expected)
+        self.assertEqual(query_fields(1479701624), expected)
+        self.assertEqual(
+            build_get_frame(0x24, 2, "/datastore", client=1479701624),
+            build_get_frame(0x24, 2, "/datastore", query_fields=(("client", "1479701624"),)),
+        )
+
+    def test_post_frame_single_client_encoding_is_unchanged(self) -> None:
+        self.assertEqual(
+            build_post_frame(0x23, 2, "/datastore/host/os", '{"value":"linux"}', client=1479701624),
+            build_post_frame(0x23, 2, "/datastore/host/os", '{"value":"linux"}', client="1479701624"),
+        )
+
+    def test_get_frame_preserves_multiple_query_field_order(self) -> None:
+        frame = build_get_frame(
+            0x24,
+            2,
+            "/meters",
+            query_fields=(("meters", "mix/level"), ("client", "1479701624")),
+        )
+        self.assertIn(
+            sized_word("meters")
+            + sized_word("mix/level")
+            + sized_word("client")
+            + sized_word("1479701624"),
+            frame,
+        )
+        self.assertNotIn(b"/meters?meters", frame)
+
+    def test_query_fields_preserve_repeated_names_and_blank_values(self) -> None:
+        encoded = query_fields(
+            (
+                ("meters", "mix/level"),
+                ("meters", "ext/input"),
+                ("label", ""),
+            )
+        )
+        self.assertEqual(encoded[:4], u32(3))
+        self.assertIn(
+            sized_word("meters")
+            + sized_word("mix/level")
+            + sized_word("meters")
+            + sized_word("ext/input")
+            + sized_word("label")
+            + sized_word(""),
+            encoded,
+        )
 
     def test_get_frame_can_forward_non_default_etag(self) -> None:
         frame = build_get_frame(0x24, 2, "/datastore", etag="5678")

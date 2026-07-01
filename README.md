@@ -54,6 +54,12 @@ Read a datastore path:
 motu-proxy get /datastore/uid
 ```
 
+Read one meter group:
+
+```sh
+motu-proxy meters mix/level
+```
+
 Show datastore API, capability, and identity details:
 
 ```sh
@@ -111,6 +117,12 @@ Read through HTTP:
 curl http://127.0.0.1:1280/datastore/uid
 ```
 
+Read one meter group through HTTP:
+
+```sh
+curl 'http://127.0.0.1:1280/meters?meters=mix/level'
+```
+
 Forward a datastore client identifier or wait from a known ETag:
 
 ```sh
@@ -134,6 +146,13 @@ GET responses include `Cache-Control: no-cache` and an `ETag` header when the
 device supplies one. A GET with `If-None-Match` waits against coordinated
 datastore state and may return either a changed payload with a new `ETag` or
 `304 Not Modified`.
+
+`/meters` is a top-level device resource, not a datastore path. Meter responses
+are passed through unchanged and expose the device's meter `ETag`, but meter
+`If-None-Match` requests are one-shot device reads rather than datastore
+long-poll waits. High-rate meter consumers should wait for foreground-safe
+long-poll coordination (`avoid-long-poll-foreground-blocking`) before relying on
+USB meter polling in production.
 
 During shutdown the coordinator asks the background poller to stop and waits for
 it before the USB datastore context is released.

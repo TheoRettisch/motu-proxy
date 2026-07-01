@@ -170,6 +170,21 @@ class DatastoreTests(TestCase):
             build_get_frame(0x20, 2, "/datastore/uid", client=1479701624),
         )
 
+    def test_get_forwards_ordered_query_fields(self) -> None:
+        transport = FakeTransport([response_packet(b'{"mix/level/1":[0]}')])
+        datastore = MotuUsbDatastore(transport)
+        datastore.get("/meters", query_fields=(("meters", "mix/level"),))
+        self.assertEqual(
+            transport.writes[0],
+            build_get_frame(
+                0x20,
+                2,
+                "/meters",
+                query_fields=(("meters", "mix/level"),),
+            ),
+        )
+        self.assertNotIn(b"/meters?meters", transport.writes[0])
+
     def test_get_wraps_message_sequence_after_u32_max(self) -> None:
         transport = FakeTransport(
             [
@@ -454,6 +469,45 @@ class DatastoreCoordinatorTests(TestCase):
         self.assertTrue(result.not_modified)
         self.assertEqual(result.etag, "5678")
         self.assertEqual(result.body, b"")
+
+    def test_meters_if_none_match_uses_one_shot_read_not_datastore_wait(self) -> None:
+        transport = FakeTransport(
+            [response_packet(b"HTTP/1.1 304 Not Modified\r\nETag: 3197890\r\n\r\n")]
+        )
+        coordinator = DatastoreCoordinator(
+            MotuUsbDatastore(transport),
+            http_wait_timeout_ms=1,
+        )
+        wait_calls = []
+
+        def wait_for_change(*args, **kwargs):
+            wait_calls.append((args, kwargs))
+            raise AssertionError("meters must not use datastore long-poll wait")
+
+        coordinator.wait_for_change = wait_for_change
+        payload = coordinator.get(
+            "/meters",
+            client="1479701624",
+            if_none_match="3197890",
+            query_fields=(("meters", "mix/level"), ("client", "1479701624")),
+        )
+
+        get_writes = [write for write in transport.writes if len(write) > 1 and write[1] == 0x80]
+        self.assertEqual(len(get_writes), 1)
+        self.assertEqual(
+            get_writes[0],
+            build_get_frame(
+                0x20,
+                2,
+                "/meters",
+                etag="3197890",
+                query_fields=(("meters", "mix/level"), ("client", "1479701624")),
+            ),
+        )
+        self.assertEqual(wait_calls, [])
+        self.assertTrue(payload.not_modified)
+        self.assertEqual(payload.etag, "3197890")
+        self.assertEqual(payload.body, b"")
 
     def test_status_reports_poller_error_and_response_stats(self) -> None:
         coordinator = DatastoreCoordinator(MotuUsbDatastore(FakeTransport([])))

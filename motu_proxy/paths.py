@@ -20,6 +20,6 @@ def normalize_path(path: str) -> str:
         path = "/" + path
     if path == "/":
         return "/datastore"
-    if path == "/datastore" or path.startswith("/datastore/") or path == "/apiversion":
+    if path == "/datastore" or path.startswith("/datastore/") or path in ("/apiversion", "/meters"):
         return path
     return "/datastore" + path
