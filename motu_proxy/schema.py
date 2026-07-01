@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
-import json
+import math
 import re
 from dataclasses import dataclass
 from numbers import Real
 from typing import Callable, Iterable
 
+from .json_body import InvalidJsonBody, load_json_object
 from .paths import normalize_path
 
 
@@ -295,11 +296,9 @@ def validate_datastore_write(
     allow_unknown: bool = False,
 ) -> None:
     try:
-        body = json.loads(json_body)
-    except json.JSONDecodeError as exc:
-        raise DatastoreValidationError(f"write body must be valid JSON: {exc.msg}") from exc
-    if not isinstance(body, dict):
-        raise DatastoreValidationError("write body must be a JSON object")
+        body = load_json_object(json_body)
+    except InvalidJsonBody as exc:
+        raise DatastoreValidationError(str(exc)) from exc
     for target_path, value in _iter_write_values(path, body):
         entry = find_path_schema(target_path)
         if entry is None:
@@ -413,6 +412,8 @@ def _validate_scalar(path: str, value: object, base_type: str) -> None:
     if base_type == "real":
         if isinstance(value, bool) or not isinstance(value, Real):
             raise DatastoreValidationError(f"{path} must be a number")
+        if not math.isfinite(value):
+            raise DatastoreValidationError(f"{path} must be a finite number")
         return
     raise DatastoreValidationError(f"{path} uses unsupported datastore type {base_type!r}")
 

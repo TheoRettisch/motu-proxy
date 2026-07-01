@@ -119,6 +119,10 @@ def validate_response_packet(path: str, index: int, packet: bytes, expected_mess
     wrapper_seq = packet[0]
     wrapper_type = packet[1]
     wrapper_len = _u16(packet, 2)
+    if wrapper_type != 0:
+        errors.append(f"unexpected response wrapper type 0x{wrapper_type:02x}")
+    if wrapper_len < 28:
+        errors.append(f"invalid response wrapper length {wrapper_len}")
     if wrapper_len > len(packet):
         logical_packet = packet
         trailing_padding = 0
@@ -134,6 +138,29 @@ def validate_response_packet(path: str, index: int, packet: bytes, expected_mess
     except UnicodeDecodeError:
         header = header_bytes.hex()
         errors.append(f"non-ascii MOTU header {header_bytes.hex()}")
+
+    if len(body) < 20:
+        errors.append(f"response body too short for MOTU fields: {len(body)} bytes")
+        return FrameCheck(
+            path=path,
+            index=index,
+            packet_len=len(packet),
+            wrapper_seq=wrapper_seq,
+            wrapper_type=wrapper_type,
+            wrapper_len=wrapper_len,
+            trailing_padding=trailing_padding,
+            header=header,
+            stored_crc=0,
+            computed_crc=0,
+            message_seq=-1,
+            expected_message_seq=expected_message_seq,
+            final_field=0,
+            segment_index=0,
+            payload_len=0,
+            actual_payload_len=0,
+            trailer=b"",
+            errors=errors,
+        )
 
     stored_crc = _u32(body, 4)
     message_seq = _u32(body, 8)
@@ -156,6 +183,8 @@ def validate_response_packet(path: str, index: int, packet: bytes, expected_mess
         errors.append(f"crc mismatch stored=0x{stored_crc:08x} computed=0x{computed_crc:08x}")
     if message_seq != expected_message_seq:
         errors.append(f"message sequence {message_seq} != expected {expected_message_seq}")
+    if final_field not in (0, 1):
+        errors.append(f"unexpected final field {final_field}")
     if payload_len != len(payload):
         errors.append(f"payload length {payload_len} != actual {len(payload)}")
     if len(trailer) != 4:
@@ -183,6 +212,21 @@ def validate_response_packet(path: str, index: int, packet: bytes, expected_mess
         trailer=trailer,
         errors=errors,
     )
+
+
+def validate_response_sequence(checks: list[FrameCheck]) -> None:
+    for expected_index, check in enumerate(checks):
+        if check.segment_index != expected_index:
+            check.errors.append(
+                f"segment index {check.segment_index} != expected {expected_index}"
+            )
+        if check.final_field not in (0, 1):
+            continue
+        is_last = expected_index == len(checks) - 1
+        if check.final_field == 1 and not is_last:
+            check.errors.append(f"final flag set before last segment {expected_index}")
+        if check.final_field == 0 and is_last:
+            check.errors.append("missing final segment flag")
 
 
 def response_payload(packet: bytes) -> bytes:
@@ -261,6 +305,7 @@ def capture_get(
         validate_response_packet(path, index, packet, message_seq)
         for index, packet in enumerate(result.response_packets, start=1)
     ]
+    validate_response_sequence(result.frame_checks)
     result.joined_response = b"".join(response_payload(packet) for packet in result.response_packets)
     return result
 

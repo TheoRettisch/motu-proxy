@@ -423,6 +423,28 @@ class HttpServerTests(TestCase):
             )
         self.assertEqual(calls, [])
 
+    def test_non_finite_write_json_is_rejected_before_usb_call(self) -> None:
+        calls: list[tuple[str, str]] = []
+
+        def post(path: str, body: str, client: str | None = None) -> bytes:
+            calls.append((path, body))
+            return b"{}"
+
+        with self.assertRaisesRegex(InvalidJsonBody, "valid JSON"):
+            dispatch_datastore_request(
+                "POST",
+                "/mix/chan/0/matrix/fader",
+                '{"value":NaN}',
+                "application/json",
+                True,
+                lambda path, client=None: b"{}",
+                post,
+                host="127.0.0.1:1280",
+                write_token=WRITE_TOKEN,
+                request_token=WRITE_TOKEN,
+            )
+        self.assertEqual(calls, [])
+
     def test_oversized_write_frame_is_rejected_before_usb_call(self) -> None:
         calls: list[tuple[str, str]] = []
         logs: list[tuple[str, str, str]] = []

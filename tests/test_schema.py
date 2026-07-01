@@ -31,6 +31,15 @@ class DatastoreSchemaTests(TestCase):
         with self.assertRaisesRegex(DatastoreValidationError, "<= 4"):
             validate_datastore_write("/datastore/mix/chan/0/matrix/fader", '{"value":4.1}')
 
+    def test_rejects_non_finite_json_numbers(self) -> None:
+        for value in ("NaN", "Infinity", "-Infinity"):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(DatastoreValidationError, "valid JSON"):
+                    validate_datastore_write(
+                        "/datastore/mix/chan/0/matrix/fader",
+                        f'{{"value":{value}}}',
+                    )
+
     def test_validates_type(self) -> None:
         with self.assertRaisesRegex(DatastoreValidationError, "integer"):
             validate_datastore_write("/datastore/mix/chan/0/hpf/freq", '{"value":440.5}')
