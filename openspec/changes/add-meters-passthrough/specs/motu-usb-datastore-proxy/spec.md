@@ -1,15 +1,19 @@
 ## ADDED Requirements
 
 ### Requirement: Generalized USB query fields
-The system SHALL encode arbitrary GET query parameters as ordered USB query fields in datastore and meters GET frames, not only the `client` parameter, and SHALL keep the single-`client` encoding byte-compatible with prior behavior. Existing `client` validation SHALL remain in force before forwarding `client` as a USB query field.
+The system SHALL encode arbitrary GET query parameters with non-empty field names as ordered USB query fields in datastore and meters GET frames, not only the `client` parameter, and SHALL keep the single-`client` GET and POST encodings byte-compatible with prior behavior. Existing `client` validation SHALL remain in force before forwarding `client` as a USB query field.
 
 #### Scenario: Meters query field is encoded
 - **WHEN** a meters request carries a `meters=mix/level` query parameter
 - **THEN** the system encodes it as a USB query field (name `meters`, value `mix/level`) in the GET frame rather than appending it to the path
 
-#### Scenario: Existing client encoding is unchanged
+#### Scenario: Existing client GET encoding is unchanged
 - **WHEN** a request carries only `client=<number>`
 - **THEN** the resulting GET frame bytes are identical to the prior single-`client` encoding
+
+#### Scenario: Existing client POST encoding is unchanged
+- **WHEN** a POST request carries only `client=<number>`
+- **THEN** the resulting POST frame bytes are identical to the prior single-`client` encoding
 
 #### Scenario: Client query validation is preserved
 - **WHEN** an HTTP GET request includes a `client` query parameter
@@ -22,6 +26,14 @@ The system SHALL encode arbitrary GET query parameters as ordered USB query fiel
 #### Scenario: Multiple query fields
 - **WHEN** a request carries both `meters=mix/level` and `client=<number>` in that order
 - **THEN** the system encodes both as query fields in the GET frame in that same order
+
+#### Scenario: Repeated and blank query values are preserved
+- **WHEN** a GET request carries repeated non-empty query field names or a blank value, such as `meters=mix/level&meters=ext/input&label=`
+- **THEN** the system encodes each query pair as a USB query field in parsed request order, preserving the repeated field names and the blank value
+
+#### Scenario: Empty query field names are rejected
+- **WHEN** a GET request includes a query pair with an empty field name, such as `=mix/level`
+- **THEN** the proxy rejects the request with an HTTP `400` before issuing a USB request
 
 ### Requirement: Meters resource routing
 The system SHALL treat `/meters` as a top-level resource and SHALL NOT add a `/datastore` prefix to it.
@@ -54,6 +66,11 @@ The system SHALL forward an HTTP `GET /meters?meters=<group>` to the device over
 - **WHEN** a client sends `GET /meters?meters=mix/level` with an `If-None-Match` header
 - **THEN** the proxy forwards that ETag to the device in a single USB meters request and does not wait on datastore long-poll history
 - **AND** the datastore coordinator wait path is not invoked
+
+#### Scenario: Meter If-None-Match no-change response is forwarded
+- **WHEN** a client sends `GET /meters?meters=mix/level` with an `If-None-Match` header and the device returns no meter change
+- **THEN** the proxy returns the device's no-change status and ETag without consulting datastore long-poll state
+- **AND** the response body handling matches the device response without synthesizing meter data
 
 ### Requirement: Meters pass-through without interpretation or polling
 The system SHALL pass meter requests and responses through without interpreting meter values, mapping channels, or running a background meter poll loop. Continuous polling and any typed meter model are out of scope for the proxy.

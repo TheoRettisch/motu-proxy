@@ -3,6 +3,7 @@
 - [ ] 1.1 Generalize `protocol.query_fields` and `build_get_frame` to encode an ordered list of `(name, value)` query parameters.
 - [ ] 1.2 Keep the single-`client` GET and POST encodings byte-identical (existing fixtures unchanged); add tests asserting both.
 - [ ] 1.3 Test multi-field GET encoding (`meters` + `client` together) preserves request order.
+- [ ] 1.4 Preserve repeated non-empty GET query field names and blank values in parsed order; reject empty query field names with HTTP `400` before issuing a USB request.
 
 ## 2. Meters Resource Routing
 
@@ -17,6 +18,7 @@
 - [ ] 3.4 Route `/meters` requests with `If-None-Match` as one-shot device reads that forward the ETag, not as datastore long-poll waits; assert one read to `/meters`, the forwarded ETag argument, and no coordinator wait call.
 - [ ] 3.5 Keep write query behavior unchanged except for existing `client` passthrough.
 - [ ] 3.6 Preserve existing HTTP GET `client` 32-bit unsigned integer validation before forwarding as a USB query field.
+- [ ] 3.7 Forward device meter no-change responses (for meter `If-None-Match`) unchanged, including status/ETag/body semantics, without consulting datastore long-poll state or synthesizing meter data.
 
 ## 4. CLI (single-shot)
 
@@ -29,3 +31,4 @@
 - [ ] 5.3 Assert meter `If-None-Match` is forwarded to the device and does not trigger datastore long-poll history.
 - [ ] 5.4 Assert `GET /meters?meters=mix/level` uses USB path `/meters` and encodes `meters=mix/level` only as a USB query field.
 - [ ] 5.5 Validate on the live 624 over USB: `GET /meters?meters=mix/level` via the proxy returns the device meter JSON + ETag.
+- [ ] 5.6 Document that high-rate meter consumers should wait for foreground-safe long-poll coordination / `avoid-long-poll-foreground-blocking`.

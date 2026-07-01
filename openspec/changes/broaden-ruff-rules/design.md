@@ -17,12 +17,13 @@ The codebase now has hardware-free tests, a local Ruff command, and GitHub Actio
 
 - Do not introduce mandatory formatting, Black, mypy, or additional lint tools.
 - Do not perform broad unrelated refactors just to satisfy style preferences.
+- Do not add Python 3.13 to the CI matrix as part of this lint-policy change.
 - Do not change runtime dependencies or MOTU USB behavior.
 - Do not require live hardware in CI.
 
 ## Decisions
 
-Enable rule families in one implementation step: `B`, `I`, `UP`, `SIM`, and `RUF`.
+Enable the exact configured rule baseline in one implementation step: `E4`, `E7`, `E9`, `F`, `B`, `I`, `UP`, `SIM`, and `RUF`.
 
 Rationale: these match the review finding and cover bug-prone constructs, import organization, modern Python idioms, simplifications, and Ruff-specific correctness checks. The project targets Python 3.11+, so `UP` can be useful without forcing compatibility with older interpreters.
 
@@ -30,9 +31,15 @@ Alternative considered: enable only one family at a time. Rejected because this 
 
 Use targeted fixes before ignores.
 
-Rationale: if Ruff reports simple, local issues, updating code is clearer than carrying suppressions. Suppressions should be reserved for cases where a rule conflicts with an intentional test shape, command-line script pattern, or hardware-protocol clarity.
+Rationale: if Ruff reports simple, local issues, updating code is clearer than carrying suppressions. Suppressions should be reserved for cases where a rule conflicts with an intentional test shape, command-line script pattern, or hardware-protocol clarity. Each suppression should be narrow and include a short inline reason so future cleanup can tell whether it is still intentional.
 
 Alternative considered: add broad per-file ignores for tests or tools first. Rejected because it weakens the purpose of broadening the lint baseline before seeing actual findings.
+
+Keep Python-version expansion separate.
+
+Rationale: the current tooling contract covers Python 3.11 and 3.12. Adding Python 3.13 CI is valuable, but it changes support validation rather than only lint policy, so it belongs in a separate OpenSpec change.
+
+Alternative considered: add Python 3.13 in the same patch while touching GitHub Actions. Rejected to keep this change limited to Ruff configuration and lint-driven cleanup.
 
 Leave formatter adoption out of scope.
 
@@ -49,9 +56,9 @@ Alternative considered: add formatting together with lint broadening. Rejected b
 
 ## Migration Plan
 
-1. Update `pyproject.toml` Ruff `select` to include the expanded rule families.
+1. Update `pyproject.toml` Ruff `select` to the exact expanded rule list.
 2. Run `.venv/bin/python -m ruff check .`.
-3. Apply targeted fixes or narrow suppressions for findings.
+3. Apply targeted fixes or narrow suppressions with inline reasons for findings.
 4. Run `.venv/bin/python -m pytest -q` and `.venv/bin/python -m ruff check .`.
 5. CI will enforce the same command on future pushes and pull requests.
 
@@ -59,4 +66,4 @@ Rollback is straightforward: revert the Ruff rule selection and associated lint-
 
 ## Open Questions
 
-- Should Python 3.13 be added to the CI matrix in this same implementation, or handled as a separate CI-support change?
+- None.

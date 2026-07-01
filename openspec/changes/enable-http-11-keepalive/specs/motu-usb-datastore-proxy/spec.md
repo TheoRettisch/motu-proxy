@@ -12,6 +12,11 @@ The system SHALL serve datastore proxy responses using HTTP/1.1 and SHALL keep c
 - **THEN** the proxy response includes an accurate `Content-Length` header
 - **AND** the proxy does not send `Connection: close` solely because the request completed successfully
 
+#### Scenario: Client-requested close is respected
+- **WHEN** a client issues an HTTP/1.1 datastore request with `Connection: close`
+- **THEN** the proxy marks the connection for closure after the response
+- **AND** this close behavior does not depend on the datastore request failing
+
 #### Scenario: Not modified response is length framed
 - **WHEN** a long-poll datastore GET returns `304 Not Modified`
 - **THEN** the proxy response includes `Content-Length: 0`
@@ -26,3 +31,8 @@ The system SHALL serve datastore proxy responses using HTTP/1.1 and SHALL keep c
 - **WHEN** a write request body times out, ends before `Content-Length` bytes, or uses an unsupported transfer encoding
 - **THEN** the proxy marks the connection for closure
 - **AND** the response includes `Connection: close`
+
+#### Scenario: Unsupported methods are length framed
+- **WHEN** a client sends an unsupported HTTP method over HTTP/1.1
+- **THEN** the proxy error response includes an explicit `Content-Length`
+- **AND** the response can be parsed without relying on connection close as the frame boundary

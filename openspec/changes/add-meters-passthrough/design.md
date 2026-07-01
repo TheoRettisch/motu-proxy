@@ -37,11 +37,15 @@ Add `/meters` to the same normalization passthrough that already exempts `/apive
 
 Alternative considered: a generic "don't prefix any unknown top-level resource" rule. Rejected as too loose; the device has a small, known set of non-datastore resources, and explicit is safer.
 
+The proxy should accept the device-native form, `GET /meters?meters=<group>`, only. Friendlier aliases such as path-based meter group routing are out of scope for this byte-faithful pass-through change.
+
 ### Forward HTTP query parameters as USB query fields
 
 The HTTP layer already extracts `client` from the query string; extend GET dispatch to preserve the parsed query pair order and forward query parameters to the datastore request, which encodes them as USB query fields. This applies to datastore and `/meters` GET requests. It bridges the network form `GET /meters?meters=mix/level` to the USB query-field form. The proxy never places the query string in the USB path (the device `404`s on that).
 
 Existing `client` validation should remain in force where it exists today, including the current 32-bit unsigned integer bounds check before forwarding. For non-`client` GET query parameters, the proxy should decode and forward the field name/value without validation or interpretation.
+
+Repeated GET query parameter names are valid and should be preserved as repeated USB query fields in parsed request order. Blank values for non-empty names should be forwarded as empty values. Empty query field names are ambiguous and should be rejected with an HTTP `400` before issuing a USB request.
 
 ### Use a one-shot meters read path, not datastore long-poll history
 
@@ -69,7 +73,6 @@ A `meters` CLI command issues exactly one `/meters?meters=<group>` read and prin
 6. Tests: query-field encoding (incl. unchanged `client` fixture), preserved `client` validation, non-`client` datastore GET query passthrough, query ordering, `/meters` routing, HTTP `?meters=` -> USB query field with USB path `/meters`, meter `If-None-Match` one-shot behavior with no coordinator wait, ETag exposure, no-poll/no-interpretation.
 7. Validate on the live 624 over USB: `GET /meters?meters=mix/level` through the proxy returns the device's meter JSON and ETag.
 
-## Open Questions
+## Follow-up Questions
 
-- Should capability discovery (`add-capability-discovery`) surface `ext/caps/meters` / `ext/caps/activityMeters` so a consumer can detect meter support before requesting it? Natural tie-in; better folded into that change than here.
-- Should the proxy accept a meter group via a cleaner path form for ergonomics, or only the device-native `?meters=` query? Lean: device-native only, to stay a faithful bridge.
+- Should a follow-up change extend `info` capability discovery to surface `ext/caps/meters` / `ext/caps/activityMeters` if present?
