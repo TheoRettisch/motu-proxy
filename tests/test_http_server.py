@@ -1212,6 +1212,40 @@ class HttpHandlerTests(TestCase):
         self.assertEqual(response.headers.get("connection", "").lower(), "close")
         self.assertEqual(response.body, body)
 
+    def test_http11_get_with_body_closes_socket_after_success(self) -> None:
+        calls: list[str] = []
+        body = b'{"value":"ok"}'
+
+        class Dispatcher:
+            def dispatch(self, method, request_path, *args, **kwargs):
+                calls.append(request_path)
+                return DispatchResult(body, "/datastore/uid")
+
+        request = (
+            "GET /datastore/uid HTTP/1.1\r\n"
+            "Host: 127.0.0.1\r\n"
+            "Content-Length: 5\r\n"
+            "\r\n"
+            "hello"
+        ).encode("ascii")
+        followup = (
+            "GET /datastore/uid HTTP/1.1\r\n"
+            "Host: 127.0.0.1\r\n"
+            "\r\n"
+        ).encode("ascii")
+
+        responses = self.parse_socket_responses(
+            self.handle_socket_requests(request + followup, Dispatcher())
+        )
+
+        self.assertEqual(len(responses), 1)
+        response = responses[0]
+        self.assertEqual(response.status_line, "HTTP/1.1 200 OK")
+        self.assertEqual(response.headers["content-length"], str(len(body)))
+        self.assertEqual(response.headers.get("connection", "").lower(), "close")
+        self.assertEqual(response.body, body)
+        self.assertEqual(calls, ["/datastore/uid"])
+
     def test_http11_unknown_method_error_is_length_framed_and_closes(self) -> None:
         request = (
             "BREW /datastore HTTP/1.1\r\n"
@@ -1385,6 +1419,22 @@ class HttpHandlerTests(TestCase):
             json.loads(handler.wfile.getvalue().decode("utf-8"))["error"],
             "MOTU USB datastore did not respond",
         )
+
+    def test_handler_does_not_emit_second_status_after_response_write_failure(self) -> None:
+        class BrokenWriter(BytesIO):
+            def write(self, data):
+                raise BrokenPipeError("client closed")
+
+        class Dispatcher:
+            def dispatch(self, *args, **kwargs):
+                return DispatchResult(b'{"value":"ok"}', "/datastore/uid")
+
+        handler = self.make_handler(dispatcher=Dispatcher())
+        handler.wfile = BrokenWriter()
+        handler.handle_datastore_request("GET")
+
+        self.assertEqual(handler.statuses, [200])
+        self.assertTrue(handler.close_connection)
 
     def test_handler_returns_413_for_oversized_protocol_frame(self) -> None:
         class Dispatcher:

@@ -1,6 +1,7 @@
 import ctypes
 import errno
 import importlib
+import time
 from pathlib import Path
 from unittest import TestCase
 from unittest.mock import patch
@@ -105,3 +106,79 @@ class UsbFsTransportTests(TestCase):
         with self.assertRaises(OSError) as raised:
             read.read()
         self.assertEqual(raised.exception.errno, errno.ENODEV)
+
+    def test_cancellable_reap_uses_coarse_wait_between_empty_polls(self) -> None:
+        read = usbfs.UsbFsCancellableBulkRead(77, 0x83, 64, None)
+        waits: list[float | None] = []
+
+        class RecordingEvent:
+            def wait(self, timeout: float | None = None) -> bool:
+                waits.append(timeout)
+                return False
+
+            def set(self) -> None:
+                return None
+
+        calls = 0
+
+        def ioctl(_fd, request, arg):
+            nonlocal calls
+            if request != usbfs.USBDEVFS_REAPURBNDELAY:
+                return 0
+            calls += 1
+            if calls == 1:
+                raise OSError(errno.EAGAIN, "try again")
+            ctypes.cast(arg, ctypes.POINTER(ctypes.c_void_p)).contents.value = ctypes.addressof(read._urb)
+            return 0
+
+        read._cancel_event = RecordingEvent()
+        with patch("motu_proxy.transports.usbfs._ioctl", side_effect=ioctl):
+            read._reap(time.monotonic() + 10)
+
+        self.assertEqual(waits, [usbfs.DEFAULT_CANCELLABLE_REAP_POLL_INTERVAL_S])
+        self.assertEqual(calls, 2)
+
+    def test_cancellable_reap_blocks_for_cancel_completion_without_idle_wait(self) -> None:
+        read = usbfs.UsbFsCancellableBulkRead(77, 0x83, 64, None)
+        read._cancel_requested = True
+        blocking_reaps = 0
+
+        class UnexpectedWaitEvent:
+            def wait(self, timeout: float | None = None) -> bool:
+                raise AssertionError(f"unexpected idle wait {timeout}")
+
+            def set(self) -> None:
+                return None
+
+        def ioctl(_fd, request, _arg):
+            if request == usbfs.USBDEVFS_REAPURBNDELAY:
+                raise OSError(errno.EAGAIN, "try again")
+            return 0
+
+        def reap_blocking() -> None:
+            nonlocal blocking_reaps
+            blocking_reaps += 1
+
+        read._cancel_event = UnexpectedWaitEvent()
+        read._reap_blocking = reap_blocking
+        with patch("motu_proxy.transports.usbfs._ioctl", side_effect=ioctl):
+            read._reap(time.monotonic() + 10)
+
+        self.assertEqual(blocking_reaps, 1)
+
+    def test_cancellable_cancel_wakes_reap_wait(self) -> None:
+        read = usbfs.UsbFsCancellableBulkRead(77, 0x83, 64, None)
+        wakeups = 0
+
+        class RecordingEvent:
+            def wait(self, timeout: float | None = None) -> bool:
+                return False
+
+            def set(self) -> None:
+                nonlocal wakeups
+                wakeups += 1
+
+        read._cancel_event = RecordingEvent()
+        read.cancel()
+
+        self.assertEqual(wakeups, 1)

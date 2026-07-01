@@ -643,6 +643,39 @@ class DatastoreCoordinatorTests(TestCase):
         self.assertEqual(other.etag, "2")
         self.assertTrue(own.not_modified)
 
+    def test_post_publishes_refresh_before_releasing_foreground_io(self) -> None:
+        transport = FakeTransport(
+            [
+                response_packet(b'HTTP/1.1 200 OK\r\nETag: 1\r\n\r\n{"state":1}'),
+                response_packet(
+                    b'HTTP/1.1 200 OK\r\nETag: 2\r\n\r\n{"post":true}',
+                    message_seq=3,
+                ),
+                response_packet(
+                    b'HTTP/1.1 200 OK\r\nETag: 2\r\n\r\n{"full":true}',
+                    message_seq=4,
+                ),
+            ]
+        )
+        coordinator = DatastoreCoordinator(
+            MotuUsbDatastore(transport),
+            http_wait_timeout_ms=1,
+        )
+        coordinator.read("/datastore")
+        release_etags: list[str | None] = []
+        release_io = coordinator._release_io
+
+        def record_release_etag() -> None:
+            release_etags.append(coordinator.latest_etag)
+            release_io()
+
+        coordinator._release_io = record_release_etag
+
+        returned = coordinator.post("/datastore/host/os", '{"value":"linux"}', client="7")
+
+        self.assertEqual(returned.body, b'{"post":true}')
+        self.assertEqual(release_etags, ["2"])
+
     def test_post_returns_write_response_when_refresh_fails(self) -> None:
         transport = FakeTransport(
             [
@@ -891,6 +924,7 @@ class DatastoreCoordinatorTests(TestCase):
         try:
             self.assertTrue(transport.wait_for_writes(1))
             self.assertTrue(transport.wait_for_cancellable_reads(1))
+            self.assertEqual(transport.cancellable_read_timeouts[0], 20)
 
             started = time.monotonic()
             coordinator.close()

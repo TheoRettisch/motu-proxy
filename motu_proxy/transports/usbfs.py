@@ -6,6 +6,7 @@ import ctypes
 import errno
 import os
 import sys
+import threading
 import time
 
 from ..device import UsbDeviceInfo
@@ -61,6 +62,7 @@ USBDEVFS_REAPURB = _ioc(_IOC_WRITE, "U", 12, ctypes.sizeof(ctypes.c_void_p))
 USBDEVFS_REAPURBNDELAY = _ioc(_IOC_WRITE, "U", 13, ctypes.sizeof(ctypes.c_void_p))
 USBDEVFS_CLAIMINTERFACE = _ioc(_IOC_READ, "U", 15, ctypes.sizeof(ctypes.c_uint))
 USBDEVFS_RELEASEINTERFACE = _ioc(_IOC_READ, "U", 16, ctypes.sizeof(ctypes.c_uint))
+DEFAULT_CANCELLABLE_REAP_POLL_INTERVAL_S = 0.05
 
 
 _LIBC = None
@@ -102,12 +104,14 @@ class UsbFsCancellableBulkRead:
         read_size: int,
         timeout_ms: int | None,
         debug: bool = False,
+        reap_poll_interval_s: float = DEFAULT_CANCELLABLE_REAP_POLL_INTERVAL_S,
     ) -> None:
         self.fd = fd
         self.endpoint = endpoint
         self.read_size = read_size
         self.timeout_ms = timeout_ms
         self.debug = debug
+        self.reap_poll_interval_s = max(0.001, reap_poll_interval_s)
         self._buffer = ctypes.create_string_buffer(read_size)
         self._urb = UsbdevfsUrb(
             USBDEVFS_URB_TYPE_BULK,
@@ -127,6 +131,7 @@ class UsbFsCancellableBulkRead:
         self._reaped = False
         self._cancel_requested = False
         self._timed_out = False
+        self._cancel_event = threading.Event()
 
     def read(self) -> bytes:
         if self._cancel_requested:
@@ -150,6 +155,7 @@ class UsbFsCancellableBulkRead:
 
     def cancel(self) -> None:
         self._cancel_requested = True
+        self._cancel_event.set()
         if not self._submitted or self._reaped:
             return
         try:
@@ -172,12 +178,18 @@ class UsbFsCancellableBulkRead:
             except OSError as exc:
                 if exc.errno != errno.EAGAIN:
                     raise
+                if self._cancel_requested:
+                    self._reap_blocking()
+                    return
                 if deadline is not None and time.monotonic() >= deadline:
                     self._timed_out = True
                     self.cancel()
                     self._reap_blocking()
                     return
-                time.sleep(0.001)
+                wait_s = self.reap_poll_interval_s
+                if deadline is not None:
+                    wait_s = min(wait_s, max(0.0, deadline - time.monotonic()))
+                self._cancel_event.wait(wait_s)
                 continue
             self._accept_reaped_urb(reaped)
             return

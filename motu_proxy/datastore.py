@@ -874,10 +874,10 @@ class DatastoreCoordinator:
                 self._clear_poller_error()
             except Exception as exc:
                 self._record_poller_error(exc)
+            else:
+                self._publish_payload(refresh, origin_client=origin_client)
         finally:
             self._release_io()
-        if refresh is not None:
-            self._publish_payload(refresh, origin_client=origin_client)
         return payload
 
     def wait_for_change(
@@ -950,7 +950,7 @@ class DatastoreCoordinator:
                         etag=etag,
                         timeout_ms=self.long_poll_timeout_ms,
                         should_cancel=self._is_closed,
-                        read_timeout_slice_ms=None,
+                        read_timeout_slice_ms=self.poll_read_timeout_slice_ms,
                         use_cancellable_read=True,
                         read_started=self._set_active_poll_read,
                     )

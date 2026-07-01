@@ -374,10 +374,13 @@ class MotuProxyHandler(BaseHTTPRequestHandler):
         super().send_error(code, message, explain)
 
     def handle_datastore_request(self, method: str) -> None:
+        response_started = False
         try:
             origin = self.headers.get("Origin")
             host = self.headers.get("Host")
             request_token = self.read_write_token() if method != "GET" else None
+            if method == "GET":
+                self.close_get_connection_if_body_announced()
             if method != "GET":
                 validator = getattr(self.server.dispatcher, "validate_write_headers", None)
                 if validator is not None:
@@ -395,6 +398,7 @@ class MotuProxyHandler(BaseHTTPRequestHandler):
             )
             body = b"" if result.status == 304 else result.response
             self.send_response(result.status)
+            response_started = True
             if result.status != 304:
                 self.send_header("Content-Type", response_content_type(body))
             self.send_header("Cache-Control", "no-cache")
@@ -409,34 +413,62 @@ class MotuProxyHandler(BaseHTTPRequestHandler):
                 self.wfile.write(body)
         except (WritesDisabled, CrossOriginWrite, HostNotAllowed, WriteTokenRequired, DatastorePermissionError) as exc:
             self.close_write_connection(method)
-            self.send_json_error(403, str(exc))
+            if self.can_send_error_response(response_started):
+                self.send_json_error(403, str(exc))
         except DatastoreValidationError as exc:
             self.close_write_connection(method)
-            self.send_json_error(422, str(exc))
+            if self.can_send_error_response(response_started):
+                self.send_json_error(422, str(exc))
         except RequestBodyTooLarge as exc:
             self.close_write_connection(method)
-            self.send_json_error(413, str(exc))
+            if self.can_send_error_response(response_started):
+                self.send_json_error(413, str(exc))
         except ProtocolFrameTooLarge as exc:
             self.close_write_connection(method)
-            self.send_json_error(413, str(exc))
+            if self.can_send_error_response(response_started):
+                self.send_json_error(413, str(exc))
         except RequestBodyTimeout as exc:
             self.close_write_connection(method)
-            self.send_json_error(408, str(exc))
+            if self.can_send_error_response(response_started):
+                self.send_json_error(408, str(exc))
         except (BadRequest, InvalidJsonBody) as exc:
             self.close_write_connection(method)
-            self.send_json_error(400, str(exc))
+            if self.can_send_error_response(response_started):
+                self.send_json_error(400, str(exc))
         except DeviceDiscoveryError as exc:
             self.close_write_connection(method)
-            self.send_backend_error(503, "MOTU USB device is not available", exc)
+            if self.can_send_error_response(response_started):
+                self.send_backend_error(503, "MOTU USB device is not available", exc)
         except (DatastoreNoResponse, DatastoreTimeout) as exc:
             self.close_write_connection(method)
-            self.send_backend_error(504, "MOTU USB datastore did not respond", exc)
+            if self.can_send_error_response(response_started):
+                self.send_backend_error(504, "MOTU USB datastore did not respond", exc)
         except (ResponseFrameError, DatastoreResponseLimit, ShortUsbFrame, ShortUsbWrite) as exc:
             self.close_write_connection(method)
-            self.send_backend_error(502, "MOTU USB datastore returned an invalid response", exc)
+            if self.can_send_error_response(response_started):
+                self.send_backend_error(502, "MOTU USB datastore returned an invalid response", exc)
         except Exception as exc:
             self.close_write_connection(method)
-            self.send_backend_error(502, "MOTU USB datastore request failed", exc)
+            if self.can_send_error_response(response_started):
+                self.send_backend_error(502, "MOTU USB datastore request failed", exc)
+
+    def close_get_connection_if_body_announced(self) -> None:
+        if self.headers.get("Transfer-Encoding"):
+            self.close_connection = True
+            return
+        content_length = self.headers.get("Content-Length")
+        if content_length is None:
+            return
+        try:
+            length = int(content_length or "0")
+        except ValueError as exc:
+            self.close_connection = True
+            raise BadRequest("invalid Content-Length") from exc
+        if length < 0:
+            self.close_connection = True
+            raise BadRequest("invalid Content-Length")
+        if length > 0:
+            self.close_connection = True
 
     def read_raw_body(self) -> str:
         transfer_encoding = self.headers.get("Transfer-Encoding", "")
@@ -492,6 +524,12 @@ class MotuProxyHandler(BaseHTTPRequestHandler):
     def close_write_connection(self, method: str) -> None:
         if method != "GET":
             self.close_connection = True
+
+    def can_send_error_response(self, response_started: bool) -> bool:
+        if response_started:
+            self.close_connection = True
+            return False
+        return True
 
     def send_json_error(self, status: int, message: str) -> None:
         body = json.dumps({"error": message}).encode("utf-8")
