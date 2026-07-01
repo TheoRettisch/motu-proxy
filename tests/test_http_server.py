@@ -76,6 +76,22 @@ class RecordingConnection:
         self.timeouts.append(timeout)
 
 
+class BufferedSocket:
+    def __init__(self, request: bytes) -> None:
+        self.request = BytesIO(request)
+        self.response = BytesIO()
+
+    def makefile(self, mode: str, *args, **kwargs):
+        if "r" in mode:
+            return self.request
+        if "w" in mode:
+            return self.response
+        raise ValueError(f"unsupported mode {mode!r}")
+
+    def sendall(self, data: bytes) -> None:
+        self.response.write(data)
+
+
 class HttpServerTests(TestCase):
     def dispatch(
         self,
@@ -797,6 +813,168 @@ class HttpHandlerTests(TestCase):
         handler.end_headers = lambda: None
         return handler
 
+    def handle_socket_requests(self, request: bytes, dispatcher=None) -> bytes:
+        if dispatcher is None:
+
+            class Dispatcher:
+                def dispatch(self, *args, **kwargs):
+                    return DispatchResult(b'{"value":"ok"}', "/datastore")
+
+            dispatcher = Dispatcher()
+
+        request_socket = BufferedSocket(request)
+        server = SimpleNamespace(
+            debug=False,
+            dispatcher=dispatcher,
+            max_write_body_bytes=64 * 1024,
+            write_body_read_timeout_s=5.0,
+        )
+        MotuProxyHandler(request_socket, ("127.0.0.1", 0), server)
+        return request_socket.response.getvalue()
+
+    def parse_socket_responses(self, data: bytes) -> list[SimpleNamespace]:
+        responses = []
+        offset = 0
+        while offset < len(data):
+            header_end = data.find(b"\r\n\r\n", offset)
+            self.assertNotEqual(header_end, -1, "response headers were not terminated")
+
+            header_block = data[offset:header_end]
+            header_lines = header_block.decode("iso-8859-1").split("\r\n")
+            headers = {}
+            for line in header_lines[1:]:
+                key, _, value = line.partition(":")
+                headers[key.lower()] = value.strip()
+
+            content_length = int(headers.get("content-length", "0"))
+            body_start = header_end + len(b"\r\n\r\n")
+            body_end = body_start + content_length
+            self.assertLessEqual(body_end, len(data), "response body was incomplete")
+            responses.append(
+                SimpleNamespace(
+                    status_line=header_lines[0],
+                    headers=headers,
+                    body=data[body_start:body_end],
+                )
+            )
+            offset = body_end
+
+        return responses
+
+    def test_handler_protocol_version_is_http_11(self) -> None:
+        self.assertEqual(MotuProxyHandler.protocol_version, "HTTP/1.1")
+
+    def test_handler_length_frames_success_without_unconditional_close(self) -> None:
+        body = b'{"value":"ok"}'
+
+        class Dispatcher:
+            def dispatch(self, *args, **kwargs):
+                return DispatchResult(body, "/datastore/uid")
+
+        handler = self.make_handler(dispatcher=Dispatcher())
+        handler.handle_datastore_request("GET")
+        self.assertEqual(handler.statuses, [200])
+        self.assertIn(("Content-Length", str(len(body))), handler.sent_headers)
+        self.assertNotIn(("Connection", "close"), handler.sent_headers)
+        self.assertEqual(handler.wfile.getvalue(), body)
+
+    def test_http11_success_responses_can_reuse_socket(self) -> None:
+        calls: list[str] = []
+        body = b'{"value":"ok"}'
+
+        class Dispatcher:
+            def dispatch(self, method, request_path, *args, **kwargs):
+                result = dispatch_datastore_request(
+                    method,
+                    request_path,
+                    "",
+                    "",
+                    False,
+                    self.get,
+                    lambda path, body, client=None: b"{}",
+                )
+                return result
+
+            def get(self, path: str, client: str | None = None) -> bytes:
+                calls.append(path)
+                return body
+
+        request = (
+            "GET /datastore/uid HTTP/1.1\r\n"
+            "Host: 127.0.0.1\r\n"
+            "\r\n"
+        ).encode("ascii")
+
+        responses = self.parse_socket_responses(
+            self.handle_socket_requests(request + request, Dispatcher())
+        )
+
+        self.assertEqual(len(responses), 2)
+        first, second = responses
+        self.assertEqual(first.status_line, "HTTP/1.1 200 OK")
+        self.assertEqual(second.status_line, "HTTP/1.1 200 OK")
+        self.assertEqual(first.headers["content-length"], str(len(body)))
+        self.assertEqual(second.headers["content-length"], str(len(body)))
+        self.assertNotEqual(first.headers.get("connection", "").lower(), "close")
+        self.assertNotEqual(second.headers.get("connection", "").lower(), "close")
+        self.assertEqual(first.body, body)
+        self.assertEqual(second.body, body)
+        self.assertEqual(calls, ["/datastore/uid", "/datastore/uid"])
+
+    def test_http11_connection_close_request_closes_socket_after_success(self) -> None:
+        body = b'{"value":"ok"}'
+
+        class Dispatcher:
+            def dispatch(self, *args, **kwargs):
+                return DispatchResult(body, "/datastore/uid")
+
+        request = (
+            "GET /datastore/uid HTTP/1.1\r\n"
+            "Host: 127.0.0.1\r\n"
+            "Connection: close\r\n"
+            "\r\n"
+        ).encode("ascii")
+        followup = (
+            "GET /datastore/uid HTTP/1.1\r\n"
+            "Host: 127.0.0.1\r\n"
+            "\r\n"
+        ).encode("ascii")
+
+        responses = self.parse_socket_responses(
+            self.handle_socket_requests(request + followup, Dispatcher())
+        )
+
+        self.assertEqual(len(responses), 1)
+        response = responses[0]
+        self.assertEqual(response.status_line, "HTTP/1.1 200 OK")
+        self.assertEqual(response.headers["content-length"], str(len(body)))
+        self.assertEqual(response.headers.get("connection", "").lower(), "close")
+        self.assertEqual(response.body, body)
+
+    def test_http11_unknown_method_error_is_length_framed_and_closes(self) -> None:
+        request = (
+            "BREW /datastore HTTP/1.1\r\n"
+            "Host: 127.0.0.1\r\n"
+            "\r\n"
+        ).encode("ascii")
+        followup = (
+            "GET /datastore HTTP/1.1\r\n"
+            "Host: 127.0.0.1\r\n"
+            "\r\n"
+        ).encode("ascii")
+
+        responses = self.parse_socket_responses(
+            self.handle_socket_requests(request + followup)
+        )
+
+        self.assertEqual(len(responses), 1)
+        response = responses[0]
+        self.assertTrue(response.status_line.startswith("HTTP/1.1 501 "))
+        self.assertIn("content-length", response.headers)
+        self.assertEqual(int(response.headers["content-length"]), len(response.body))
+        self.assertEqual(response.headers.get("connection", "").lower(), "close")
+        self.assertIn(b"Unsupported method", response.body)
+
     def test_handler_does_not_truncate_concatenated_json_response(self) -> None:
         class Dispatcher:
             def dispatch(self, *args, **kwargs):
@@ -823,7 +1001,7 @@ class HttpHandlerTests(TestCase):
     def test_handler_sends_304_without_body(self) -> None:
         class Dispatcher:
             def dispatch(self, *args, **kwargs):
-                return DispatchResult(b"", "/datastore", etag="5678", status=304)
+                return DispatchResult(b'{"unexpected":true}', "/datastore", etag="5678", status=304)
 
         handler = self.make_handler(dispatcher=Dispatcher())
         handler.handle_datastore_request("GET")
@@ -831,7 +1009,7 @@ class HttpHandlerTests(TestCase):
         self.assertIn(("Cache-Control", "no-cache"), handler.sent_headers)
         self.assertIn(("ETag", "5678"), handler.sent_headers)
         self.assertIn(("Content-Length", "0"), handler.sent_headers)
-        self.assertNotIn(("Content-Type", "application/json"), handler.sent_headers)
+        self.assertFalse(any(key == "Content-Type" for key, _ in handler.sent_headers))
         self.assertEqual(handler.wfile.getvalue(), b"")
 
     def test_dispatch_accepts_datastore_payload_metadata(self) -> None:
@@ -854,10 +1032,12 @@ class HttpHandlerTests(TestCase):
 
         handler = self.make_handler({"Content-Length": "17"}, b'{"value":"linux"}', Dispatcher())
         handler.handle_datastore_request("POST")
+        body = handler.wfile.getvalue()
         self.assertEqual(handler.statuses, [403])
         self.assertIn(("Content-Type", "application/json"), handler.sent_headers)
+        self.assertIn(("Content-Length", str(len(body))), handler.sent_headers)
         self.assertIn(("Connection", "close"), handler.sent_headers)
-        self.assertIn("valid write token required", json.loads(handler.wfile.getvalue().decode("utf-8"))["error"])
+        self.assertIn("valid write token required", json.loads(body.decode("utf-8"))["error"])
 
     def test_handler_rejects_unsafe_writes_before_reading_body(self) -> None:
         def get(path: str, client: str | None = None) -> bytes:
@@ -909,6 +1089,7 @@ class HttpHandlerTests(TestCase):
                 handler.handle_datastore_request("POST")
                 self.assertEqual(handler.statuses, [403])
                 self.assertEqual(body.reads, 0)
+                self.assertIn(("Connection", "close"), handler.sent_headers)
                 self.assertIn(message, json.loads(handler.wfile.getvalue().decode("utf-8"))["error"])
 
     def test_handler_returns_json_403_for_read_only_path(self) -> None:
@@ -967,6 +1148,30 @@ class HttpHandlerTests(TestCase):
         handler = self.make_handler({"Transfer-Encoding": "chunked", WRITE_TOKEN_HEADER: WRITE_TOKEN}, b"")
         with self.assertRaisesRegex(BadRequest, "Transfer-Encoding"):
             handler.read_raw_body()
+
+    def test_handler_body_read_failures_emit_connection_close(self) -> None:
+        class Dispatcher:
+            def validate_write_headers(self, *args, **kwargs) -> None:
+                return None
+
+            def dispatch(self, *args, **kwargs):
+                raise AssertionError("unexpected dispatch")
+
+        cases = [
+            ("unsupported transfer encoding", {"Transfer-Encoding": "chunked"}, b"", 400, None),
+            ("short body", {"Content-Length": "17"}, b"{}", 400, None),
+            ("timeout", {"Content-Length": "17"}, TimeoutBody(), 408, RecordingConnection()),
+        ]
+
+        for name, headers, body, status, connection in cases:
+            with self.subTest(name=name):
+                handler = self.make_handler(headers, body, Dispatcher(), connection=connection)
+                handler.handle_datastore_request("POST")
+                response_body = handler.wfile.getvalue()
+                self.assertEqual(handler.statuses, [status])
+                self.assertTrue(handler.close_connection)
+                self.assertIn(("Connection", "close"), handler.sent_headers)
+                self.assertIn(("Content-Length", str(len(response_body))), handler.sent_headers)
 
     def test_handler_times_out_stalled_write_body_and_restores_socket_timeout(self) -> None:
         connection = RecordingConnection(timeout=None)

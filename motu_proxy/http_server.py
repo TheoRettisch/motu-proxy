@@ -306,6 +306,7 @@ class DatastoreDispatcher:
 
 class MotuProxyHandler(BaseHTTPRequestHandler):
     server_version = "MotuProxy/0.1"
+    protocol_version = "HTTP/1.1"
 
     def do_GET(self) -> None:
         self.handle_datastore_request("GET")
@@ -320,6 +321,10 @@ class MotuProxyHandler(BaseHTTPRequestHandler):
     def log_message(self, fmt: str, *args) -> None:
         if self.server.debug:
             super().log_message(fmt, *args)
+
+    def send_error(self, code, message=None, explain=None) -> None:
+        self.close_connection = True
+        super().send_error(code, message, explain)
 
     def handle_datastore_request(self, method: str) -> None:
         try:
@@ -341,7 +346,7 @@ class MotuProxyHandler(BaseHTTPRequestHandler):
                 request_token=request_token,
                 if_none_match=self.headers.get("If-None-Match") if method == "GET" else None,
             )
-            body = result.response
+            body = b"" if result.status == 304 else result.response
             self.send_response(result.status)
             if result.status != 304:
                 self.send_header("Content-Type", response_content_type(body))
@@ -349,8 +354,11 @@ class MotuProxyHandler(BaseHTTPRequestHandler):
             if method == "GET" and result.etag is not None:
                 self.send_header("ETag", result.etag)
             self.send_header("Content-Length", str(len(body)))
+            if getattr(self, "close_connection", False):
+                self.send_header("Connection", "close")
             self.end_headers()
-            self.wfile.write(body)
+            if body:
+                self.wfile.write(body)
         except (WritesDisabled, CrossOriginWrite, HostNotAllowed, WriteTokenRequired, DatastorePermissionError) as exc:
             self.close_write_connection(method)
             self.send_json_error(403, str(exc))
