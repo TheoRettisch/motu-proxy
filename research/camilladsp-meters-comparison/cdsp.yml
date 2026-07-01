@@ -1,0 +1,16 @@
+# CamillaDSP 4.x — minimal 24ch passthrough through the MOTU 624.
+# chunksize 576 @ 48000 -> meter/chunk rate 83.3 Hz (matched to the MOTU /meters rate).
+devices:
+  samplerate: 48000
+  chunksize: 576
+  capture:
+    type: Alsa
+    channels: 24
+    device: "hw:CARD=D624"
+    format: S24_3_LE
+  playback:
+    type: Alsa
+    channels: 24
+    device: "hw:CARD=D624"
+    format: S24_3_LE
+pipeline: []
