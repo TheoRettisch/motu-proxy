@@ -14,8 +14,10 @@ from .paths import normalize_path
 
 DATASTORE_PREFIX = "/datastore/"
 SEMVER_RE = re.compile(r"^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$")
+SEGMENT_PLACEHOLDER_RE = re.compile(r"<([A-Za-z0-9_]+)>")
 PLACEHOLDER_VALUES = {
     "ibank_or_obank": {"ibank", "obank"},
+    "input_or_output": {"input", "output"},
 }
 
 
@@ -41,12 +43,93 @@ class PathSchema:
         return tuple(self.path.split("/"))
 
 
-RAW_SCHEMA: tuple[tuple[str, str, str, int | float | None, int | float | None, str | None], ...] = (
+RAW_SCHEMA: tuple[
+    tuple[str, str, str, int | float | None, int | float | None, str | None], ...
+] = (
     ("uid", "string", "r", None, None, None),
     ("host/os", "string", "rw", None, None, None),
     ("ext/caps/avb", "semver_opt", "r", None, None, None),
     ("ext/caps/router", "semver_opt", "r", None, None, None),
     ("ext/caps/mixer", "semver_opt", "r", None, None, None),
+    ("avb/devs", "string_list", "r", None, None, None),
+    ("avb/<uid>/entity_model_id_h32", "int", "r", None, None, None),
+    ("avb/<uid>/entity_model_id_l32", "int", "r", None, None, None),
+    ("avb/<uid>/entity_name", "string", "rw", None, None, None),
+    ("avb/<uid>/model_name", "string", "r", None, None, None),
+    ("avb/<uid>/hostname", "string_opt", "r", None, None, None),
+    ("avb/<uid>/master_clock/capable", "int_bool", "r", None, None, None),
+    ("avb/<uid>/master_clock/uid", "string_opt", "rw", None, None, None),
+    ("avb/<uid>/vendor_name", "string", "r", None, None, None),
+    ("avb/<uid>/firmware_version", "string", "r", None, None, None),
+    ("avb/<uid>/serial_number", "string", "r", None, None, None),
+    ("avb/<uid>/controller_ignore", "int_bool", "r", None, None, None),
+    ("avb/<uid>/acquired_id", "string", "r", None, None, None),
+    ("avb/<uid>/motu.mdns.type", "string_opt", "r", None, None, None),
+    ("avb/<uid>/apiversion", "semver_opt", "r", None, None, None),
+    ("avb/<uid>/url", "string_opt", "r", None, None, None),
+    ("avb/<uid>/current_configuration", "int", "rw", None, None, None),
+    ("avb/<uid>/cfg/<index>/object_name", "string", "r", None, None, None),
+    ("avb/<uid>/cfg/<index>/identify", "int_bool", "rw", None, None, None),
+    ("avb/<uid>/cfg/<index>/current_sampling_rate", "int", "rw", None, None, None),
+    ("avb/<uid>/cfg/<index>/sample_rates", "int_list", "r", None, None, None),
+    ("avb/<uid>/cfg/<index>/clock_source_index", "int", "rw", None, None, None),
+    ("avb/<uid>/cfg/<index>/clock_sources/num", "int", "r", None, None, None),
+    (
+        "avb/<uid>/cfg/<index>/clock_sources/<index>/object_name",
+        "string",
+        "r",
+        None,
+        None,
+        None,
+    ),
+    (
+        "avb/<uid>/cfg/<index>/clock_sources/<index>/type",
+        "string",
+        "r",
+        None,
+        None,
+        None,
+    ),
+    (
+        "avb/<uid>/cfg/<index>/clock_sources/<index>/stream_id",
+        "int_opt",
+        "r",
+        None,
+        None,
+        None,
+    ),
+    (
+        "avb/<uid>/cfg/<index>/<input_or_output>_streams/num",
+        "int",
+        "r",
+        None,
+        None,
+        None,
+    ),
+    (
+        "avb/<uid>/cfg/<index>/<input_or_output>_streams/<index>/object_name",
+        "string",
+        "r",
+        None,
+        None,
+        None,
+    ),
+    (
+        "avb/<uid>/cfg/<index>/<input_or_output>_streams/<index>/num_ch",
+        "int",
+        "r",
+        None,
+        None,
+        None,
+    ),
+    (
+        "avb/<uid>/cfg/<index>/input_streams/<index>/talker",
+        "string_pair",
+        "rw",
+        None,
+        None,
+        None,
+    ),
     ("ext/clockLocked", "int_bool", "r", None, None, None),
     ("ext/wordClockMode", "string", "rw", None, None, None),
     ("ext/wordClockThru", "string", "rw", None, None, None),
@@ -66,16 +149,58 @@ RAW_SCHEMA: tuple[tuple[str, str, str, int | float | None, int | float | None, s
     ("ext/obank/<index>/madiFormat", "int", "rw", None, None, None),
     ("ext/<ibank_or_obank>/<index>/ch/<index>/name", "string", "rw", None, None, None),
     ("ext/obank/<index>/ch/<index>/src", "int_pair_opt", "rw", None, None, None),
-    ("ext/<ibank_or_obank>/<index>/ch/<index>/phase", "int_bool_opt", "rw", None, None, None),
-    ("ext/<ibank_or_obank>/<index>/ch/<index>/pad", "int_bool_opt", "rw", None, None, None),
+    (
+        "ext/<ibank_or_obank>/<index>/ch/<index>/phase",
+        "int_bool_opt",
+        "rw",
+        None,
+        None,
+        None,
+    ),
+    (
+        "ext/<ibank_or_obank>/<index>/ch/<index>/pad",
+        "int_bool_opt",
+        "rw",
+        None,
+        None,
+        None,
+    ),
     ("ext/ibank/<index>/ch/<index>/48V", "int_bool_opt", "rw", None, None, None),
     ("ext/ibank/<index>/ch/<index>/vlLimit", "int_bool_opt", "rw", None, None, None),
     ("ext/ibank/<index>/ch/<index>/vlClip", "int_bool_opt", "rw", None, None, None),
     ("ext/<ibank_or_obank>/<index>/ch/<index>/trim", "int_opt", "rw", None, None, None),
-    ("ext/<ibank_or_obank>/<index>/ch/<index>/trimRange", "int_pair_opt", "rw", None, None, None),
-    ("ext/<ibank_or_obank>/<index>/ch/<index>/stereoTrim", "int_opt", "rw", None, None, None),
-    ("ext/<ibank_or_obank>/<index>/ch/<index>/stereoTrimRange", "int_pair_opt", "rw", None, None, None),
-    ("ext/<ibank_or_obank>/<index>/ch/<index>/connection", "int_bool_opt", "r", None, None, None),
+    (
+        "ext/<ibank_or_obank>/<index>/ch/<index>/trimRange",
+        "int_pair_opt",
+        "rw",
+        None,
+        None,
+        None,
+    ),
+    (
+        "ext/<ibank_or_obank>/<index>/ch/<index>/stereoTrim",
+        "int_opt",
+        "rw",
+        None,
+        None,
+        None,
+    ),
+    (
+        "ext/<ibank_or_obank>/<index>/ch/<index>/stereoTrimRange",
+        "int_pair_opt",
+        "rw",
+        None,
+        None,
+        None,
+    ),
+    (
+        "ext/<ibank_or_obank>/<index>/ch/<index>/connection",
+        "int_bool_opt",
+        "r",
+        None,
+        None,
+        None,
+    ),
     ("mix/ctrls/dsp/usage", "int", "r", None, None, None),
     ("mix/ctrls/<effect_resource>/avail", "int_bool_opt", "r", None, None, None),
     ("mix/chan/<index>/matrix/aux/<index>/send", "real", "rw", 0, 4, None),
@@ -90,7 +215,14 @@ RAW_SCHEMA: tuple[tuple[str, str, str, int | float | None, int | float | None, s
     ("mix/chan/<index>/eq/highshelf/freq", "int", "rw", 20, 20000, None),
     ("mix/chan/<index>/eq/highshelf/gain", "real", "rw", -20, 20, None),
     ("mix/chan/<index>/eq/highshelf/bw", "real", "rw", 0.01, 3, None),
-    ("mix/chan/<index>/eq/highshelf/mode", "real_enum", "rw", None, None, "Shelf=0,Para=1"),
+    (
+        "mix/chan/<index>/eq/highshelf/mode",
+        "real_enum",
+        "rw",
+        None,
+        None,
+        "Shelf=0,Para=1",
+    ),
     ("mix/chan/<index>/eq/mid1/enable", "real_bool", "rw", None, None, None),
     ("mix/chan/<index>/eq/mid1/freq", "int", "rw", 20, 20000, None),
     ("mix/chan/<index>/eq/mid1/gain", "real", "rw", -20, 20, None),
@@ -103,7 +235,14 @@ RAW_SCHEMA: tuple[tuple[str, str, str, int | float | None, int | float | None, s
     ("mix/chan/<index>/eq/lowshelf/freq", "int", "rw", 20, 20000, None),
     ("mix/chan/<index>/eq/lowshelf/gain", "real", "rw", -20, 20, None),
     ("mix/chan/<index>/eq/lowshelf/bw", "real", "rw", 0.01, 3, None),
-    ("mix/chan/<index>/eq/lowshelf/mode", "real_enum", "rw", None, None, "Shelf=0,Para=1"),
+    (
+        "mix/chan/<index>/eq/lowshelf/mode",
+        "real_enum",
+        "rw",
+        None,
+        None,
+        "Shelf=0,Para=1",
+    ),
     ("mix/chan/<index>/gate/enable", "real_bool", "rw", None, None, None),
     ("mix/chan/<index>/gate/release", "real", "rw", 50, 2000, None),
     ("mix/chan/<index>/gate/threshold", "real", "rw", 0, 1, None),
@@ -124,7 +263,14 @@ RAW_SCHEMA: tuple[tuple[str, str, str, int | float | None, int | float | None, s
     ("mix/main/<index>/eq/highshelf/freq", "int", "rw", 20, 20000, None),
     ("mix/main/<index>/eq/highshelf/gain", "real", "rw", -20, 20, None),
     ("mix/main/<index>/eq/highshelf/bw", "real", "rw", 0.01, 3, None),
-    ("mix/main/<index>/eq/highshelf/mode", "real_enum", "rw", None, None, "Shelf=0,Para=1"),
+    (
+        "mix/main/<index>/eq/highshelf/mode",
+        "real_enum",
+        "rw",
+        None,
+        None,
+        "Shelf=0,Para=1",
+    ),
     ("mix/main/<index>/eq/mid1/enable", "real_bool", "rw", None, None, None),
     ("mix/main/<index>/eq/mid1/freq", "int", "rw", 20, 20000, None),
     ("mix/main/<index>/eq/mid1/gain", "real", "rw", -20, 20, None),
@@ -137,7 +283,14 @@ RAW_SCHEMA: tuple[tuple[str, str, str, int | float | None, int | float | None, s
     ("mix/main/<index>/eq/lowshelf/freq", "int", "rw", 20, 20000, None),
     ("mix/main/<index>/eq/lowshelf/gain", "real", "rw", -20, 20, None),
     ("mix/main/<index>/eq/lowshelf/bw", "real", "rw", 0.01, 3, None),
-    ("mix/main/<index>/eq/lowshelf/mode", "real_enum", "rw", None, None, "Shelf=0,Para=1"),
+    (
+        "mix/main/<index>/eq/lowshelf/mode",
+        "real_enum",
+        "rw",
+        None,
+        None,
+        "Shelf=0,Para=1",
+    ),
     ("mix/main/<index>/leveler/enable", "real_bool", "rw", None, None, None),
     ("mix/main/<index>/leveler/makeup", "real", "rw", 0, 100, None),
     ("mix/main/<index>/leveler/reduction", "real", "rw", 0, 100, None),
@@ -149,7 +302,14 @@ RAW_SCHEMA: tuple[tuple[str, str, str, int | float | None, int | float | None, s
     ("mix/aux/<index>/eq/highshelf/freq", "int", "rw", 20, 20000, None),
     ("mix/aux/<index>/eq/highshelf/gain", "real", "rw", -20, 20, None),
     ("mix/aux/<index>/eq/highshelf/bw", "real", "rw", 0.01, 3, None),
-    ("mix/aux/<index>/eq/highshelf/mode", "real_enum", "rw", None, None, "Shelf=0,Para=1"),
+    (
+        "mix/aux/<index>/eq/highshelf/mode",
+        "real_enum",
+        "rw",
+        None,
+        None,
+        "Shelf=0,Para=1",
+    ),
     ("mix/aux/<index>/eq/mid1/enable", "real_bool", "rw", None, None, None),
     ("mix/aux/<index>/eq/mid1/freq", "int", "rw", 20, 20000, None),
     ("mix/aux/<index>/eq/mid1/gain", "real", "rw", -20, 20, None),
@@ -162,7 +322,14 @@ RAW_SCHEMA: tuple[tuple[str, str, str, int | float | None, int | float | None, s
     ("mix/aux/<index>/eq/lowshelf/freq", "int", "rw", 20, 20000, None),
     ("mix/aux/<index>/eq/lowshelf/gain", "real", "rw", -20, 20, None),
     ("mix/aux/<index>/eq/lowshelf/bw", "real", "rw", 0.01, 3, None),
-    ("mix/aux/<index>/eq/lowshelf/mode", "real_enum", "rw", None, None, "Shelf=0,Para=1"),
+    (
+        "mix/aux/<index>/eq/lowshelf/mode",
+        "real_enum",
+        "rw",
+        None,
+        None,
+        "Shelf=0,Para=1",
+    ),
     ("mix/aux/<index>/matrix/enable", "real_bool", "rw", None, None, None),
     ("mix/aux/<index>/matrix/prefader", "real_bool", "rw", None, None, None),
     ("mix/aux/<index>/matrix/panner", "real_bool", "rw", None, None, None),
@@ -174,7 +341,14 @@ RAW_SCHEMA: tuple[tuple[str, str, str, int | float | None, int | float | None, s
     ("mix/group/<index>/eq/highshelf/freq", "int", "rw", 20, 20000, None),
     ("mix/group/<index>/eq/highshelf/gain", "real", "rw", -20, 20, None),
     ("mix/group/<index>/eq/highshelf/bw", "real", "rw", 0.01, 3, None),
-    ("mix/group/<index>/eq/highshelf/mode", "real_enum", "rw", None, None, "Shelf=0,Para=1"),
+    (
+        "mix/group/<index>/eq/highshelf/mode",
+        "real_enum",
+        "rw",
+        None,
+        None,
+        "Shelf=0,Para=1",
+    ),
     ("mix/group/<index>/eq/mid1/enable", "real_bool", "rw", None, None, None),
     ("mix/group/<index>/eq/mid1/freq", "int", "rw", 20, 20000, None),
     ("mix/group/<index>/eq/mid1/gain", "real", "rw", -20, 20, None),
@@ -187,7 +361,14 @@ RAW_SCHEMA: tuple[tuple[str, str, str, int | float | None, int | float | None, s
     ("mix/group/<index>/eq/lowshelf/freq", "int", "rw", 20, 20000, None),
     ("mix/group/<index>/eq/lowshelf/gain", "real", "rw", -20, 20, None),
     ("mix/group/<index>/eq/lowshelf/bw", "real", "rw", 0.01, 3, None),
-    ("mix/group/<index>/eq/lowshelf/mode", "real_enum", "rw", None, None, "Shelf=0,Para=1"),
+    (
+        "mix/group/<index>/eq/lowshelf/mode",
+        "real_enum",
+        "rw",
+        None,
+        None,
+        "Shelf=0,Para=1",
+    ),
     ("mix/group/<index>/leveler/enable", "real_bool", "rw", None, None, None),
     ("mix/group/<index>/leveler/makeup", "real", "rw", 0, 100, None),
     ("mix/group/<index>/leveler/reduction", "real", "rw", 0, 100, None),
@@ -204,7 +385,14 @@ RAW_SCHEMA: tuple[tuple[str, str, str, int | float | None, int | float | None, s
     ("mix/reverb/<index>/eq/highshelf/freq", "int", "rw", 20, 20000, None),
     ("mix/reverb/<index>/eq/highshelf/gain", "real", "rw", -20, 20, None),
     ("mix/reverb/<index>/eq/highshelf/bw", "real", "rw", 0.01, 3, None),
-    ("mix/reverb/<index>/eq/highshelf/mode", "real_enum", "rw", None, None, "Shelf=0,Para=1"),
+    (
+        "mix/reverb/<index>/eq/highshelf/mode",
+        "real_enum",
+        "rw",
+        None,
+        None,
+        "Shelf=0,Para=1",
+    ),
     ("mix/reverb/<index>/eq/mid1/enable", "real_bool", "rw", None, None, None),
     ("mix/reverb/<index>/eq/mid1/freq", "int", "rw", 20, 20000, None),
     ("mix/reverb/<index>/eq/mid1/gain", "real", "rw", -20, 20, None),
@@ -217,7 +405,14 @@ RAW_SCHEMA: tuple[tuple[str, str, str, int | float | None, int | float | None, s
     ("mix/reverb/<index>/eq/lowshelf/freq", "int", "rw", 20, 20000, None),
     ("mix/reverb/<index>/eq/lowshelf/gain", "real", "rw", -20, 20, None),
     ("mix/reverb/<index>/eq/lowshelf/bw", "real", "rw", 0.01, 3, None),
-    ("mix/reverb/<index>/eq/lowshelf/mode", "real_enum", "rw", None, None, "Shelf=0,Para=1"),
+    (
+        "mix/reverb/<index>/eq/lowshelf/mode",
+        "real_enum",
+        "rw",
+        None,
+        None,
+        "Shelf=0,Para=1",
+    ),
     ("mix/reverb/<index>/leveler/enable", "real_bool", "rw", None, None, None),
     ("mix/reverb/<index>/leveler/makeup", "real", "rw", 0, 100, None),
     ("mix/reverb/<index>/leveler/reduction", "real", "rw", 0, 100, None),
@@ -306,7 +501,9 @@ def validate_datastore_write(
                 if warn_unknown is not None:
                     warn_unknown(target_path)
                 continue
-            raise DatastoreValidationError(f"{target_path} is not in the known writable schema")
+            raise DatastoreValidationError(
+                f"{target_path} is not in the known writable schema"
+            )
         if entry.permission != "rw":
             raise DatastorePermissionError(f"{target_path} is read-only")
         _validate_value(target_path, entry, value)
@@ -336,7 +533,9 @@ def _iter_write_values(base_path: str, body: dict) -> Iterable[tuple[str, object
             yield normalize_path(f"{base}/{key}"), value
 
 
-def _match_score(pattern: tuple[str, ...], requested: tuple[str, ...]) -> tuple[int, int] | None:
+def _match_score(
+    pattern: tuple[str, ...], requested: tuple[str, ...]
+) -> tuple[int, int] | None:
     if len(pattern) != len(requested):
         return None
     exact = 0
@@ -353,9 +552,26 @@ def _match_score(pattern: tuple[str, ...], requested: tuple[str, ...]) -> tuple[
 
 
 def _placeholder_matches(pattern_segment: str, requested_segment: str) -> bool:
-    if not (pattern_segment.startswith("<") and pattern_segment.endswith(">")):
+    match = SEGMENT_PLACEHOLDER_RE.fullmatch(pattern_segment)
+    if match is not None:
+        return _placeholder_value_matches(match.group(1), requested_segment)
+    match = SEGMENT_PLACEHOLDER_RE.search(pattern_segment)
+    if match is None:
         return False
-    name = pattern_segment[1:-1]
+    prefix = pattern_segment[: match.start()]
+    suffix = pattern_segment[match.end() :]
+    if not requested_segment.startswith(prefix) or not requested_segment.endswith(
+        suffix
+    ):
+        return False
+    value_end = (
+        len(requested_segment) - len(suffix) if suffix else len(requested_segment)
+    )
+    value = requested_segment[len(prefix) : value_end]
+    return _placeholder_value_matches(match.group(1), value)
+
+
+def _placeholder_value_matches(name: str, requested_segment: str) -> bool:
     if name == "index":
         return requested_segment.isdecimal()
     allowed = PLACEHOLDER_VALUES.get(name)
@@ -372,7 +588,9 @@ def _validate_value(path: str, entry: PathSchema, value: object) -> None:
         _validate_string_parts(path, entry.value_type, value, base_type, min_parts=0)
         return
     if "pair" in modifiers:
-        _validate_string_parts(path, entry.value_type, value, base_type, min_parts=2, max_parts=2)
+        _validate_string_parts(
+            path, entry.value_type, value, base_type, min_parts=2, max_parts=2
+        )
         return
     if "enum" in modifiers:
         _validate_scalar(path, value, base_type)
@@ -415,7 +633,9 @@ def _validate_scalar(path: str, value: object, base_type: str) -> None:
         if not math.isfinite(value):
             raise DatastoreValidationError(f"{path} must be a finite number")
         return
-    raise DatastoreValidationError(f"{path} uses unsupported datastore type {base_type!r}")
+    raise DatastoreValidationError(
+        f"{path} uses unsupported datastore type {base_type!r}"
+    )
 
 
 def _validate_string_parts(
@@ -427,15 +647,21 @@ def _validate_string_parts(
     max_parts: int | None = None,
 ) -> None:
     if not isinstance(value, str):
-        raise DatastoreValidationError(f"{path} must be a colon-separated {value_type} string")
+        raise DatastoreValidationError(
+            f"{path} must be a colon-separated {value_type} string"
+        )
     parts = [] if value == "" else value.split(":")
     if len(parts) < min_parts or (max_parts is not None and len(parts) > max_parts):
-        raise DatastoreValidationError(f"{path} must contain {min_parts} colon-separated values")
+        raise DatastoreValidationError(
+            f"{path} must contain {min_parts} colon-separated values"
+        )
     for part in parts:
         parsed: object = part
         if base_type == "int":
             try:
                 parsed = int(part, 10)
             except ValueError as exc:
-                raise DatastoreValidationError(f"{path} contains a non-integer list value") from exc
+                raise DatastoreValidationError(
+                    f"{path} contains a non-integer list value"
+                ) from exc
         _validate_scalar(path, parsed, base_type)
