@@ -5,6 +5,7 @@ from __future__ import annotations
 import ctypes
 import errno
 import os
+import select
 import sys
 import threading
 import time
@@ -62,7 +63,6 @@ USBDEVFS_REAPURB = _ioc(_IOC_WRITE, "U", 12, ctypes.sizeof(ctypes.c_void_p))
 USBDEVFS_REAPURBNDELAY = _ioc(_IOC_WRITE, "U", 13, ctypes.sizeof(ctypes.c_void_p))
 USBDEVFS_CLAIMINTERFACE = _ioc(_IOC_READ, "U", 15, ctypes.sizeof(ctypes.c_uint))
 USBDEVFS_RELEASEINTERFACE = _ioc(_IOC_READ, "U", 16, ctypes.sizeof(ctypes.c_uint))
-DEFAULT_CANCELLABLE_REAP_POLL_INTERVAL_S = 0.05
 
 
 _LIBC = None
@@ -104,14 +104,13 @@ class UsbFsCancellableBulkRead:
         read_size: int,
         timeout_ms: int | None,
         debug: bool = False,
-        reap_poll_interval_s: float = DEFAULT_CANCELLABLE_REAP_POLL_INTERVAL_S,
+        reap_poll_interval_s: float | None = None,
     ) -> None:
         self.fd = fd
         self.endpoint = endpoint
         self.read_size = read_size
         self.timeout_ms = timeout_ms
         self.debug = debug
-        self.reap_poll_interval_s = max(0.001, reap_poll_interval_s)
         self._buffer = ctypes.create_string_buffer(read_size)
         self._urb = UsbdevfsUrb(
             USBDEVFS_URB_TYPE_BULK,
@@ -135,6 +134,9 @@ class UsbFsCancellableBulkRead:
         self._discard_failure_errno: int | None = None
         self._timed_out = False
         self._cancel_event = threading.Event()
+        self._cancel_wakeup_lock = threading.Lock()
+        self._cancel_wakeup_reader: int | None = None
+        self._cancel_wakeup_writer: int | None = None
 
     def read(self) -> bytes:
         if self._cancel_requested:
@@ -158,8 +160,9 @@ class UsbFsCancellableBulkRead:
 
     def cancel(self) -> None:
         self._cancel_requested = True
-        self._cancel_event.set()
         self._discard_pending_urb()
+        self._cancel_event.set()
+        self._wake_cancel_waiters()
 
     def _discard_pending_urb(self) -> None:
         if (
@@ -185,28 +188,29 @@ class UsbFsCancellableBulkRead:
         self._submitted = True
 
     def _reap(self, deadline: float | None) -> None:
-        while True:
-            reaped = ctypes.c_void_p()
-            try:
-                _ioctl(self.fd, USBDEVFS_REAPURBNDELAY, ctypes.byref(reaped))
-            except OSError as exc:
-                if exc.errno != errno.EAGAIN:
-                    raise
-                if self._cancel_requested:
-                    self._finish_cancelled_reap()
-                    return
-                if deadline is not None and time.monotonic() >= deadline:
-                    self._timed_out = True
-                    self.cancel()
-                    self._finish_cancelled_reap()
-                    return
-                wait_s = self.reap_poll_interval_s
-                if deadline is not None:
-                    wait_s = min(wait_s, max(0.0, deadline - time.monotonic()))
-                self._cancel_event.wait(wait_s)
-                continue
-            self._accept_reaped_urb(reaped)
-            return
+        self._open_cancel_wakeup()
+        try:
+            while True:
+                reaped = ctypes.c_void_p()
+                try:
+                    _ioctl(self.fd, USBDEVFS_REAPURBNDELAY, ctypes.byref(reaped))
+                except OSError as exc:
+                    if exc.errno != errno.EAGAIN:
+                        raise
+                    if self._cancel_requested:
+                        self._finish_cancelled_reap()
+                        return
+                    if deadline is not None and time.monotonic() >= deadline:
+                        self._timed_out = True
+                        self.cancel()
+                        self._finish_cancelled_reap()
+                        return
+                    self._wait_for_reap_ready(deadline)
+                    continue
+                self._accept_reaped_urb(reaped)
+                return
+        finally:
+            self._close_cancel_wakeup()
 
     def _reap_blocking(self) -> None:
         reaped = ctypes.c_void_p()
@@ -237,6 +241,88 @@ class UsbFsCancellableBulkRead:
         if reaped.value != ctypes.addressof(self._urb):
             raise OSError(errno.EIO, "reaped unexpected USB URB")
         self._reaped = True
+
+    def _wait_for_reap_ready(self, deadline: float | None) -> None:
+        timeout_ms = None
+        if deadline is not None:
+            remaining_s = deadline - time.monotonic()
+            if remaining_s <= 0:
+                return
+            timeout_ms = max(1, int(remaining_s * 1000))
+        self._poll_reap_ready(timeout_ms)
+
+    def _poll_reap_ready(self, timeout_ms: int | None) -> None:
+        poller = select.poll()
+        poller.register(
+            self.fd,
+            select.POLLOUT | select.POLLERR | select.POLLHUP | select.POLLNVAL,
+        )
+        with self._cancel_wakeup_lock:
+            cancel_reader = self._cancel_wakeup_reader
+        if cancel_reader is not None:
+            poller.register(cancel_reader, select.POLLIN | select.POLLERR | select.POLLHUP)
+        poller.poll(timeout_ms)
+        self._drain_cancel_wakeup()
+
+    def _open_cancel_wakeup(self) -> None:
+        reader, writer = _nonblocking_pipe()
+        with self._cancel_wakeup_lock:
+            self._cancel_wakeup_reader = reader
+            self._cancel_wakeup_writer = writer
+
+    def _close_cancel_wakeup(self) -> None:
+        with self._cancel_wakeup_lock:
+            reader = self._cancel_wakeup_reader
+            writer = self._cancel_wakeup_writer
+            self._cancel_wakeup_reader = None
+            self._cancel_wakeup_writer = None
+        for fd in (reader, writer):
+            if fd is not None:
+                _close_fd_quietly(fd)
+
+    def _wake_cancel_waiters(self) -> None:
+        with self._cancel_wakeup_lock:
+            writer = self._cancel_wakeup_writer
+        if writer is None:
+            return
+        try:
+            os.write(writer, b"\x00")
+        except OSError as exc:
+            if exc.errno not in (errno.EAGAIN, errno.EBADF, errno.EPIPE):
+                raise
+
+    def _drain_cancel_wakeup(self) -> None:
+        with self._cancel_wakeup_lock:
+            reader = self._cancel_wakeup_reader
+        if reader is None:
+            return
+        while True:
+            try:
+                data = os.read(reader, 1024)
+            except OSError as exc:
+                if exc.errno in (errno.EAGAIN, errno.EBADF):
+                    return
+                raise
+            if not data:
+                return
+
+
+def _nonblocking_pipe() -> tuple[int, int]:
+    pipe2 = getattr(os, "pipe2", None)
+    if pipe2 is not None:
+        return pipe2(os.O_NONBLOCK | os.O_CLOEXEC)
+    reader, writer = os.pipe()
+    for fd in (reader, writer):
+        os.set_blocking(fd, False)
+        os.set_inheritable(fd, False)
+    return reader, writer
+
+
+def _close_fd_quietly(fd: int) -> None:
+    try:
+        os.close(fd)
+    except OSError:
+        return
 
 
 class UsbFsTransport:

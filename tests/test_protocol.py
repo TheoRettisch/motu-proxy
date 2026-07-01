@@ -1,3 +1,4 @@
+import zlib
 from unittest import TestCase
 
 from motu_proxy.fixtures import EXPECTED_GET_DATASTORE, EXPECTED_POST_HOST_OS
@@ -19,6 +20,11 @@ from motu_proxy.protocol import (
 class ProtocolTests(TestCase):
     def test_crc32_known_vector(self) -> None:
         self.assertEqual(crc32(b"123456789"), 0xCBF43926)
+
+    def test_crc32_matches_zlib_unsigned_result(self) -> None:
+        payload = bytes(range(256)) * 3
+
+        self.assertEqual(crc32(payload), zlib.crc32(payload) & 0xFFFFFFFF)
 
     def test_get_frame_matches_fixture(self) -> None:
         self.assertEqual(build_get_frame(0x24, 2, "/datastore"), EXPECTED_GET_DATASTORE)

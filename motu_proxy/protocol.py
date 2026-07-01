@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import struct
+import zlib
 from collections.abc import Iterable
 
 MOTU_VID = 0x07FD
@@ -34,27 +35,8 @@ class InvalidHostSequence(RuntimeError):
     pass
 
 
-def _crc32_table() -> list[int]:
-    table = []
-    for byte in range(256):
-        crc = byte
-        for _ in range(8):
-            if crc & 1:
-                crc = (crc >> 1) ^ 0xEDB88320
-            else:
-                crc >>= 1
-        table.append(crc & 0xFFFFFFFF)
-    return table
-
-
-CRC32_TABLE = _crc32_table()
-
-
 def crc32(data: bytes) -> int:
-    crc = 0xFFFFFFFF
-    for byte in data:
-        crc = CRC32_TABLE[(crc ^ byte) & 0xFF] ^ (crc >> 8)
-    return crc ^ 0xFFFFFFFF
+    return zlib.crc32(data) & 0xFFFFFFFF
 
 
 def u16(value: int) -> bytes:

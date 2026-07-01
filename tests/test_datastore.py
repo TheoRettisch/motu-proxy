@@ -528,7 +528,32 @@ class ManagedDatastoreTests(TestCase):
             status["datastore_last_reconnect_error"],
             {"type": "NoDeviceFound", "message": "missing"},
         )
+        self.assertEqual(status["datastore_retry_delay_s"], 1.0)
         self.assertEqual(status["datastore_next_retry_in_s"], 1.0)
+
+    def test_reconnectable_status_reports_current_retry_delay(self) -> None:
+        clock = ManualClock()
+        opener = FakeManagedOpener([NoDeviceFound("missing"), NoDeviceFound("still missing")])
+        manager = ManagedDatastore(
+            DatastoreConfig(),
+            opener=opener,
+            reconnect_initial_delay_s=1.0,
+            reconnect_max_delay_s=3.0,
+            clock=clock,
+        )
+
+        with self.assertRaises(DatastoreDeviceUnavailable):
+            manager.get("/datastore/uid")
+        first_status = manager.status()
+        self.assertEqual(first_status["datastore_retry_delay_s"], 1.0)
+        self.assertEqual(first_status["datastore_next_retry_in_s"], 1.0)
+
+        clock.advance(1.0)
+        with self.assertRaises(DatastoreDeviceUnavailable):
+            manager.get("/datastore/uid")
+        second_status = manager.status()
+        self.assertEqual(second_status["datastore_retry_delay_s"], 2.0)
+        self.assertEqual(second_status["datastore_next_retry_in_s"], 2.0)
 
     def test_non_reconnectable_open_failure_uses_configuration_backoff(self) -> None:
         clock = ManualClock()

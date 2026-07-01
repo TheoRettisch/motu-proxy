@@ -741,6 +741,7 @@ class ManagedDatastore:
         self._reconnect_state = "unavailable"
         self._last_reconnect_error: Exception | None = None
         self._retry_delay_s = self._initial_delay_s
+        self._scheduled_retry_delay_s = self._initial_delay_s
         self._next_retry_at = 0.0
         self._closed = False
         self._last_response_stats: ResponseStats | None = None
@@ -794,7 +795,7 @@ class ManagedDatastore:
             retry_delay_s = (
                 self._configuration_error_retry_delay_s
                 if self._reconnect_state == "configuration_error"
-                else self._retry_delay_s
+                else self._scheduled_retry_delay_s
             )
             return {
                 "datastore_available": available,
@@ -863,6 +864,7 @@ class ManagedDatastore:
             self._reconnect_state = "available"
             self._last_reconnect_error = None
             self._retry_delay_s = self._initial_delay_s
+            self._scheduled_retry_delay_s = self._initial_delay_s
             self._next_retry_at = now
             return datastore
 
@@ -890,11 +892,13 @@ class ManagedDatastore:
     def _schedule_retry_locked(self, now: float) -> None:
         delay = self._retry_delay_s
         self._next_retry_at = now + delay
+        self._scheduled_retry_delay_s = delay
         self._retry_delay_s = min(self._max_delay_s, max(self._initial_delay_s, delay * 2))
         self._reconnect_state = "backoff"
 
     def _schedule_configuration_error_retry_locked(self, now: float) -> None:
         self._next_retry_at = now + self._configuration_error_retry_delay_s
+        self._scheduled_retry_delay_s = self._configuration_error_retry_delay_s
         self._reconnect_state = "configuration_error"
 
     def _temporary_unavailable(self) -> DatastoreDeviceUnavailable:

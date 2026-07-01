@@ -1,6 +1,7 @@
 import ctypes
 import errno
 import importlib
+import os
 import time
 from pathlib import Path
 from unittest import TestCase
@@ -107,17 +108,9 @@ class UsbFsTransportTests(TestCase):
             read.read()
         self.assertEqual(raised.exception.errno, errno.ENODEV)
 
-    def test_cancellable_reap_uses_coarse_wait_between_empty_polls(self) -> None:
+    def test_cancellable_reap_polls_usbfs_fd_until_reapable(self) -> None:
         read = usbfs.UsbFsCancellableBulkRead(77, 0x83, 64, None)
-        waits: list[float | None] = []
-
-        class RecordingEvent:
-            def wait(self, timeout: float | None = None) -> bool:
-                waits.append(timeout)
-                return False
-
-            def set(self) -> None:
-                return None
+        poll_timeouts: list[int | None] = []
 
         calls = 0
 
@@ -131,11 +124,17 @@ class UsbFsTransportTests(TestCase):
             ctypes.cast(arg, ctypes.POINTER(ctypes.c_void_p)).contents.value = ctypes.addressof(read._urb)
             return 0
 
-        read._cancel_event = RecordingEvent()
+        def poll_reap_ready(timeout_ms: int | None) -> None:
+            poll_timeouts.append(timeout_ms)
+
+        read._poll_reap_ready = poll_reap_ready
         with patch("motu_proxy.transports.usbfs._ioctl", side_effect=ioctl):
             read._reap(time.monotonic() + 10)
 
-        self.assertEqual(waits, [usbfs.DEFAULT_CANCELLABLE_REAP_POLL_INTERVAL_S])
+        self.assertEqual(len(poll_timeouts), 1)
+        assert poll_timeouts[0] is not None
+        self.assertGreaterEqual(poll_timeouts[0], 9000)
+        self.assertLessEqual(poll_timeouts[0], 10000)
         self.assertEqual(calls, 2)
 
     def test_cancellable_reap_blocks_for_cancel_completion_without_idle_wait(self) -> None:
@@ -269,3 +268,14 @@ class UsbFsTransportTests(TestCase):
         read.cancel()
 
         self.assertEqual(wakeups, 1)
+
+    def test_cancellable_cancel_writes_poll_wakeup_pipe(self) -> None:
+        read = usbfs.UsbFsCancellableBulkRead(77, 0x83, 64, None)
+        read._open_cancel_wakeup()
+        assert read._cancel_wakeup_reader is not None
+        try:
+            read.cancel()
+
+            self.assertEqual(os.read(read._cancel_wakeup_reader, 1), b"\x00")
+        finally:
+            read._close_cancel_wakeup()
