@@ -47,8 +47,18 @@ DEFAULT_MAX_IGNORED_PACKETS = 32
 DEFAULT_MAX_RESPONSE_FRAMES = 256
 DEFAULT_POLL_PATH = "/datastore"
 DEFAULT_POLL_READ_TIMEOUT_SLICE_MS = 250
+DEFAULT_FOREGROUND_PREEMPTION_BUDGET_MS = 500
+DEFAULT_DEGRADED_REFRESH_INTERVAL_S = 0.5
 CAPABILITY_SECTIONS = ("avb", "router", "mixer")
 IDENTITY_KEYS = ("uid", "model_name", "firmware_version", "serial_number")
+
+
+class CancellableBulkRead(Protocol):
+    def read(self) -> bytes:
+        ...
+
+    def cancel(self) -> None:
+        ...
 
 
 class Transport(Protocol):
@@ -168,6 +178,10 @@ class MotuUsbDatastore:
         self.last_response_stats: ResponseStats | None = None
         self.last_response_etag: str | None = None
 
+    @property
+    def supports_cancellable_bulk_reads(self) -> bool:
+        return callable(getattr(self.transport, "begin_cancellable_bulk_read", None))
+
     def _next_host_seq(self) -> int:
         return self.host_seq.take()
 
@@ -188,6 +202,8 @@ class MotuUsbDatastore:
         timeout_ms: int = DEFAULT_RESPONSE_TIMEOUT_MS,
         should_cancel: Callable[[], bool] | None = None,
         read_timeout_slice_ms: int | None = None,
+        use_cancellable_read: bool = False,
+        read_started: Callable[[CancellableBulkRead | None], None] | None = None,
     ) -> bytes:
         message_seq = self.message_seq
         frame = build_get_frame(self._next_host_seq(), message_seq, path, etag=etag, client=client)
@@ -198,6 +214,8 @@ class MotuUsbDatastore:
             timeout_ms=timeout_ms,
             should_cancel=should_cancel,
             read_timeout_slice_ms=read_timeout_slice_ms,
+            use_cancellable_read=use_cancellable_read,
+            read_started=read_started,
         )
 
     def post(
@@ -213,9 +231,19 @@ class MotuUsbDatastore:
         self.message_seq += 1
         return self._collect_response(message_seq, timeout_ms=timeout_ms)
 
-    def _read_logical_frame(self, timeout_ms: int | None = None) -> bytes:
+    def _read_logical_frame(
+        self,
+        timeout_ms: int | None = None,
+        use_cancellable_read: bool = False,
+        read_started: Callable[[CancellableBulkRead | None], None] | None = None,
+    ) -> bytes:
         max_chunk = getattr(self.transport, "max_packet_size", DEFAULT_MAX_USB_CHUNK) or DEFAULT_MAX_USB_CHUNK
-        first = self.transport.bulk_read(max_chunk, timeout_ms=timeout_ms)
+        first = self._bulk_read(
+            max_chunk,
+            timeout_ms=timeout_ms,
+            use_cancellable_read=use_cancellable_read,
+            read_started=read_started,
+        )
         if not first:
             return b""
         if len(first) < 4:
@@ -226,7 +254,12 @@ class MotuUsbDatastore:
         chunks = [first]
         got = len(first)
         while got < expected:
-            chunk = self.transport.bulk_read(max_chunk, timeout_ms=timeout_ms)
+            chunk = self._bulk_read(
+                max_chunk,
+                timeout_ms=timeout_ms,
+                use_cancellable_read=use_cancellable_read,
+                read_started=read_started,
+            )
             if not chunk:
                 break
             chunks.append(chunk)
@@ -234,6 +267,29 @@ class MotuUsbDatastore:
         if got < expected:
             raise ShortUsbFrame(f"short USB logical frame: got {got} of {expected} bytes")
         return b"".join(chunks)
+
+    def _bulk_read(
+        self,
+        size: int,
+        timeout_ms: int | None,
+        use_cancellable_read: bool,
+        read_started: Callable[[CancellableBulkRead | None], None] | None,
+    ) -> bytes:
+        if not use_cancellable_read:
+            return self.transport.bulk_read(size, timeout_ms=timeout_ms)
+        begin_read = getattr(self.transport, "begin_cancellable_bulk_read", None)
+        if begin_read is None:
+            raise RuntimeError("transport does not support cancellable bulk reads")
+        read = begin_read(size, timeout_ms=timeout_ms)
+        if read_started is not None:
+            read_started(read)
+        try:
+            return read.read()
+        except InterruptedError as exc:
+            raise DatastoreCancelled("cancellable datastore read cancelled") from exc
+        finally:
+            if read_started is not None:
+                read_started(None)
 
     def _collect_response(
         self,
@@ -245,6 +301,8 @@ class MotuUsbDatastore:
         max_response_frames: int = DEFAULT_MAX_RESPONSE_FRAMES,
         should_cancel: Callable[[], bool] | None = None,
         read_timeout_slice_ms: int | None = None,
+        use_cancellable_read: bool = False,
+        read_started: Callable[[CancellableBulkRead | None], None] | None = None,
     ) -> bytes:
         self.last_response_stats = None
         self.last_response_etag = None
@@ -319,7 +377,23 @@ class MotuUsbDatastore:
             read_timeout_ms = max(1, int((deadline - now) * 1000))
             if read_timeout_slice_ms is not None:
                 read_timeout_ms = min(read_timeout_ms, max(1, read_timeout_slice_ms))
-            packet = self._read_logical_frame(timeout_ms=read_timeout_ms)
+            try:
+                packet = self._read_logical_frame(
+                    timeout_ms=read_timeout_ms,
+                    use_cancellable_read=use_cancellable_read,
+                    read_started=read_started,
+                )
+            except DatastoreCancelled:
+                self._record_response_stats(
+                    timeout_ms,
+                    started,
+                    reads,
+                    len(frames),
+                    ignored_packets,
+                    ack_packets,
+                    total,
+                )
+                raise
             reads += 1
             if not packet:
                 if read_timeout_slice_ms is not None and time.monotonic() < deadline:
@@ -549,6 +623,8 @@ class DatastoreCoordinator:
         history_size: int = DEFAULT_ETAG_HISTORY_SIZE,
         poll_interval_s: float = 0.05,
         poll_read_timeout_slice_ms: int = DEFAULT_POLL_READ_TIMEOUT_SLICE_MS,
+        foreground_preemption_budget_ms: int = DEFAULT_FOREGROUND_PREEMPTION_BUDGET_MS,
+        degraded_refresh_interval_s: float = DEFAULT_DEGRADED_REFRESH_INTERVAL_S,
     ) -> None:
         self.datastore = datastore
         self.poll_path = poll_path
@@ -556,14 +632,28 @@ class DatastoreCoordinator:
         self.http_wait_timeout_ms = http_wait_timeout_ms
         self.poll_interval_s = poll_interval_s
         self.poll_read_timeout_slice_ms = poll_read_timeout_slice_ms
+        self.foreground_preemption_budget_ms = foreground_preemption_budget_ms
+        self.degraded_refresh_interval_s = degraded_refresh_interval_s
+        self.foreground_preemptive_native_long_poll_available = bool(
+            getattr(datastore, "supports_cancellable_bulk_reads", False)
+        )
         self._condition = threading.Condition()
         self._io_busy = False
+        self._io_owner: str | None = None
         self._foreground_waiters = 0
+        self._active_poll_read: CancellableBulkRead | None = None
+        self._active_poll_cancel_requested = False
         self._history: deque[DatastoreTransition] = deque(maxlen=history_size)
         self._latest_etag: str | None = None
         self._closed = False
         self._worker: threading.Thread | None = None
         self.last_poller_error: Exception | None = None
+
+    @property
+    def long_poll_mode(self) -> str:
+        if self.foreground_preemptive_native_long_poll_available:
+            return "native-preemptive"
+        return "degraded-refresh"
 
     @property
     def latest_etag(self) -> str | None:
@@ -577,6 +667,8 @@ class DatastoreCoordinator:
 
     def start(self) -> None:
         with self._condition:
+            if not self.foreground_preemptive_native_long_poll_available:
+                return
             if self._worker is not None:
                 return
             self._worker = threading.Thread(
@@ -589,8 +681,11 @@ class DatastoreCoordinator:
     def close(self, timeout: float | None = None) -> None:
         with self._condition:
             self._closed = True
+            active_poll_read = self._request_active_poll_cancel_locked()
             self._condition.notify_all()
             worker = self._worker
+        if active_poll_read is not None:
+            active_poll_read.cancel()
         if worker is not None and worker is not threading.current_thread():
             worker.join(timeout=timeout)
 
@@ -647,7 +742,10 @@ class DatastoreCoordinator:
     ) -> DatastorePayload:
         deadline = time.monotonic() + (self.http_wait_timeout_ms / 1000)
         client_id = _client_string(client)
+        next_degraded_refresh = 0.0
         while True:
+            refresh_poll_path = False
+            refresh_timeout_ms = DEFAULT_RESPONSE_TIMEOUT_MS
             with self._condition:
                 transition, should_refresh = self._find_wait_outcome_locked(etag, client_id)
                 if transition is not None:
@@ -659,7 +757,25 @@ class DatastoreCoordinator:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0 or self._closed:
                     return DatastorePayload(b"", etag=etag, not_modified=True)
-                self._condition.wait(remaining)
+                if not self.foreground_preemptive_native_long_poll_available:
+                    now = time.monotonic()
+                    if now >= next_degraded_refresh:
+                        next_degraded_refresh = now + self.degraded_refresh_interval_s
+                        refresh_timeout_ms = max(1, int(remaining * 1000))
+                        refresh_poll_path = True
+                    else:
+                        self._condition.wait(min(remaining, max(0.001, next_degraded_refresh - now)))
+                    if not refresh_poll_path:
+                        continue
+                else:
+                    self._condition.wait(remaining)
+                    continue
+            if refresh_poll_path:
+                try:
+                    self.read(self.poll_path, etag="0", client=None, timeout_ms=refresh_timeout_ms)
+                except (DatastoreNoResponse, DatastoreTimeout) as exc:
+                    self.last_poller_error = exc
+                    continue
         return self.read(path, etag="0", client=client)
 
     def _poll_loop(self) -> None:
@@ -677,7 +793,9 @@ class DatastoreCoordinator:
                         etag=etag,
                         timeout_ms=self.long_poll_timeout_ms,
                         should_cancel=self._is_closed,
-                        read_timeout_slice_ms=self.poll_read_timeout_slice_ms,
+                        read_timeout_slice_ms=None,
+                        use_cancellable_read=True,
+                        read_started=self._set_active_poll_read,
                     )
                     payload = self._payload_from_response(response)
                 finally:
@@ -687,7 +805,7 @@ class DatastoreCoordinator:
             except DatastoreCancelled as exc:
                 if self._is_closed():
                     return
-                self.last_poller_error = exc
+                self.last_poller_error = None
             except (DatastoreNoResponse, DatastoreTimeout) as exc:
                 self.last_poller_error = exc
             except Exception as exc:
@@ -715,10 +833,27 @@ class DatastoreCoordinator:
         with self._condition:
             self._foreground_waiters += 1
             self._condition.notify_all()
+            preemption_deadline: float | None = None
             try:
                 while self._io_busy:
-                    self._condition.wait()
+                    wait_timeout: float | None = None
+                    if self._io_owner == "poller":
+                        active_poll_read = self._request_active_poll_cancel_locked()
+                        if active_poll_read is not None:
+                            active_poll_read.cancel()
+                            if preemption_deadline is None:
+                                preemption_deadline = (
+                                    time.monotonic() + (self.foreground_preemption_budget_ms / 1000)
+                                )
+                        if preemption_deadline is not None:
+                            wait_timeout = preemption_deadline - time.monotonic()
+                            if wait_timeout <= 0:
+                                raise DatastoreTimeout(
+                                    "foreground preemption budget exceeded while cancelling active long-poll read"
+                                )
+                    self._condition.wait(wait_timeout)
                 self._io_busy = True
+                self._io_owner = "foreground"
             finally:
                 self._foreground_waiters -= 1
                 self._condition.notify_all()
@@ -732,12 +867,33 @@ class DatastoreCoordinator:
             if self._closed:
                 return False
             self._io_busy = True
+            self._io_owner = "poller"
             return True
 
     def _release_io(self) -> None:
         with self._condition:
             self._io_busy = False
+            self._io_owner = None
+            self._active_poll_read = None
+            self._active_poll_cancel_requested = False
             self._condition.notify_all()
+
+    def _set_active_poll_read(self, read: CancellableBulkRead | None) -> None:
+        active_poll_read: CancellableBulkRead | None = None
+        with self._condition:
+            self._active_poll_read = read
+            self._active_poll_cancel_requested = False
+            if read is not None and self._foreground_waiters > 0:
+                active_poll_read = self._request_active_poll_cancel_locked()
+            self._condition.notify_all()
+        if active_poll_read is not None:
+            active_poll_read.cancel()
+
+    def _request_active_poll_cancel_locked(self) -> CancellableBulkRead | None:
+        if self._active_poll_read is None or self._active_poll_cancel_requested:
+            return None
+        self._active_poll_cancel_requested = True
+        return self._active_poll_read
 
     def _payload_from_response(self, response: bytes) -> DatastorePayload:
         payload = datastore_payload(response)

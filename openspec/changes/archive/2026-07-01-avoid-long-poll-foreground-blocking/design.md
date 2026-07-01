@@ -27,7 +27,9 @@ The hard part is not noticing that a foreground operation is waiting; it is safe
 
 The coordinator should be able to ask the active poll read to stop when a foreground operation is queued. The poller acknowledges cancellation, cleans up any read completion state, and releases coordinator ownership before the foreground request is sent.
 
-For the Linux usbfs transport, the preferred implementation is an explicit cancellable bulk-read operation for long-poll reads. Candidate approaches include asynchronous usbfs URBs with discard/reap semantics, or another Linux-supported cancellation mechanism that guarantees the coordinator knows whether the poll read produced a response or was cancelled before the foreground request proceeds.
+For the Linux usbfs transport, the selected implementation is an explicit cancellable bulk-read operation for long-poll reads using asynchronous usbfs bulk URBs. The poller submits the bulk IN read with `USBDEVFS_SUBMITURB`, and foreground preemption calls `USBDEVFS_DISCARDURB` on the active URB before the poller reaps the completion through `USBDEVFS_REAPURB`/`USBDEVFS_REAPURBNDELAY`. Ordinary datastore reads and writes continue to use the existing synchronous `USBDEVFS_BULK` path.
+
+This primitive gives the coordinator a bounded hand-off point: a discarded URB is either reaped as cancelled, or it has already completed with a poll response that the poller can publish before releasing the USB owner. If a host transport does not expose this cancellable read abstraction, the coordinator selects degraded refresh mode and does not start native-hold background polling.
 
 Alternative considered: reduce the poller's timeout to 1-2 seconds. Rejected as the primary design because the device-side hold can still complete after the host-side timeout. Without a robust stale-response quarantine, the late response can be mistaken for a later request or corrupt message sequencing.
 
@@ -39,13 +41,13 @@ Alternative considered: let foreground operations open a separate USB session. R
 
 ### Use a configured foreground preemption budget
 
-The initial foreground preemption budget is 500 ms, measured from the coordinator registering a foreground waiter while the poller is inside a native long-poll read to either submitting the foreground USB request or entering/reporting explicit degraded behavior. This budget is intentionally far below the 15-16 second native hold window and should be represented as a coordinator configuration value or constant so unit tests and live validation share the same threshold.
+The initial foreground preemption budget is 500 ms, measured from the coordinator registering a foreground waiter while the poller is inside a native long-poll read to either submitting the foreground USB request or entering/reporting explicit degraded behavior. This budget is intentionally far below the 15-16 second native hold window and is represented as a coordinator configuration value so unit tests and live validation share the same threshold.
 
 The budget applies to dispatch/preemption latency, not the device's normal response body latency after the foreground request is sent. Existing response timeouts continue to govern response collection once the foreground request is on the USB pipe.
 
 ### Quarantine or discard cancelled-poll completions by sequence
 
-If the cancellation path can still surface a poll response, the coordinator must either publish it as a valid poll change before the foreground operation starts, or discard it as belonging to the cancelled poll epoch. Later foreground response collection must not raise on or consume a stale poll reply as if it belonged to the foreground request.
+If the cancellation path can still surface a poll response, the coordinator must either publish it as a valid poll change before the foreground operation starts, or discard it as belonging to the cancelled poll epoch. Later foreground response collection must not raise on or consume a stale poll reply as if it belonged to the foreground request. Response collection already filters mismatched MOTU message sequence values; cancelled poll completions keep relying on that sequence quarantine when a late packet is drained by the foreground collector.
 
 ### Use refresh-based degraded mode for unsupported transports
 
@@ -68,8 +70,12 @@ HTTP long-poll callers remain local waiters. The coordinator satisfies them from
 4. Preserve refresh-based degraded mode for hosts without cancellation support.
 5. Validate against the live MOTU 624 with an active held long-poll, prompt foreground write/read, and resumed long-poll changes.
 
+## Live Characterization
+
+On 2026-07-01, the Linux usbfs async URB path was validated against the live MOTU 624 at `10.0.8.104` (`07fd:0005`, serial `0001f2fffe00c719`). The validator held a native `/datastore` long-poll, preempted it with three foreground `/datastore/uid` reads, and then preempted it with an idempotent foreground write to `/datastore/host/os` using body `{"value":"win"}`.
+
+Observed foreground dispatch latency stayed well below the configured 500 ms budget: max read dispatch was 2.4 ms, and the idempotent write dispatched in 1.7 ms. The background `/datastore` poller resumed after each foreground operation. Three repeated preemption cycles returned the expected UID without stale cancelled-poll responses corrupting foreground collection. The existing live response-frame validator also passed afterward with `PASS: paths=3 frames=58`.
+
 ## Open Questions
 
-- Which usbfs cancellation primitive behaves best with this device: async URB discard/reap, closing/reopening the fd, or another kernel-supported path?
-- Does a cancelled native long-poll produce a later device reply that must be drained, or does the device fully abandon it?
 - Should the 500 ms default foreground preemption budget be tuned after live MOTU validation?

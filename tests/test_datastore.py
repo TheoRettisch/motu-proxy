@@ -12,7 +12,7 @@ from motu_proxy.datastore import (
     read_device_capability_info,
 )
 from motu_proxy.parser import DatastorePayload
-from motu_proxy.protocol import build_get_frame, build_post_frame
+from motu_proxy.protocol import build_ack, build_get_frame, build_post_frame
 
 from tests.helpers import response_packet
 
@@ -44,6 +44,8 @@ class BlockingTransport:
         self.reads = list(reads or [])
         self.writes: list[bytes] = []
         self.read_timeouts: list[int | None] = []
+        self.cancellable_read_timeouts: list[int | None] = []
+        self.cancelled_reads = 0
         self._condition = threading.Condition()
 
     def bulk_write(self, data: bytes) -> int:
@@ -66,6 +68,16 @@ class BlockingTransport:
                 self._condition.wait(remaining)
             return self.reads.pop(0)
 
+    def begin_cancellable_bulk_read(
+        self,
+        size: int | None = None,
+        timeout_ms: int | None = None,
+    ) -> "BlockingCancellableRead":
+        with self._condition:
+            self.cancellable_read_timeouts.append(timeout_ms)
+            self._condition.notify_all()
+        return BlockingCancellableRead(self, timeout_ms)
+
     def push(self, *packets: bytes) -> None:
         with self._condition:
             self.reads.extend(packets)
@@ -80,6 +92,45 @@ class BlockingTransport:
                     return False
                 self._condition.wait(remaining)
             return True
+
+    def wait_for_cancellable_reads(self, count: int, timeout: float = 1.0) -> bool:
+        deadline = time.monotonic() + timeout
+        with self._condition:
+            while len(self.cancellable_read_timeouts) < count:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self._condition.wait(remaining)
+            return True
+
+
+class BlockingCancellableRead:
+    def __init__(self, transport: BlockingTransport, timeout_ms: int | None) -> None:
+        self.transport = transport
+        self.timeout_ms = timeout_ms
+        self.cancelled = False
+
+    def read(self) -> bytes:
+        deadline = None if self.timeout_ms is None else time.monotonic() + (self.timeout_ms / 1000)
+        with self.transport._condition:
+            while not self.transport.reads and not self.cancelled:
+                if deadline is None:
+                    self.transport._condition.wait()
+                    continue
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return b""
+                self.transport._condition.wait(remaining)
+            if self.cancelled:
+                raise InterruptedError("fake USB read cancelled")
+            return self.transport.reads.pop(0)
+
+    def cancel(self) -> None:
+        with self.transport._condition:
+            if not self.cancelled:
+                self.cancelled = True
+                self.transport.cancelled_reads += 1
+            self.transport._condition.notify_all()
 
 
 class SizeCheckingTransport(FakeTransport):
@@ -412,12 +463,8 @@ class DatastoreCoordinatorTests(TestCase):
         self.assertEqual(other.body, b'{"own":true}')
         self.assertEqual(other.etag, "2")
 
-    def test_ordinary_read_serializes_behind_active_poller(self) -> None:
+    def test_foreground_read_preempts_active_held_poll_within_budget(self) -> None:
         initial = response_packet(b'HTTP/1.1 200 OK\r\nETag: 1\r\n\r\n{"state":1}')
-        no_change = response_packet(
-            b'HTTP/1.1 304 Not Modified\r\nETag: 1\r\n\r\n',
-            message_seq=3,
-        )
         read_response = response_packet(
             b'HTTP/1.1 200 OK\r\nETag: 1\r\n\r\n{"value":"ok"}',
             message_seq=4,
@@ -425,27 +472,129 @@ class DatastoreCoordinatorTests(TestCase):
         transport = BlockingTransport([initial])
         coordinator = DatastoreCoordinator(
             MotuUsbDatastore(transport),
-            long_poll_timeout_ms=500,
+            long_poll_timeout_ms=5000,
             http_wait_timeout_ms=1000,
-            poll_interval_s=0.2,
+            poll_interval_s=1,
+            foreground_preemption_budget_ms=250,
         )
         try:
             coordinator.read("/datastore")
             coordinator.start()
             self.assertTrue(transport.wait_for_writes(3))
+            self.assertTrue(transport.wait_for_cancellable_reads(1))
 
             results: list[DatastorePayload] = []
             thread = threading.Thread(target=lambda: results.append(coordinator.read("/datastore/uid")))
+            started = time.monotonic()
             thread.start()
-            time.sleep(0.02)
-            self.assertEqual(results, [])
 
-            transport.push(no_change)
-            self.assertTrue(transport.wait_for_writes(5))
+            self.assertTrue(transport.wait_for_writes(4, timeout=0.25))
+            dispatch_elapsed = time.monotonic() - started
+            self.assertLess(dispatch_elapsed, 0.25)
+            self.assertEqual(transport.cancelled_reads, 1)
+            self.assertEqual(
+                transport.writes[3],
+                build_get_frame(0x23, 4, "/datastore/uid"),
+            )
             transport.push(read_response)
             thread.join(timeout=1)
 
             self.assertEqual([result.body for result in results], [b'{"value":"ok"}'])
+        finally:
+            coordinator.close()
+
+    def test_foreground_write_preempts_active_poll_and_publishes_refresh(self) -> None:
+        initial = response_packet(b'HTTP/1.1 200 OK\r\nETag: 1\r\n\r\n{"state":1}')
+        post_response = response_packet(
+            b'HTTP/1.1 200 OK\r\nETag: 2\r\n\r\n{"post":true}',
+            message_seq=4,
+        )
+        refresh_response = response_packet(
+            b'HTTP/1.1 200 OK\r\nETag: 2\r\n\r\n{"full":true}',
+            message_seq=5,
+        )
+        transport = BlockingTransport([initial])
+        coordinator = DatastoreCoordinator(
+            MotuUsbDatastore(transport),
+            long_poll_timeout_ms=5000,
+            http_wait_timeout_ms=1000,
+            poll_interval_s=1,
+            foreground_preemption_budget_ms=250,
+        )
+        try:
+            coordinator.read("/datastore")
+            coordinator.start()
+            self.assertTrue(transport.wait_for_writes(3))
+            self.assertTrue(transport.wait_for_cancellable_reads(1))
+
+            waiter_results: list[DatastorePayload] = []
+            waiter = threading.Thread(
+                target=lambda: waiter_results.append(
+                    coordinator.wait_for_change("/datastore", "1", client="8")
+                )
+            )
+            waiter.start()
+
+            post_results: list[DatastorePayload] = []
+            post = threading.Thread(
+                target=lambda: post_results.append(
+                    coordinator.post("/datastore/host/os", '{"value":"linux"}', client="7")
+                )
+            )
+            post.start()
+            self.assertTrue(transport.wait_for_writes(4, timeout=0.25))
+            self.assertEqual(
+                transport.writes[3],
+                build_post_frame(0x23, 4, "/datastore/host/os", '{"value":"linux"}', client="7"),
+            )
+
+            transport.push(post_response, refresh_response)
+            post.join(timeout=1)
+            waiter.join(timeout=1)
+
+            self.assertEqual([result.body for result in post_results], [b'{"post":true}'])
+            self.assertEqual([result.body for result in waiter_results], [b'{"full":true}'])
+            self.assertEqual([result.etag for result in waiter_results], ["2"])
+        finally:
+            coordinator.close()
+
+    def test_cancelled_poll_response_is_quarantined_from_foreground_response(self) -> None:
+        initial = response_packet(b'HTTP/1.1 200 OK\r\nETag: 1\r\n\r\n{"state":1}')
+        stale_poll = response_packet(
+            b'HTTP/1.1 200 OK\r\nETag: 2\r\n\r\n{"stale":true}',
+            message_seq=3,
+        )
+        read_response = response_packet(
+            b'HTTP/1.1 200 OK\r\nETag: uid\r\n\r\n{"value":"ok"}',
+            message_seq=4,
+        )
+        transport = BlockingTransport([initial])
+        datastore = MotuUsbDatastore(transport)
+        coordinator = DatastoreCoordinator(
+            datastore,
+            long_poll_timeout_ms=5000,
+            http_wait_timeout_ms=1000,
+            poll_interval_s=1,
+        )
+        try:
+            coordinator.read("/datastore")
+            coordinator.start()
+            self.assertTrue(transport.wait_for_writes(3))
+            self.assertTrue(transport.wait_for_cancellable_reads(1))
+
+            results: list[DatastorePayload] = []
+            thread = threading.Thread(target=lambda: results.append(coordinator.read("/datastore/uid")))
+            thread.start()
+            self.assertTrue(transport.wait_for_writes(4, timeout=0.25))
+
+            transport.push(stale_poll, read_response)
+            thread.join(timeout=1)
+
+            self.assertEqual([result.body for result in results], [b'{"value":"ok"}'])
+            self.assertEqual(coordinator.latest_etag, "1")
+            self.assertGreaterEqual(len(transport.writes), 6)
+            self.assertEqual(transport.writes[4], build_ack(0x24))
+            self.assertEqual(transport.writes[5], build_ack(0x25))
         finally:
             coordinator.close()
 
@@ -460,14 +609,7 @@ class DatastoreCoordinatorTests(TestCase):
         coordinator.start()
         try:
             self.assertTrue(transport.wait_for_writes(1))
-            deadline = time.monotonic() + 1
-            while time.monotonic() < deadline:
-                with transport._condition:
-                    if transport.read_timeouts:
-                        break
-                time.sleep(0.005)
-            else:
-                self.fail("poller did not block in a USB read")
+            self.assertTrue(transport.wait_for_cancellable_reads(1))
 
             started = time.monotonic()
             coordinator.close()
@@ -479,20 +621,20 @@ class DatastoreCoordinatorTests(TestCase):
         finally:
             coordinator.close()
 
-    def test_poller_yields_to_waiting_foreground_read_between_cycles(self) -> None:
+    def test_local_long_poll_waiters_continue_after_preempted_foreground_read(self) -> None:
         initial = response_packet(b'HTTP/1.1 200 OK\r\nETag: 1\r\n\r\n{"state":1}')
-        no_change = response_packet(
-            b'HTTP/1.1 304 Not Modified\r\nETag: 1\r\n\r\n',
-            message_seq=3,
-        )
         read_response = response_packet(
             b'HTTP/1.1 200 OK\r\nETag: 1\r\n\r\n{"value":"ok"}',
             message_seq=4,
         )
+        changed = response_packet(
+            b'HTTP/1.1 200 OK\r\nETag: 2\r\n\r\n{"changed":true}',
+            message_seq=5,
+        )
         transport = BlockingTransport([initial])
         coordinator = DatastoreCoordinator(
             MotuUsbDatastore(transport),
-            long_poll_timeout_ms=500,
+            long_poll_timeout_ms=5000,
             http_wait_timeout_ms=1000,
             poll_interval_s=0,
         )
@@ -500,28 +642,67 @@ class DatastoreCoordinatorTests(TestCase):
             coordinator.read("/datastore")
             coordinator.start()
             self.assertTrue(transport.wait_for_writes(3))
+            self.assertTrue(transport.wait_for_cancellable_reads(1))
 
-            results: list[DatastorePayload] = []
-            thread = threading.Thread(target=lambda: results.append(coordinator.read("/datastore/uid")))
-            thread.start()
-            deadline = time.monotonic() + 1
-            while time.monotonic() < deadline:
-                with coordinator._condition:
-                    if coordinator._foreground_waiters > 0:
-                        break
-                time.sleep(0.005)
-            else:
-                self.fail("foreground read did not queue behind active poller")
-
-            transport.push(no_change)
-            self.assertTrue(transport.wait_for_writes(5))
-            self.assertEqual(
-                transport.writes[4],
-                build_get_frame(0x24, 4, "/datastore/uid"),
+            foreground_results: list[DatastorePayload] = []
+            thread = threading.Thread(
+                target=lambda: foreground_results.append(coordinator.read("/datastore/uid"))
             )
+            thread.start()
+            self.assertTrue(transport.wait_for_writes(4, timeout=0.25))
             transport.push(read_response)
             thread.join(timeout=1)
+            self.assertEqual([result.body for result in foreground_results], [b'{"value":"ok"}'])
 
-            self.assertEqual([result.body for result in results], [b'{"value":"ok"}'])
+            self.assertTrue(transport.wait_for_writes(6))
+            self.assertEqual(
+                transport.writes[5],
+                build_get_frame(0x25, 5, "/datastore", etag="1"),
+            )
+
+            waiter_results: list[DatastorePayload] = []
+            waiter = threading.Thread(
+                target=lambda: waiter_results.append(coordinator.wait_for_change("/datastore", "1"))
+            )
+            waiter.start()
+            transport.push(changed)
+            waiter.join(timeout=1)
+
+            self.assertEqual([result.body for result in waiter_results], [b'{"changed":true}'])
+            self.assertEqual([result.etag for result in waiter_results], ["2"])
         finally:
             coordinator.close()
+
+    def test_unsupported_transport_uses_degraded_refresh_mode(self) -> None:
+        transport = FakeTransport(
+            [
+                response_packet(b'HTTP/1.1 200 OK\r\nETag: 1\r\n\r\n{"state":1}'),
+                response_packet(
+                    b'HTTP/1.1 200 OK\r\nETag: 2\r\n\r\n{"changed":true}',
+                    message_seq=3,
+                ),
+            ]
+        )
+        coordinator = DatastoreCoordinator(
+            MotuUsbDatastore(transport),
+            http_wait_timeout_ms=100,
+            degraded_refresh_interval_s=0,
+        )
+
+        self.assertFalse(coordinator.foreground_preemptive_native_long_poll_available)
+        self.assertEqual(coordinator.long_poll_mode, "degraded-refresh")
+        coordinator.start()
+        self.assertIsNone(coordinator._worker)
+
+        result = coordinator.wait_for_change("/datastore", "1")
+
+        self.assertEqual(result.body, b'{"changed":true}')
+        self.assertEqual(result.etag, "2")
+        self.assertEqual(
+            transport.writes[0],
+            build_get_frame(0x20, 2, "/datastore"),
+        )
+        self.assertEqual(
+            transport.writes[2],
+            build_get_frame(0x22, 3, "/datastore"),
+        )
