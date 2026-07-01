@@ -15,6 +15,7 @@ from motu_proxy.http_server import (
     MotuProxyHandler,
     MotuProxyServer,
     RequestBodyTooLarge,
+    RequestBodyTimeout,
     WriteTokenRequired,
     WritesDisabled,
     dispatch_datastore_request,
@@ -52,6 +53,24 @@ class TrackingBody(BytesIO):
     def read(self, *args, **kwargs):
         self.reads += 1
         return super().read(*args, **kwargs)
+
+
+class TimeoutBody:
+    def read(self, *args, **kwargs):
+        raise TimeoutError("client stalled")
+
+
+class RecordingConnection:
+    def __init__(self, timeout: float | None = None) -> None:
+        self.timeout = timeout
+        self.timeouts: list[float | None] = []
+
+    def gettimeout(self) -> float | None:
+        return self.timeout
+
+    def settimeout(self, timeout: float | None) -> None:
+        self.timeout = timeout
+        self.timeouts.append(timeout)
 
 
 class HttpServerTests(TestCase):
@@ -644,16 +663,27 @@ class HttpServerTests(TestCase):
 
 
 class HttpHandlerTests(TestCase):
-    def make_handler(self, headers=None, body: bytes = b"", dispatcher=None, max_write_body_bytes: int = 64 * 1024):
+    def make_handler(
+        self,
+        headers=None,
+        body: bytes = b"",
+        dispatcher=None,
+        max_write_body_bytes: int = 64 * 1024,
+        write_body_read_timeout_s: float | None = 5.0,
+        connection=None,
+    ):
         handler = object.__new__(MotuProxyHandler)
         handler.headers = headers or {}
         handler.rfile = body if hasattr(body, "read") else BytesIO(body)
         handler.wfile = BytesIO()
         handler.path = "/datastore"
+        handler.connection = connection
+        handler.close_connection = False
         handler.server = SimpleNamespace(
             debug=False,
             dispatcher=dispatcher,
             max_write_body_bytes=max_write_body_bytes,
+            write_body_read_timeout_s=write_body_read_timeout_s,
         )
         handler.statuses = []
         handler.sent_headers = []
@@ -721,6 +751,7 @@ class HttpHandlerTests(TestCase):
         handler.handle_datastore_request("POST")
         self.assertEqual(handler.statuses, [403])
         self.assertIn(("Content-Type", "application/json"), handler.sent_headers)
+        self.assertIn(("Connection", "close"), handler.sent_headers)
         self.assertIn("valid write token required", json.loads(handler.wfile.getvalue().decode("utf-8"))["error"])
 
     def test_handler_rejects_unsafe_writes_before_reading_body(self) -> None:
@@ -826,6 +857,30 @@ class HttpHandlerTests(TestCase):
         handler = self.make_handler({"Content-Length": "5", WRITE_TOKEN_HEADER: WRITE_TOKEN}, b"12345", max_write_body_bytes=4)
         with self.assertRaises(RequestBodyTooLarge):
             handler.read_raw_body()
+
+    def test_handler_rejects_chunked_write_body(self) -> None:
+        handler = self.make_handler({"Transfer-Encoding": "chunked", WRITE_TOKEN_HEADER: WRITE_TOKEN}, b"")
+        with self.assertRaisesRegex(BadRequest, "Transfer-Encoding"):
+            handler.read_raw_body()
+
+    def test_handler_times_out_stalled_write_body_and_restores_socket_timeout(self) -> None:
+        connection = RecordingConnection(timeout=None)
+        handler = self.make_handler(
+            {"Content-Length": "17", WRITE_TOKEN_HEADER: WRITE_TOKEN},
+            TimeoutBody(),
+            write_body_read_timeout_s=1.25,
+            connection=connection,
+        )
+        with self.assertRaisesRegex(RequestBodyTimeout, "timed out"):
+            handler.read_raw_body()
+        self.assertTrue(handler.close_connection)
+        self.assertEqual(connection.timeouts, [1.25, None])
+
+    def test_handler_rejects_short_write_body(self) -> None:
+        handler = self.make_handler({"Content-Length": "17", WRITE_TOKEN_HEADER: WRITE_TOKEN}, b"{}")
+        with self.assertRaisesRegex(BadRequest, "Content-Length"):
+            handler.read_raw_body()
+        self.assertTrue(handler.close_connection)
 
     def test_handler_rejects_invalid_utf8_write_body(self) -> None:
         handler = self.make_handler({"Content-Length": "1"}, b"\xff")

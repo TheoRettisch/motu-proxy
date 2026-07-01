@@ -38,6 +38,7 @@ from .protocol import (
     build_get_frame,
     build_post_frame,
     crc32,
+    validate_host_seq,
 )
 from .schema import validate_datastore_write
 
@@ -48,6 +49,7 @@ DEFAULT_SMOKE_PATHS = ("/datastore/uid", "/datastore/ext/maxUSBToHost", "/datast
 
 def config_from_args(args) -> DatastoreConfig:
     validate_usb_overrides(args.interface, args.ep_out, args.ep_in)
+    validate_host_seq(args.seq_start)
     return DatastoreConfig(
         vid=args.vid,
         pid=args.pid,
@@ -113,6 +115,20 @@ def prepare_write_token(token_file: str | None) -> tuple[str, str | None]:
     path = Path(token_file)
     write_token_file(path, token)
     return token, str(path)
+
+
+def remove_write_token_file(token_file: str | None, token: str | None) -> None:
+    if token_file is None or token is None:
+        return
+    path = Path(token_file)
+    try:
+        if not stat.S_ISREG(os.lstat(path).st_mode):
+            return
+        if path.read_text(encoding="ascii") != f"{token}\n":
+            return
+        path.unlink()
+    except (FileNotFoundError, OSError, UnicodeDecodeError):
+        return
 
 
 def command_info(args) -> int:
@@ -219,13 +235,14 @@ def command_serve(args) -> int:
     config = config_from_args(args)
     validate_serve_write_safety(args.listen, args.allow_writes, args.unsafe_allow_remote_writes)
 
-    write_token, write_token_file_path = (
-        prepare_write_token(args.write_token_file) if args.allow_writes else (None, None)
-    )
     with open_datastore(config) as datastore:
         coordinator = DatastoreCoordinator(datastore)
+        write_token: str | None = None
+        write_token_file_path: str | None = None
         coordinator.start()
         try:
+            if args.allow_writes:
+                write_token, write_token_file_path = prepare_write_token(args.write_token_file)
             server = MotuProxyServer(
                 (args.listen, args.port),
                 args.allow_writes,
@@ -243,6 +260,7 @@ def command_serve(args) -> int:
             return serve(server, before_close=coordinator.close)
         finally:
             coordinator.close()
+            remove_write_token_file(write_token_file_path, write_token)
 
 
 def command_selftest(_args) -> int:

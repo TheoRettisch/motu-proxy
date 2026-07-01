@@ -13,6 +13,7 @@ from motu_proxy.cli import (
     build_parser,
     config_from_args,
     prepare_write_token,
+    remove_write_token_file,
     validate_serve_write_safety,
     write_token_file,
 )
@@ -141,6 +142,11 @@ class CliUsbOverrideTests(TestCase):
         self.assertEqual(config.ep_out, 0x04)
         self.assertEqual(config.ep_in, 0x84)
 
+    def test_invalid_seq_start_is_rejected_before_usb_open(self) -> None:
+        args = build_parser().parse_args(["get", "--seq-start", "0x40"])
+        with self.assertRaisesRegex(RuntimeError, "0x20..0x3f"):
+            config_from_args(args)
+
 
 class CliServeSecurityTests(TestCase):
     def test_serve_write_token_file_defaults_to_run_path(self) -> None:
@@ -181,6 +187,93 @@ class CliServeSecurityTests(TestCase):
             token, token_file = prepare_write_token(str(path))
             self.assertEqual(token_file, str(path))
             self.assertEqual(path.read_text(encoding="ascii"), f"{token}\n")
+
+    def test_remove_write_token_file_only_removes_matching_token(self) -> None:
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "write-token"
+            path.write_text("replacement\n", encoding="ascii")
+            remove_write_token_file(str(path), "original")
+            self.assertEqual(path.read_text(encoding="ascii"), "replacement\n")
+
+            remove_write_token_file(str(path), "replacement")
+            self.assertFalse(path.exists())
+
+    def test_serve_does_not_create_write_token_before_usb_open(self) -> None:
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "write-token"
+            args = build_parser().parse_args(["serve", "--allow-writes", "--write-token-file", str(path)])
+            with patch("motu_proxy.cli.open_datastore", side_effect=RuntimeError("open failed")):
+                with self.assertRaisesRegex(RuntimeError, "open failed"):
+                    args.func(args)
+
+            self.assertFalse(path.exists())
+
+    def test_serve_removes_write_token_file_after_shutdown(self) -> None:
+        datastore = FakeServeDatastore(b'{"value":"ok"}')
+
+        class FakeServer:
+            def __init__(
+                self,
+                server_address,
+                allow_writes,
+                debug,
+                run_get,
+                run_post,
+                write_token=None,
+                write_token_file=None,
+                allow_remote_writes=False,
+                max_write_body_bytes=64 * 1024,
+                serialize_dispatch=True,
+                validate_writes=True,
+                allow_unknown_writes=False,
+            ) -> None:
+                self.server_address = server_address
+                self.allow_writes = allow_writes
+                self.debug = debug
+                self.write_token = write_token
+                self.write_token_file = write_token_file
+                self.allow_remote_writes = allow_remote_writes
+                self.validate_writes = validate_writes
+
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "write-token"
+            args = build_parser().parse_args(["serve", "--allow-writes", "--write-token-file", str(path)])
+
+            def fake_serve(server, before_close=None) -> int:
+                self.assertTrue(path.exists())
+                self.assertEqual(path.read_text(encoding="ascii"), f"{server.write_token}\n")
+                if before_close is not None:
+                    before_close()
+                return 0
+
+            with (
+                patch("motu_proxy.cli.open_datastore", return_value=FakeOpenDatastore(datastore)),
+                patch("motu_proxy.cli.MotuProxyServer", FakeServer),
+                patch("motu_proxy.cli.serve", side_effect=fake_serve),
+            ):
+                result = args.func(args)
+
+            self.assertEqual(result, 0)
+            self.assertFalse(path.exists())
+
+    def test_serve_removes_write_token_file_after_server_startup_failure(self) -> None:
+        datastore = FakeServeDatastore(b'{"value":"ok"}')
+
+        class FailingServer:
+            def __init__(self, *args, **kwargs) -> None:
+                raise RuntimeError("bind failed")
+
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "write-token"
+            args = build_parser().parse_args(["serve", "--allow-writes", "--write-token-file", str(path)])
+            with (
+                patch("motu_proxy.cli.open_datastore", return_value=FakeOpenDatastore(datastore)),
+                patch("motu_proxy.cli.MotuProxyServer", FailingServer),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "bind failed"):
+                    args.func(args)
+
+            self.assertFalse(path.exists())
 
     def test_serve_get_does_not_truncate_raw_concatenated_json_response(self) -> None:
         datastore = FakeServeDatastore(b'{"first":true}{"second":true}')

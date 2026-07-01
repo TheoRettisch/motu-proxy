@@ -5,6 +5,7 @@ from __future__ import annotations
 import hmac
 import ipaddress
 import json
+import socket
 import sys
 import threading
 from dataclasses import dataclass
@@ -33,6 +34,7 @@ WriteLogger = Callable[[str, str, str], None]
 # Keep the default comfortably below the protocol's single-frame u16 limits.
 # Path/client-specific validation below catches exact frame overflows.
 DEFAULT_MAX_WRITE_BODY_BYTES = 60 * 1024
+DEFAULT_WRITE_BODY_READ_TIMEOUT_S = 5.0
 WRITE_TOKEN_HEADER = "X-Motu-Proxy-Token"
 MAX_CLIENT_ID = 0xFFFFFFFF
 
@@ -54,6 +56,10 @@ class WriteTokenRequired(RuntimeError):
 
 
 class RequestBodyTooLarge(RuntimeError):
+    pass
+
+
+class RequestBodyTimeout(RuntimeError):
     pass
 
 
@@ -324,25 +330,40 @@ class MotuProxyHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(body)
         except (WritesDisabled, CrossOriginWrite, HostNotAllowed, WriteTokenRequired, DatastorePermissionError) as exc:
+            self.close_write_connection(method)
             self.send_json_error(403, str(exc))
         except DatastoreValidationError as exc:
+            self.close_write_connection(method)
             self.send_json_error(422, str(exc))
         except RequestBodyTooLarge as exc:
+            self.close_write_connection(method)
             self.send_json_error(413, str(exc))
         except ProtocolFrameTooLarge as exc:
+            self.close_write_connection(method)
             self.send_json_error(413, str(exc))
+        except RequestBodyTimeout as exc:
+            self.close_write_connection(method)
+            self.send_json_error(408, str(exc))
         except (BadRequest, InvalidJsonBody) as exc:
+            self.close_write_connection(method)
             self.send_json_error(400, str(exc))
         except DeviceDiscoveryError as exc:
+            self.close_write_connection(method)
             self.send_backend_error(503, "MOTU USB device is not available", exc)
         except (DatastoreNoResponse, DatastoreTimeout) as exc:
+            self.close_write_connection(method)
             self.send_backend_error(504, "MOTU USB datastore did not respond", exc)
         except (ResponseFrameError, DatastoreResponseLimit, ShortUsbFrame, ShortUsbWrite) as exc:
+            self.close_write_connection(method)
             self.send_backend_error(502, "MOTU USB datastore returned an invalid response", exc)
         except Exception as exc:
+            self.close_write_connection(method)
             self.send_backend_error(502, "MOTU USB datastore request failed", exc)
 
     def read_raw_body(self) -> str:
+        transfer_encoding = self.headers.get("Transfer-Encoding", "")
+        if transfer_encoding and transfer_encoding.lower() != "identity":
+            raise BadRequest("Transfer-Encoding is not supported")
         try:
             length = int(self.headers.get("Content-Length", "0") or "0")
         except ValueError as exc:
@@ -351,10 +372,34 @@ class MotuProxyHandler(BaseHTTPRequestHandler):
             raise BadRequest("invalid Content-Length")
         if length > self.server.max_write_body_bytes:
             raise RequestBodyTooLarge(f"request body exceeds {self.server.max_write_body_bytes} bytes")
+        raw = self._read_exact_body_bytes(length)
+        if len(raw) != length:
+            self.close_connection = True
+            raise BadRequest("request body ended before Content-Length bytes")
         try:
-            return self.rfile.read(length).decode("utf-8", errors="strict")
+            return raw.decode("utf-8", errors="strict")
         except UnicodeDecodeError as exc:
             raise BadRequest("request body must be valid UTF-8") from exc
+
+    def _read_exact_body_bytes(self, length: int) -> bytes:
+        if length == 0:
+            return b""
+        connection = getattr(self, "connection", None)
+        timeout_s = getattr(self.server, "write_body_read_timeout_s", DEFAULT_WRITE_BODY_READ_TIMEOUT_S)
+        previous_timeout = None
+        timeout_was_set = False
+        if connection is not None and timeout_s is not None:
+            previous_timeout = connection.gettimeout()
+            connection.settimeout(timeout_s)
+            timeout_was_set = True
+        try:
+            return self.rfile.read(length)
+        except (TimeoutError, socket.timeout) as exc:
+            self.close_connection = True
+            raise RequestBodyTimeout("request body read timed out") from exc
+        finally:
+            if timeout_was_set:
+                connection.settimeout(previous_timeout)
 
     def read_write_token(self) -> str | None:
         token = self.headers.get(WRITE_TOKEN_HEADER)
@@ -366,11 +411,17 @@ class MotuProxyHandler(BaseHTTPRequestHandler):
             return value.strip()
         return None
 
+    def close_write_connection(self, method: str) -> None:
+        if method != "GET":
+            self.close_connection = True
+
     def send_json_error(self, status: int, message: str) -> None:
         body = json.dumps({"error": message}).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
+        if getattr(self, "close_connection", False):
+            self.send_header("Connection", "close")
         self.end_headers()
         self.wfile.write(body)
 
@@ -397,6 +448,7 @@ class MotuProxyServer(ThreadingHTTPServer):
         write_token_file: str | None = None,
         allow_remote_writes: bool = False,
         max_write_body_bytes: int = DEFAULT_MAX_WRITE_BODY_BYTES,
+        write_body_read_timeout_s: float | None = DEFAULT_WRITE_BODY_READ_TIMEOUT_S,
         serialize_dispatch: bool = True,
         validate_writes: bool = True,
         allow_unknown_writes: bool = False,
@@ -410,6 +462,7 @@ class MotuProxyServer(ThreadingHTTPServer):
         self.validate_writes = validate_writes
         self.allow_unknown_writes = allow_unknown_writes
         self.max_write_body_bytes = max_write_body_bytes
+        self.write_body_read_timeout_s = write_body_read_timeout_s
         self.dispatcher = DatastoreDispatcher(
             allow_writes,
             run_get,

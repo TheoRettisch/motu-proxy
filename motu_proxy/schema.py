@@ -15,6 +15,7 @@ from .paths import normalize_path
 DATASTORE_PREFIX = "/datastore/"
 SEMVER_RE = re.compile(r"^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$")
 SEGMENT_PLACEHOLDER_RE = re.compile(r"<([A-Za-z0-9_]+)>")
+UID_RE = re.compile(r"^[0-9a-fA-F]{16}$")
 PLACEHOLDER_VALUES = {
     "ibank_or_obank": {"ibank", "obank"},
     "input_or_output": {"input", "output"},
@@ -574,6 +575,8 @@ def _placeholder_matches(pattern_segment: str, requested_segment: str) -> bool:
 def _placeholder_value_matches(name: str, requested_segment: str) -> bool:
     if name == "index":
         return requested_segment.isdecimal()
+    if name == "uid":
+        return bool(UID_RE.fullmatch(requested_segment))
     allowed = PLACEHOLDER_VALUES.get(name)
     if allowed is not None:
         return requested_segment in allowed

@@ -18,6 +18,7 @@ DEFAULT_MAX_USB_CHUNK = 512
 
 HOST_SEQ_MIN = 0x20
 HOST_SEQ_COUNT = 0x20
+HOST_SEQ_MAX_EXCLUSIVE = HOST_SEQ_MIN + HOST_SEQ_COUNT
 MAX_U16 = 0xFFFF
 USB_LOGICAL_HEADER_BYTES = 4
 MOTU_FRAME_CONTROL_BYTES = 16
@@ -26,6 +27,10 @@ POST_BODY_PREFIX_BYTES = 12
 
 
 class ProtocolFrameTooLarge(RuntimeError):
+    pass
+
+
+class InvalidHostSequence(RuntimeError):
     pass
 
 
@@ -88,9 +93,17 @@ def next_host_seq(seq: int) -> int:
     return ((seq + 1 - HOST_SEQ_MIN) % HOST_SEQ_COUNT) + HOST_SEQ_MIN
 
 
+def validate_host_seq(seq: int) -> int:
+    if not HOST_SEQ_MIN <= seq < HOST_SEQ_MAX_EXCLUSIVE:
+        raise InvalidHostSequence(
+            f"host sequence must be in range 0x{HOST_SEQ_MIN:02x}..0x{HOST_SEQ_MAX_EXCLUSIVE - 1:02x}"
+        )
+    return seq
+
+
 class HostSequencer:
     def __init__(self, seq_start: int = DEFAULT_SEQ_START) -> None:
-        self._next = seq_start & 0xFF
+        self._next = validate_host_seq(seq_start)
 
     def take(self) -> int:
         seq = self._next

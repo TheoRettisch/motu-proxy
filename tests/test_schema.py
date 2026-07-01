@@ -54,6 +54,9 @@ class DatastoreSchemaTests(TestCase):
             "/datastore/avb/0001f2fffe00c719/entity_name", '{"value":"My 624"}'
         )
         validate_datastore_write(
+            "/datastore/avb/0001F2FFFE00C719/entity_name", '{"value":"My 624"}'
+        )
+        validate_datastore_write(
             "/datastore/avb/0001f2fffe00c719/cfg/0/identify", '{"value":1}'
         )
         validate_datastore_write(
@@ -65,6 +68,13 @@ class DatastoreSchemaTests(TestCase):
             validate_datastore_write(
                 "/datastore/avb/0001f2fffe00c719/cfg/0/identify",
                 '{"value":2}',
+            )
+
+    def test_rejects_malformed_avb_uid_path_segments(self) -> None:
+        self.assertIsNone(find_path_schema("/datastore/avb/not-a-uid/entity_name"))
+        with self.assertRaisesRegex(DatastoreValidationError, "known writable schema"):
+            validate_datastore_write(
+                "/datastore/avb/not-a-uid/entity_name", '{"value":"My 624"}'
             )
 
     def test_rejects_read_only_avb_paths_without_usb_io(self) -> None:
