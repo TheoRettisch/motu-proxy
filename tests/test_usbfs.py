@@ -141,6 +141,7 @@ class UsbFsTransportTests(TestCase):
     def test_cancellable_reap_blocks_for_cancel_completion_without_idle_wait(self) -> None:
         read = usbfs.UsbFsCancellableBulkRead(77, 0x83, 64, None)
         read._cancel_requested = True
+        read._discard_submitted = True
         blocking_reaps = 0
 
         class UnexpectedWaitEvent:
@@ -165,6 +166,31 @@ class UsbFsTransportTests(TestCase):
             read._reap(time.monotonic() + 10)
 
         self.assertEqual(blocking_reaps, 1)
+
+    def test_cancellable_reap_skips_blocking_reap_after_ignored_discard_error(self) -> None:
+        read = usbfs.UsbFsCancellableBulkRead(77, 0x83, 64, None)
+        read._submitted = True
+        calls: list[int] = []
+
+        def ioctl(_fd, request, _arg):
+            calls.append(request)
+            if request == usbfs.USBDEVFS_REAPURBNDELAY:
+                raise OSError(errno.EAGAIN, "try again")
+            if request == usbfs.USBDEVFS_DISCARDURB:
+                raise OSError(errno.EINVAL, "invalid urb")
+            if request == usbfs.USBDEVFS_REAPURB:
+                raise AssertionError("blocking reap should not be used")
+            return 0
+
+        with patch("motu_proxy.transports.usbfs._ioctl", side_effect=ioctl):
+            read._reap(time.monotonic() - 1)
+
+        self.assertTrue(read._timed_out)
+        self.assertTrue(read._reaped)
+        self.assertEqual(
+            calls,
+            [usbfs.USBDEVFS_REAPURBNDELAY, usbfs.USBDEVFS_DISCARDURB],
+        )
 
     def test_cancellable_cancel_wakes_reap_wait(self) -> None:
         read = usbfs.UsbFsCancellableBulkRead(77, 0x83, 64, None)

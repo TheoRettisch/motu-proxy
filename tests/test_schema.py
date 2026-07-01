@@ -164,3 +164,21 @@ class DatastoreSchemaTests(TestCase):
             allow_unknown=True,
         )
         self.assertEqual(warnings, ["/datastore/future/path"])
+
+    def test_allow_unknown_writes_still_rejects_non_datastore_paths(self) -> None:
+        for path in ("/meters", "/apiversion"):
+            with (
+                self.subTest(path=path),
+                self.assertRaisesRegex(DatastoreValidationError, "known writable schema"),
+            ):
+                validate_datastore_write(path, '{"value":{"anything":true}}', allow_unknown=True)
+
+        with self.assertRaisesRegex(DatastoreValidationError, "known writable schema"):
+            validate_datastore_write("/meters", '{"/datastore/host/os":"linux"}')
+
+        with self.assertRaisesRegex(DatastoreValidationError, "known writable schema"):
+            validate_datastore_write(
+                "/datastore",
+                '{"/meters":{"anything":true}}',
+                allow_unknown=True,
+            )

@@ -494,10 +494,14 @@ def validate_datastore_write(
         body = load_json_object(json_body)
     except InvalidJsonBody as exc:
         raise DatastoreValidationError(str(exc)) from exc
+    if _relative_datastore_path(path) is None:
+        raise DatastoreValidationError(
+            f"{normalize_path(path)} is not in the known writable schema"
+        )
     for target_path, value in _iter_write_values(path, body):
         entry = find_path_schema(target_path)
         if entry is None:
-            if allow_unknown:
+            if allow_unknown and _relative_datastore_path(target_path) is not None:
                 if warn_unknown is not None:
                     warn_unknown(target_path)
                 continue

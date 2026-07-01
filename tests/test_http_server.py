@@ -928,6 +928,29 @@ class HttpServerTests(TestCase):
         self.assertEqual(result.response, b'{"ok":true}')
         self.assertEqual(calls, [("POST", "/datastore/future/path", '{"value":{"new":true}}')])
 
+    def test_allow_unknown_writes_does_not_allow_non_datastore_paths(self) -> None:
+        calls: list[tuple[str, str]] = []
+
+        def post(path: str, body: str, client: str | None = None) -> bytes:
+            calls.append((path, body))
+            return b'{"ok":true}'
+
+        with self.assertRaisesRegex(DatastoreValidationError, "known writable schema"):
+            dispatch_datastore_request(
+                "POST",
+                "/meters",
+                '{"value":{"new":true}}',
+                "application/json",
+                True,
+                lambda path, client=None: b"{}",
+                post,
+                host="127.0.0.1:1280",
+                write_token=WRITE_TOKEN,
+                request_token=WRITE_TOKEN,
+                allow_unknown_writes=True,
+            )
+        self.assertEqual(calls, [])
+
     def test_no_validate_bypasses_read_only_and_value_checks(self) -> None:
         calls: list[tuple[str, str]] = []
 

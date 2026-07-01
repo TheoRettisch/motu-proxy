@@ -96,7 +96,7 @@ default. Use `--allow-unknown-writes` for forward-compatible unknown paths, or
 Useful USB selection overrides:
 
 ```sh
-motu-proxy get /uid --serial 0001f2fffe00c719
+motu-proxy get /uid --serial <device-serial>
 motu-proxy get /uid --interface 3 --ep-out 0x03 --ep-in 0x83
 ```
 
@@ -183,8 +183,8 @@ Use only the vendor-specific datastore control interface for live recovery
 validation; do not disturb ALSA audio ownership.
 
 ```sh
-scp -r motu_proxy tools root@10.0.8.104:/tmp/motu-proxy-live/
-ssh root@10.0.8.104 'cd /tmp/motu-proxy-live && PYTHONPATH=. python3 -m motu_proxy serve --listen 127.0.0.1 --port 1280 --serial 0001f2fffe00c719'
+scp -r motu_proxy tools <user>@<motu-host>:/tmp/motu-proxy-live/
+ssh <user>@<motu-host> 'cd /tmp/motu-proxy-live && PYTHONPATH=. python3 -m motu_proxy serve --listen 127.0.0.1 --port 1280 --serial <device-serial>'
 ```
 
 In another shell, confirm a harmless read, disconnect or power-cycle the MOTU,
@@ -192,10 +192,10 @@ observe `503` during the outage, then reconnect the same device and confirm read
 resume without restarting `serve`:
 
 ```sh
-ssh root@10.0.8.104 'curl -fsS http://127.0.0.1:1280/datastore/uid'
-ssh root@10.0.8.104 'curl -i http://127.0.0.1:1280/datastore/uid'
-ssh root@10.0.8.104 'curl -fsS http://127.0.0.1:1280/__motu_proxy/status'
-ssh root@10.0.8.104 'curl -fsS http://127.0.0.1:1280/datastore/uid'
+ssh <user>@<motu-host> 'curl -fsS http://127.0.0.1:1280/datastore/uid'
+ssh <user>@<motu-host> 'curl -i http://127.0.0.1:1280/datastore/uid'
+ssh <user>@<motu-host> 'curl -fsS http://127.0.0.1:1280/__motu_proxy/status'
+ssh <user>@<motu-host> 'curl -fsS http://127.0.0.1:1280/datastore/uid'
 ```
 
 ## Write Mode

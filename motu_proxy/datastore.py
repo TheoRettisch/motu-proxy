@@ -65,6 +65,7 @@ DEFAULT_DEGRADED_REFRESH_INTERVAL_S = 0.5
 DEFAULT_POLL_ERROR_LOG_INTERVAL_S = 30.0
 DEFAULT_RECONNECT_INITIAL_DELAY_S = 0.25
 DEFAULT_RECONNECT_MAX_DELAY_S = 5.0
+DEFAULT_CONFIGURATION_ERROR_RETRY_DELAY_S = 30.0
 MAX_MESSAGE_SEQ = 0xFFFFFFFF
 CAPABILITY_SECTIONS = ("avb", "router", "mixer")
 IDENTITY_KEYS = ("uid", "model_name", "firmware_version", "serial_number")
@@ -708,6 +709,12 @@ def is_reconnectable_device_loss(exc: Exception, *, during_open: bool = False) -
     return during_open and isinstance(exc, (DatastoreNoResponse, DatastoreTimeout))
 
 
+def _close_context(context: object) -> None:
+    exit_context = getattr(context, "__exit__", None)
+    if exit_context is not None:
+        exit_context(None, None, None)
+
+
 class ManagedDatastore:
     def __init__(
         self,
@@ -715,6 +722,7 @@ class ManagedDatastore:
         opener: Callable[[DatastoreConfig], object] | None = None,
         reconnect_initial_delay_s: float = DEFAULT_RECONNECT_INITIAL_DELAY_S,
         reconnect_max_delay_s: float = DEFAULT_RECONNECT_MAX_DELAY_S,
+        configuration_error_retry_delay_s: float = DEFAULT_CONFIGURATION_ERROR_RETRY_DELAY_S,
         clock: Callable[[], float] = time.monotonic,
         assume_cancellable_bulk_reads: bool = True,
     ) -> None:
@@ -722,6 +730,7 @@ class ManagedDatastore:
         self._opener = opener if opener is not None else open_datastore
         self._initial_delay_s = max(0.0, reconnect_initial_delay_s)
         self._max_delay_s = max(self._initial_delay_s, reconnect_max_delay_s)
+        self._configuration_error_retry_delay_s = max(0.0, configuration_error_retry_delay_s)
         self._clock = clock
         self._assume_cancellable_bulk_reads = assume_cancellable_bulk_reads
         self._state_lock = threading.RLock()
@@ -782,12 +791,17 @@ class ManagedDatastore:
             now = self._clock()
             available = self._datastore is not None
             next_retry_in_s = None if available else max(0.0, self._next_retry_at - now)
+            retry_delay_s = (
+                self._configuration_error_retry_delay_s
+                if self._reconnect_state == "configuration_error"
+                else self._retry_delay_s
+            )
             return {
                 "datastore_available": available,
                 "datastore_reconnect_state": self._reconnect_state,
                 "datastore_session_generation": self._session_generation,
                 "datastore_last_reconnect_error": _exception_status(self._last_reconnect_error),
-                "datastore_retry_delay_s": self._retry_delay_s,
+                "datastore_retry_delay_s": retry_delay_s,
                 "datastore_next_retry_in_s": next_retry_in_s,
             }
 
@@ -814,20 +828,35 @@ class ManagedDatastore:
                 return self._datastore
             now = self._clock()
             if now < self._next_retry_at:
-                self._reconnect_state = "backoff"
+                if self._reconnect_state != "configuration_error":
+                    self._reconnect_state = "backoff"
                 raise self._temporary_unavailable()
             self._reconnect_state = "reconnecting"
-            try:
-                context = self._opener(self.config)
-                datastore = context.__enter__()
-            except Exception as exc:
+
+        try:
+            context = self._opener(self.config)
+            datastore = context.__enter__()
+        except Exception as exc:
+            reconnectable = is_reconnectable_device_loss(exc, during_open=True)
+            with self._state_lock:
                 self._last_reconnect_error = exc
-                if is_reconnectable_device_loss(exc, during_open=True):
+                now = self._clock()
+                if reconnectable:
                     self._schedule_retry_locked(now)
-                    raise self._temporary_unavailable() from exc
-                self._reconnect_state = "unavailable"
-                self._next_retry_at = now
-                raise
+                else:
+                    self._schedule_configuration_error_retry_locked(now)
+            if reconnectable:
+                raise self._temporary_unavailable() from exc
+            raise
+
+        with self._state_lock:
+            if self._closed:
+                _close_context(context)
+                raise self._temporary_unavailable()
+            if self._datastore is not None:
+                _close_context(context)
+                return self._datastore
+            now = self._clock()
             self._context = context
             self._datastore = datastore
             self._session_generation += 1
@@ -863,6 +892,10 @@ class ManagedDatastore:
         self._next_retry_at = now + delay
         self._retry_delay_s = min(self._max_delay_s, max(self._initial_delay_s, delay * 2))
         self._reconnect_state = "backoff"
+
+    def _schedule_configuration_error_retry_locked(self, now: float) -> None:
+        self._next_retry_at = now + self._configuration_error_retry_delay_s
+        self._reconnect_state = "configuration_error"
 
     def _temporary_unavailable(self) -> DatastoreDeviceUnavailable:
         return DatastoreDeviceUnavailable("MOTU USB datastore is temporarily unavailable")

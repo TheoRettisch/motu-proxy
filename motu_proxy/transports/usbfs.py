@@ -130,6 +130,8 @@ class UsbFsCancellableBulkRead:
         self._submitted = False
         self._reaped = False
         self._cancel_requested = False
+        self._discard_submitted = False
+        self._discard_failed_without_reap = False
         self._timed_out = False
         self._cancel_event = threading.Event()
 
@@ -156,13 +158,23 @@ class UsbFsCancellableBulkRead:
     def cancel(self) -> None:
         self._cancel_requested = True
         self._cancel_event.set()
-        if not self._submitted or self._reaped:
+        self._discard_pending_urb()
+
+    def _discard_pending_urb(self) -> None:
+        if (
+            not self._submitted
+            or self._reaped
+            or self._discard_submitted
+            or self._discard_failed_without_reap
+        ):
             return
         try:
             _ioctl(self.fd, USBDEVFS_DISCARDURB, ctypes.byref(self._urb))
+            self._discard_submitted = True
         except OSError as exc:
             if exc.errno not in (errno.EINVAL, errno.ENODEV, errno.ENOENT):
                 raise
+            self._discard_failed_without_reap = True
 
     def _submit(self) -> None:
         if self._submitted:
@@ -179,12 +191,12 @@ class UsbFsCancellableBulkRead:
                 if exc.errno != errno.EAGAIN:
                     raise
                 if self._cancel_requested:
-                    self._reap_blocking()
+                    self._finish_cancelled_reap()
                     return
                 if deadline is not None and time.monotonic() >= deadline:
                     self._timed_out = True
                     self.cancel()
-                    self._reap_blocking()
+                    self._finish_cancelled_reap()
                     return
                 wait_s = self.reap_poll_interval_s
                 if deadline is not None:
@@ -198,6 +210,12 @@ class UsbFsCancellableBulkRead:
         reaped = ctypes.c_void_p()
         _ioctl(self.fd, USBDEVFS_REAPURB, ctypes.byref(reaped))
         self._accept_reaped_urb(reaped)
+
+    def _finish_cancelled_reap(self) -> None:
+        if self._discard_failed_without_reap:
+            self._reaped = True
+            return
+        self._reap_blocking()
 
     def _accept_reaped_urb(self, reaped: ctypes.c_void_p) -> None:
         if reaped.value != ctypes.addressof(self._urb):

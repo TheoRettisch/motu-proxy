@@ -530,7 +530,7 @@ class ManagedDatastoreTests(TestCase):
         )
         self.assertEqual(status["datastore_next_retry_in_s"], 1.0)
 
-    def test_non_reconnectable_open_failure_stays_on_original_error_path(self) -> None:
+    def test_non_reconnectable_open_failure_uses_configuration_backoff(self) -> None:
         clock = ManualClock()
         opener = FakeManagedOpener(
             [
@@ -542,16 +542,77 @@ class ManagedDatastoreTests(TestCase):
             DatastoreConfig(),
             opener=opener,
             reconnect_initial_delay_s=1.0,
+            reconnect_max_delay_s=3.0,
+            configuration_error_retry_delay_s=7.0,
             clock=clock,
         )
 
         with self.assertRaises(PermissionError):
             manager.get("/datastore/uid")
+        status = manager.status()
+        self.assertEqual(status["datastore_reconnect_state"], "configuration_error")
+        self.assertEqual(status["datastore_retry_delay_s"], 7.0)
+        self.assertEqual(status["datastore_next_retry_in_s"], 7.0)
+
+        with self.assertRaises(DatastoreDeviceUnavailable):
+            manager.get("/datastore/uid")
+        self.assertEqual(opener.calls, 1)
+
+        clock.advance(7.0)
         with self.assertRaises(PermissionError):
             manager.get("/datastore/uid")
-
         self.assertEqual(opener.calls, 2)
-        self.assertEqual(manager.status()["datastore_reconnect_state"], "unavailable")
+
+    def test_status_does_not_wait_for_slow_session_open(self) -> None:
+        entered = threading.Event()
+        release = threading.Event()
+        session = FakeManagedSession(get_effects=[http_response("uid", b'{"value":"ok"}')])
+
+        class BlockingContext:
+            def __enter__(self):
+                entered.set()
+                release.wait(timeout=1.0)
+                return session
+
+            def __exit__(self, exc_type, exc, tb) -> None:
+                session.closed = True
+
+        class BlockingOpener:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def __call__(self, _config):
+                self.calls += 1
+                return BlockingContext()
+
+        opener = BlockingOpener()
+        manager = ManagedDatastore(DatastoreConfig(), opener=opener)
+        errors: list[Exception] = []
+
+        def request() -> None:
+            try:
+                manager.get("/datastore/uid")
+            except Exception as exc:
+                errors.append(exc)
+
+        request_thread = threading.Thread(target=request)
+        request_thread.start()
+        status_results: list[dict[str, object | None]] = []
+        status_thread = threading.Thread(target=lambda: status_results.append(manager.status()))
+        try:
+            self.assertTrue(entered.wait(timeout=1.0))
+            status_thread.start()
+            status_thread.join(timeout=0.2)
+            self.assertFalse(status_thread.is_alive())
+            self.assertEqual(status_results[0]["datastore_reconnect_state"], "reconnecting")
+            self.assertFalse(status_results[0]["datastore_available"])
+        finally:
+            release.set()
+            request_thread.join(timeout=1.0)
+            status_thread.join(timeout=1.0)
+
+        self.assertFalse(request_thread.is_alive())
+        self.assertEqual(errors, [])
 
     def test_session_is_discarded_after_reconnectable_usb_loss(self) -> None:
         session = FakeManagedSession(get_effects=[OSError(errno.ENODEV, "device disappeared")])
