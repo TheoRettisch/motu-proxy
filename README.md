@@ -73,6 +73,7 @@ prints timing/frame counters:
 ```sh
 motu-proxy smoke --compact
 motu-proxy smoke --no-body
+motu-proxy smoke --path /uid --path /host/mode --continue-on-error
 ```
 
 Send an explicit datastore POST over USB:
@@ -80,6 +81,11 @@ Send an explicit datastore POST over USB:
 ```sh
 motu-proxy post /datastore/host/os '{"value":"linux"}'
 ```
+
+CLI writes validate known datastore paths before USB I/O. They reject known
+read-only paths, out-of-range values, invalid enums, and unknown paths by
+default. Use `--allow-unknown-writes` for forward-compatible unknown paths, or
+`--no-validate` for raw debugging.
 
 Useful USB selection overrides:
 
@@ -105,11 +111,23 @@ Read through HTTP:
 curl http://127.0.0.1:1280/datastore/uid
 ```
 
+Forward a datastore client identifier or wait from a known ETag:
+
+```sh
+curl 'http://127.0.0.1:1280/datastore/uid?client=1479701624'
+curl -i -H 'If-None-Match: 5678' http://127.0.0.1:1280/datastore
+```
+
 By default the server binds to `127.0.0.1`, opens one USB datastore session for
 the server lifetime, and rejects POST/PATCH. A `DatastoreCoordinator` owns USB
 access for the HTTP server: foreground reads and writes are serialized against a
 background `/datastore` long-poller that tracks ETags and fans out changes to
 HTTP long-poll waiters.
+
+GET responses include `Cache-Control: no-cache` and an `ETag` header when the
+device supplies one. A GET with `If-None-Match` waits against coordinated
+datastore state and may return either a changed payload with a new `ETag` or
+`304 Not Modified`.
 
 During shutdown the coordinator asks the background poller to stop and waits for
 it before the USB datastore context is released.
@@ -156,6 +174,9 @@ curl \
 
 HTTP PATCH is accepted only as a compatibility alias for the same MOTU
 datastore POST operation. It does not implement partial-update semantics.
+
+HTTP writes accept either a raw JSON object body or an
+`application/x-www-form-urlencoded` body with a `json` field.
 
 Additional write-mode protections:
 
@@ -212,28 +233,28 @@ motu-proxy serve --allow-writes --no-write-token-file
 
 ## Development
 
-Install development tools:
+Use the repo-local virtual environment for checks:
 
 ```sh
-python -m pip install -e ".[dev]"
+.venv/bin/python -m pip install -e ".[dev]"
 ```
 
 Run the hardware-free test suite:
 
 ```sh
-python -m pytest -q
+.venv/bin/python -m pytest -q
 ```
 
 Run lint checks:
 
 ```sh
-python -m ruff check .
+.venv/bin/python -m ruff check .
 ```
 
 Run the fixture self-test:
 
 ```sh
-python -m motu_proxy selftest
+.venv/bin/python -m motu_proxy selftest
 ```
 
 The tests cover protocol byte fixtures, path normalization, strict response
@@ -254,13 +275,17 @@ valid paths.
   plus the persistent HTTP coordinator/long-poller.
 - `motu_proxy/http_server.py`: localhost HTTP compatibility layer and write
   safety checks.
+- `motu_proxy/schema.py`: embedded datastore type, permission, range, and enum
+  validation for writes.
 - `motu_proxy/cli.py`: command-line entry point.
 - `tools/live_validate_response_frames.py`: opt-in live USB response-frame
   validator for CRC, message sequence, segmentation, and logical wrapper
   behavior.
+- `tools/live_validate_foreground_preemption.py`: opt-in live validation for
+  foreground reads/writes while the HTTP long-poller is active.
 - `tests/`: hardware-free regression tests.
-- `handover/`: original MVP notes and reference script.
 - `openspec/`: design/specification history for the rebuild.
+- `research/spike-metering/`: exploratory notes and probes for meter reads.
 
 ## License
 
