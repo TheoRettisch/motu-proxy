@@ -1,6 +1,6 @@
 ## Context
 
-`MotuProxyHandler` inherits `BaseHTTPRequestHandler`, whose default `protocol_version` is `HTTP/1.0`. The proxy already sends explicit `Content-Length` headers for normal datastore responses, `304 Not Modified`, and JSON error responses, which is the key framing requirement for HTTP/1.1 persistent connections. Write-request failures already force `close_connection` in several paths to avoid reusing a connection after unsafe or partially-read request bodies.
+`MotuProxyHandler` inherits `BaseHTTPRequestHandler`, whose default `protocol_version` is `HTTP/1.0`. The proxy already sends explicit `Content-Length` headers for normal datastore responses and JSON error responses, which is the key framing requirement for HTTP/1.1 persistent connections. `304 Not Modified` responses are bodyless by status semantics, so they remain safely framed without inventing a zero `Content-Length`. Write-request failures already force `close_connection` in several paths to avoid reusing a connection after unsafe or partially-read request bodies.
 
 ## Goals / Non-Goals
 
@@ -27,7 +27,7 @@
   - Alternative considered: chunked responses. That would add complexity without improving the current buffered datastore flow.
 
 - Force `304 Not Modified` responses to be bodyless at the handler boundary.
-  - Rationale: HTTP `304` must not include a response body, so the handler should send `Content-Length: 0` and write no bytes even if an upstream dispatch result accidentally carries a payload.
+  - Rationale: HTTP `304` must not include a response body, and `Content-Length` on `304` is only valid when it equals the selected representation length, which the handler does not know. The handler should omit `Content-Length` and write no bytes even if an upstream dispatch result accidentally carries a payload.
   - Alternative considered: trust the datastore dispatch result to keep `304` bodies empty. That leaves the HTTP/1.1 framing contract dependent on every future producer.
 
 - Respect client-requested connection closure.

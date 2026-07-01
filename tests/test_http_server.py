@@ -1008,7 +1008,7 @@ class HttpHandlerTests(TestCase):
         self.assertEqual(handler.statuses, [304])
         self.assertIn(("Cache-Control", "no-cache"), handler.sent_headers)
         self.assertIn(("ETag", "5678"), handler.sent_headers)
-        self.assertIn(("Content-Length", "0"), handler.sent_headers)
+        self.assertFalse(any(key == "Content-Length" for key, _ in handler.sent_headers))
         self.assertFalse(any(key == "Content-Type" for key, _ in handler.sent_headers))
         self.assertEqual(handler.wfile.getvalue(), b"")
 

@@ -353,7 +353,8 @@ class MotuProxyHandler(BaseHTTPRequestHandler):
             self.send_header("Cache-Control", "no-cache")
             if method == "GET" and result.etag is not None:
                 self.send_header("ETag", result.etag)
-            self.send_header("Content-Length", str(len(body)))
+            if result.status != 304:
+                self.send_header("Content-Length", str(len(body)))
             if getattr(self, "close_connection", False):
                 self.send_header("Connection", "close")
             self.end_headers()

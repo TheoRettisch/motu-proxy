@@ -17,9 +17,9 @@ The system SHALL serve datastore proxy responses using HTTP/1.1 and SHALL keep c
 - **THEN** the proxy marks the connection for closure after the response
 - **AND** this close behavior does not depend on the datastore request failing
 
-#### Scenario: Not modified response is length framed
+#### Scenario: Not modified response is bodyless
 - **WHEN** a long-poll datastore GET returns `304 Not Modified`
-- **THEN** the proxy response includes `Content-Length: 0`
+- **THEN** the proxy response omits `Content-Length` unless the selected representation length is known and correct
 - **AND** the proxy does not send a response body
 
 #### Scenario: Unsafe write rejection closes the connection

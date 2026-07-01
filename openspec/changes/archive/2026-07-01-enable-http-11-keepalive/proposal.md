@@ -5,7 +5,7 @@ The HTTP proxy currently inherits `BaseHTTPRequestHandler`'s HTTP/1.0 default, s
 ## What Changes
 
 - Serve datastore HTTP responses using HTTP/1.1 so clients can reuse connections when request and response framing make that safe.
-- Keep explicit `Content-Length` headers on normal, `304 Not Modified`, and JSON error responses so persistent connections remain well framed.
+- Keep explicit `Content-Length` headers on normal and JSON error responses so persistent connections remain well framed, while keeping `304 Not Modified` bodyless without inventing a zero length.
 - Continue closing write/error connections in paths where the request body or backend state may be unsafe to reuse.
 - Add tests that verify the handler advertises HTTP/1.1, preserves response framing, and emits `Connection: close` where the proxy intentionally terminates a connection.
 
