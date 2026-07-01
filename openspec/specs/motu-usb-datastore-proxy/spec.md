@@ -358,3 +358,42 @@ The system SHALL serve datastore proxy responses using HTTP/1.1 and SHALL keep c
 - **WHEN** a client sends an unsupported HTTP method over HTTP/1.1
 - **THEN** the proxy error response includes an explicit `Content-Length`
 - **AND** the response can be parsed without relying on connection close as the frame boundary
+
+### Requirement: HTTP datastore hotplug recovery
+The system SHALL keep the HTTP proxy process alive across MOTU USB datastore device disconnects, power-cycles, and USB resets, SHALL retry discovery/open/init until the configured device is available again, and SHALL resume datastore service without requiring a process restart.
+
+#### Scenario: Foreground request while device is unavailable
+- **WHEN** the HTTP proxy is running and the configured MOTU datastore control interface is disconnected, unavailable, or still reconnecting
+- **THEN** a foreground HTTP datastore request returns `503 Service Unavailable` and the proxy process remains running
+
+#### Scenario: Service resumes after device returns
+- **WHEN** the configured MOTU datastore control interface becomes available again after a disconnect, power-cycle, or USB reset
+- **THEN** the proxy rediscovers the device, reopens the vendor-specific bulk control interface, initializes the datastore session, and subsequent HTTP datastore requests can succeed without restarting the proxy process
+
+#### Scenario: Reconnect resets coordinated datastore history
+- **WHEN** the proxy recovers after a device disconnect, power-cycle, or USB reset
+- **THEN** it discards stale datastore ETag and delta history from the previous USB session
+- **AND** it resumes coordination from a fresh datastore read on the new session
+
+#### Scenario: Foreground reconnect attempts are bounded
+- **WHEN** a foreground HTTP datastore request arrives while the configured device is unavailable or still inside reconnect backoff
+- **THEN** the request performs no more than one prompt opportunistic open attempt before returning `503 Service Unavailable`
+- **AND** it does not keep the HTTP worker blocked in an unbounded reconnect loop
+
+#### Scenario: No implicit write replay after reconnect
+- **WHEN** an HTTP write fails because the datastore device is lost before a valid write response is received
+- **THEN** the proxy returns an error for that request and does not replay the write automatically after reconnect
+
+#### Scenario: Recovery preserves single control-interface ownership
+- **WHEN** the proxy is reconnecting or serving requests after recovery
+- **THEN** it uses at most one active vendor-specific datastore control session at a time and does not claim class-compliant ALSA audio interfaces
+
+#### Scenario: Reconnect honors configured device selection
+- **WHEN** the proxy was started with VID, PID, serial, interface, or endpoint selection options
+- **THEN** reconnect attempts use the same selection constraints and remain unavailable if the matching device cannot be selected unambiguously
+
+#### Scenario: Status reports reconnect state
+- **WHEN** a client requests `GET /__motu_proxy/status` while the device is unavailable, reconnecting, or recovered
+- **THEN** the status response reports whether a usable datastore session is available
+- **AND** it includes the last reconnect error and retry/backoff state when applicable
+- **AND** it is served through the status fast path without performing a datastore read

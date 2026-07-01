@@ -13,6 +13,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, parse_qsl, urlparse
 
 from .datastore import (
+    DatastoreDeviceUnavailable,
     DatastoreNoResponse,
     DatastoreResponseLimit,
     DatastoreTimeout,
@@ -435,7 +436,7 @@ class MotuProxyHandler(BaseHTTPRequestHandler):
             self.close_write_connection(method)
             if self.can_send_error_response(response_started):
                 self.send_json_error(400, str(exc))
-        except DeviceDiscoveryError as exc:
+        except (DatastoreDeviceUnavailable, DeviceDiscoveryError) as exc:
             self.close_write_connection(method)
             if self.can_send_error_response(response_started):
                 self.send_backend_error(503, "MOTU USB device is not available", exc)

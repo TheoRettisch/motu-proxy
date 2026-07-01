@@ -5,7 +5,7 @@ from types import SimpleNamespace
 from unittest import TestCase
 
 from motu_proxy.cli import build_parser
-from motu_proxy.datastore import DatastoreNoResponse
+from motu_proxy.datastore import DatastoreDeviceUnavailable, DatastoreNoResponse
 from motu_proxy.http_server import (
     STATUS_PATH,
     WRITE_TOKEN_HEADER,
@@ -1418,6 +1418,19 @@ class HttpHandlerTests(TestCase):
         self.assertEqual(
             json.loads(handler.wfile.getvalue().decode("utf-8"))["error"],
             "MOTU USB datastore did not respond",
+        )
+
+    def test_handler_returns_503_for_temporary_device_unavailable(self) -> None:
+        class Dispatcher:
+            def dispatch(self, *args, **kwargs):
+                raise DatastoreDeviceUnavailable("MOTU USB datastore is temporarily unavailable")
+
+        handler = self.make_handler(dispatcher=Dispatcher())
+        handler.handle_datastore_request("GET")
+        self.assertEqual(handler.statuses, [503])
+        self.assertEqual(
+            json.loads(handler.wfile.getvalue().decode("utf-8"))["error"],
+            "MOTU USB device is not available",
         )
 
     def test_handler_does_not_emit_second_status_after_response_write_failure(self) -> None:

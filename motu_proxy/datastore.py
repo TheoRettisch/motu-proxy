@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import json
 import struct
 import sys
@@ -14,7 +15,15 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
-from .device import DEFAULT_DEVFS_ROOT, DEFAULT_SYSFS_ROOT, find_motu_device
+from .device import (
+    DEFAULT_DEVFS_ROOT,
+    DEFAULT_SYSFS_ROOT,
+    DeviceDiscoveryError,
+    MultipleDevicesFound,
+    NoControlInterfaceFound,
+    NoDeviceFound,
+    find_motu_device,
+)
 from .parser import (
     DatastorePayload,
     ResponseFrameError,
@@ -54,9 +63,23 @@ DEFAULT_POLL_READ_TIMEOUT_SLICE_MS = 250
 DEFAULT_FOREGROUND_PREEMPTION_BUDGET_MS = 500
 DEFAULT_DEGRADED_REFRESH_INTERVAL_S = 0.5
 DEFAULT_POLL_ERROR_LOG_INTERVAL_S = 30.0
+DEFAULT_RECONNECT_INITIAL_DELAY_S = 0.25
+DEFAULT_RECONNECT_MAX_DELAY_S = 5.0
 MAX_MESSAGE_SEQ = 0xFFFFFFFF
 CAPABILITY_SECTIONS = ("avb", "router", "mixer")
 IDENTITY_KEYS = ("uid", "model_name", "firmware_version", "serial_number")
+RECONNECTABLE_USB_ERRNOS = frozenset(
+    code
+    for code in (
+        errno.ENODEV,
+        errno.ENOENT,
+        errno.ENXIO,
+        errno.ECONNRESET,
+        getattr(errno, "ESHUTDOWN", None),
+        errno.EPIPE,
+    )
+    if code is not None
+)
 
 
 class CancellableBulkRead(Protocol):
@@ -103,6 +126,10 @@ class DatastoreResponseLimit(RuntimeError):
 
 
 class DatastoreCancelled(RuntimeError):
+    pass
+
+
+class DatastoreDeviceUnavailable(RuntimeError):
     pass
 
 
@@ -667,6 +694,186 @@ class MotuUsbDatastore:
         return packets
 
 
+def is_reconnectable_device_loss(exc: Exception, *, during_open: bool = False) -> bool:
+    if isinstance(exc, (NoDeviceFound, NoControlInterfaceFound, MultipleDevicesFound)):
+        return True
+    if isinstance(exc, DeviceDiscoveryError):
+        return not (
+            isinstance(exc.__cause__, PermissionError) or "not readable" in str(exc).lower()
+        )
+    if isinstance(exc, OSError):
+        return exc.errno in RECONNECTABLE_USB_ERRNOS
+    if isinstance(exc, ShortUsbWrite):
+        return True
+    return during_open and isinstance(exc, (DatastoreNoResponse, DatastoreTimeout))
+
+
+class ManagedDatastore:
+    def __init__(
+        self,
+        config: DatastoreConfig,
+        opener: Callable[[DatastoreConfig], object] | None = None,
+        reconnect_initial_delay_s: float = DEFAULT_RECONNECT_INITIAL_DELAY_S,
+        reconnect_max_delay_s: float = DEFAULT_RECONNECT_MAX_DELAY_S,
+        clock: Callable[[], float] = time.monotonic,
+        assume_cancellable_bulk_reads: bool = True,
+    ) -> None:
+        self.config = config
+        self._opener = opener if opener is not None else open_datastore
+        self._initial_delay_s = max(0.0, reconnect_initial_delay_s)
+        self._max_delay_s = max(self._initial_delay_s, reconnect_max_delay_s)
+        self._clock = clock
+        self._assume_cancellable_bulk_reads = assume_cancellable_bulk_reads
+        self._state_lock = threading.RLock()
+        self._operation_lock = threading.Lock()
+        self._context: object | None = None
+        self._datastore: object | None = None
+        self._session_generation = 0
+        self._reconnect_state = "unavailable"
+        self._last_reconnect_error: Exception | None = None
+        self._retry_delay_s = self._initial_delay_s
+        self._next_retry_at = 0.0
+        self._closed = False
+        self._last_response_stats: ResponseStats | None = None
+        self._last_response_etag: str | None = None
+
+    @property
+    def supports_cancellable_bulk_reads(self) -> bool:
+        with self._state_lock:
+            if self._datastore is None:
+                return self._assume_cancellable_bulk_reads
+            return bool(getattr(self._datastore, "supports_cancellable_bulk_reads", False))
+
+    @property
+    def session_generation(self) -> int:
+        with self._state_lock:
+            return self._session_generation
+
+    @property
+    def last_response_stats(self) -> ResponseStats | None:
+        with self._state_lock:
+            datastore = self._datastore
+            if datastore is not None:
+                return getattr(datastore, "last_response_stats", None)
+            return self._last_response_stats
+
+    @property
+    def last_response_etag(self) -> str | None:
+        with self._state_lock:
+            datastore = self._datastore
+            if datastore is not None:
+                return getattr(datastore, "last_response_etag", None)
+            return self._last_response_etag
+
+    def get(self, path: str, **kwargs) -> bytes:
+        return self._call("get", path, **kwargs)
+
+    def post(self, path: str, json_body: str, **kwargs) -> bytes:
+        return self._call("post", path, json_body, **kwargs)
+
+    def close(self) -> None:
+        with self._operation_lock, self._state_lock:
+            self._closed = True
+            self._discard_session_locked()
+            self._reconnect_state = "closed"
+
+    def status(self) -> dict[str, object | None]:
+        with self._state_lock:
+            now = self._clock()
+            available = self._datastore is not None
+            next_retry_in_s = None if available else max(0.0, self._next_retry_at - now)
+            return {
+                "datastore_available": available,
+                "datastore_reconnect_state": self._reconnect_state,
+                "datastore_session_generation": self._session_generation,
+                "datastore_last_reconnect_error": _exception_status(self._last_reconnect_error),
+                "datastore_retry_delay_s": self._retry_delay_s,
+                "datastore_next_retry_in_s": next_retry_in_s,
+            }
+
+    def _call(self, method: str, *args, **kwargs) -> bytes:
+        with self._operation_lock:
+            datastore = self._ensure_session()
+            try:
+                operation = getattr(datastore, method)
+                response = operation(*args, **kwargs)
+            except Exception as exc:
+                self._remember_response_state(datastore)
+                if is_reconnectable_device_loss(exc):
+                    self._discard_after_loss(datastore, exc)
+                    raise self._temporary_unavailable() from exc
+                raise
+            self._remember_response_state(datastore)
+            return response
+
+    def _ensure_session(self) -> object:
+        with self._state_lock:
+            if self._closed:
+                raise DatastoreDeviceUnavailable("MOTU USB datastore is temporarily unavailable")
+            if self._datastore is not None:
+                return self._datastore
+            now = self._clock()
+            if now < self._next_retry_at:
+                self._reconnect_state = "backoff"
+                raise self._temporary_unavailable()
+            self._reconnect_state = "reconnecting"
+            try:
+                context = self._opener(self.config)
+                datastore = context.__enter__()
+            except Exception as exc:
+                self._last_reconnect_error = exc
+                if is_reconnectable_device_loss(exc, during_open=True):
+                    self._schedule_retry_locked(now)
+                    raise self._temporary_unavailable() from exc
+                self._reconnect_state = "unavailable"
+                self._next_retry_at = now
+                raise
+            self._context = context
+            self._datastore = datastore
+            self._session_generation += 1
+            self._reconnect_state = "available"
+            self._last_reconnect_error = None
+            self._retry_delay_s = self._initial_delay_s
+            self._next_retry_at = now
+            return datastore
+
+    def _discard_after_loss(self, datastore: object, exc: Exception) -> None:
+        with self._state_lock:
+            if datastore is not self._datastore:
+                return
+            self._last_reconnect_error = exc
+            self._schedule_retry_locked(self._clock())
+            self._discard_session_locked()
+
+    def _discard_session_locked(self) -> None:
+        context = self._context
+        self._context = None
+        self._datastore = None
+        if context is not None:
+            try:
+                context.__exit__(None, None, None)
+            except Exception as exc:
+                if self._last_reconnect_error is None:
+                    self._last_reconnect_error = exc
+        if self._reconnect_state not in ("closed", "reconnecting"):
+            self._reconnect_state = "backoff"
+
+    def _schedule_retry_locked(self, now: float) -> None:
+        delay = self._retry_delay_s
+        self._next_retry_at = now + delay
+        self._retry_delay_s = min(self._max_delay_s, max(self._initial_delay_s, delay * 2))
+        self._reconnect_state = "backoff"
+
+    def _temporary_unavailable(self) -> DatastoreDeviceUnavailable:
+        return DatastoreDeviceUnavailable("MOTU USB datastore is temporarily unavailable")
+
+    def _remember_response_state(self, datastore: object) -> None:
+        with self._state_lock:
+            if datastore is self._datastore:
+                self._last_response_stats = getattr(datastore, "last_response_stats", None)
+                self._last_response_etag = getattr(datastore, "last_response_etag", None)
+
+
 def read_device_capability_info(datastore: DatastoreReader) -> DeviceCapabilityInfo:
     apiversion = _read_required_datastore_value(datastore, "/apiversion")
     capabilities = {
@@ -726,7 +933,7 @@ def _looks_like_absent_path(exc: RuntimeError) -> bool:
 class DatastoreCoordinator:
     def __init__(
         self,
-        datastore: MotuUsbDatastore,
+        datastore: MotuUsbDatastore | ManagedDatastore,
         poll_path: str = DEFAULT_POLL_PATH,
         long_poll_timeout_ms: int = DEFAULT_LONG_POLL_TIMEOUT_MS,
         http_wait_timeout_ms: int = DEFAULT_HTTP_LONG_POLL_WAIT_MS,
@@ -759,6 +966,7 @@ class DatastoreCoordinator:
         self._next_degraded_refresh = 0.0
         self._history: deque[DatastoreTransition] = deque(maxlen=history_size)
         self._latest_etag: str | None = None
+        self._datastore_session_generation = _session_generation(datastore)
         self._closed = False
         self._worker: threading.Thread | None = None
         self.last_poller_error: Exception | None = None
@@ -788,7 +996,7 @@ class DatastoreCoordinator:
             poller_running = self._worker is not None and self._worker.is_alive()
             io_owner = self._io_owner
             foreground_waiters = self._foreground_waiters
-        return {
+        status = {
             "long_poll_mode": self.long_poll_mode,
             "latest_etag": latest_etag,
             "last_poller_error": _exception_status(last_poller_error),
@@ -797,6 +1005,10 @@ class DatastoreCoordinator:
             "io_owner": io_owner,
             "foreground_waiters": foreground_waiters,
         }
+        datastore_status = getattr(self.datastore, "status", None)
+        if datastore_status is not None:
+            status.update(datastore_status())
+        return status
 
     def start(self) -> None:
         with self._condition:
@@ -926,7 +1138,7 @@ class DatastoreCoordinator:
                 try:
                     self.read(self.poll_path, etag="0", client=None, timeout_ms=refresh_timeout_ms)
                     self._clear_poller_error()
-                except (DatastoreNoResponse, DatastoreTimeout) as exc:
+                except (DatastoreDeviceUnavailable, DatastoreNoResponse, DatastoreTimeout) as exc:
                     self._record_poller_error(exc)
                     continue
                 finally:
@@ -940,6 +1152,7 @@ class DatastoreCoordinator:
             with self._condition:
                 if self._closed:
                     return
+                initial_refresh = self._latest_etag is None
                 etag = self._latest_etag or "0"
             try:
                 if not self._acquire_poller_io():
@@ -948,11 +1161,15 @@ class DatastoreCoordinator:
                     response = self.datastore.get(
                         self.poll_path,
                         etag=etag,
-                        timeout_ms=self.long_poll_timeout_ms,
+                        timeout_ms=DEFAULT_RESPONSE_TIMEOUT_MS
+                        if initial_refresh
+                        else self.long_poll_timeout_ms,
                         should_cancel=self._is_closed,
-                        read_timeout_slice_ms=self.poll_read_timeout_slice_ms,
-                        use_cancellable_read=True,
-                        read_started=self._set_active_poll_read,
+                        read_timeout_slice_ms=None
+                        if initial_refresh
+                        else self.poll_read_timeout_slice_ms,
+                        use_cancellable_read=not initial_refresh,
+                        read_started=None if initial_refresh else self._set_active_poll_read,
                     )
                     payload = self._payload_from_response(response)
                 finally:
@@ -1012,6 +1229,7 @@ class DatastoreCoordinator:
                 timeout_ms=timeout_ms,
                 query_fields=device_query_fields,
             )
+        self._reset_if_session_generation_changed()
         return self._payload_from_response(response)
 
     def _acquire_foreground_io(self) -> None:
@@ -1081,6 +1299,7 @@ class DatastoreCoordinator:
         return self._active_poll_read
 
     def _payload_from_response(self, response: bytes) -> DatastorePayload:
+        self._reset_if_session_generation_changed()
         payload = datastore_payload(response)
         return DatastorePayload(
             payload.body,
@@ -1135,6 +1354,16 @@ class DatastoreCoordinator:
         if self._latest_etag is not None and self._latest_etag != etag:
             return None, True
         return None, False
+
+    def _reset_if_session_generation_changed(self) -> None:
+        generation = _session_generation(self.datastore)
+        with self._condition:
+            if generation == self._datastore_session_generation:
+                return
+            self._datastore_session_generation = generation
+            self._latest_etag = None
+            self._history.clear()
+            self._condition.notify_all()
 
 
 @contextmanager
@@ -1211,6 +1440,11 @@ def _long_poll_query_fields_cacheable(query_fields: tuple[QueryField, ...] | Non
     return query_fields is None or not query_fields or (
         len(query_fields) == 1 and query_fields[0][0] == "client"
     )
+
+
+def _session_generation(datastore: object) -> int:
+    generation = getattr(datastore, "session_generation", 0)
+    return generation if isinstance(generation, int) else 0
 
 
 def _exception_status(exc: Exception | None) -> dict[str, str] | None:

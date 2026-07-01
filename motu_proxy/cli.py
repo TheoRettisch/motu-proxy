@@ -19,6 +19,7 @@ from .datastore import (
     DatastoreConfig,
     DatastoreCoordinator,
     DeviceCapabilityInfo,
+    ManagedDatastore,
     ResponseStats,
     open_datastore,
     read_device_capability_info,
@@ -267,33 +268,34 @@ def command_serve(args) -> int:
     config = config_from_args(args)
     validate_serve_write_safety(args.listen, args.allow_writes, args.unsafe_allow_remote_writes)
 
-    with open_datastore(config) as datastore:
-        coordinator = DatastoreCoordinator(datastore)
-        write_token: str | None = None
-        write_token_file_path: str | None = None
-        coordinator.start()
-        try:
-            if args.allow_writes:
-                write_token, write_token_file_path = prepare_write_token(args.write_token_file)
-            server = MotuProxyServer(
-                (args.listen, args.port),
-                args.allow_writes,
-                args.debug,
-                coordinator.get,
-                coordinator.post,
-                write_token=write_token,
-                write_token_file=write_token_file_path,
-                allow_remote_writes=args.unsafe_allow_remote_writes,
-                max_write_body_bytes=args.max_write_body_bytes,
-                serialize_dispatch=False,
-                validate_writes=not args.no_validate,
-                allow_unknown_writes=args.allow_unknown_writes,
-                status_provider=coordinator.status,
-            )
-            return serve(server, before_close=coordinator.close)
-        finally:
-            coordinator.close()
-            remove_write_token_file(write_token_file_path, write_token)
+    datastore = ManagedDatastore(config, opener=open_datastore)
+    coordinator = DatastoreCoordinator(datastore)
+    write_token: str | None = None
+    write_token_file_path: str | None = None
+    coordinator.start()
+    try:
+        if args.allow_writes:
+            write_token, write_token_file_path = prepare_write_token(args.write_token_file)
+        server = MotuProxyServer(
+            (args.listen, args.port),
+            args.allow_writes,
+            args.debug,
+            coordinator.get,
+            coordinator.post,
+            write_token=write_token,
+            write_token_file=write_token_file_path,
+            allow_remote_writes=args.unsafe_allow_remote_writes,
+            max_write_body_bytes=args.max_write_body_bytes,
+            serialize_dispatch=False,
+            validate_writes=not args.no_validate,
+            allow_unknown_writes=args.allow_unknown_writes,
+            status_provider=coordinator.status,
+        )
+        return serve(server, before_close=coordinator.close)
+    finally:
+        coordinator.close()
+        datastore.close()
+        remove_write_token_file(write_token_file_path, write_token)
 
 
 def command_selftest(_args) -> int:

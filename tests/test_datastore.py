@@ -1,3 +1,4 @@
+import errno
 import threading
 import time
 from contextlib import redirect_stderr
@@ -5,15 +6,21 @@ from io import StringIO
 from unittest import TestCase
 
 from motu_proxy.datastore import (
+    DEFAULT_RESPONSE_TIMEOUT_MS,
+    DatastoreConfig,
     DatastoreCoordinator,
+    DatastoreDeviceUnavailable,
     DatastoreNoResponse,
     DatastoreTimeout,
+    ManagedDatastore,
     MotuUsbDatastore,
     ResponseStats,
     ShortUsbFrame,
     ShortUsbWrite,
+    is_reconnectable_device_loss,
     read_device_capability_info,
 )
+from motu_proxy.device import NoDeviceFound
 from motu_proxy.parser import DatastorePayload, ResponseFrameError
 from motu_proxy.protocol import build_ack, build_get_frame, build_post_frame
 
@@ -106,6 +113,16 @@ class BlockingTransport:
                 self._condition.wait(remaining)
             return True
 
+    def wait_for_read_timeouts(self, count: int, timeout: float = 1.0) -> bool:
+        deadline = time.monotonic() + timeout
+        with self._condition:
+            while len(self.read_timeouts) < count:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self._condition.wait(remaining)
+            return True
+
 
 class BlockingCancellableRead:
     def __init__(self, transport: BlockingTransport, timeout_ms: int | None) -> None:
@@ -145,6 +162,80 @@ class SizeCheckingTransport(FakeTransport):
         if self.reads and size is not None and len(self.reads[0]) > size:
             raise OSError(75, "Value too large for defined data type")
         return super().bulk_read(size=size, timeout_ms=timeout_ms)
+
+
+class ManualClock:
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def __call__(self) -> float:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
+
+
+class FakeManagedSession:
+    supports_cancellable_bulk_reads = False
+
+    def __init__(
+        self,
+        get_effects: list[bytes | Exception] | None = None,
+        post_effects: list[bytes | Exception] | None = None,
+    ) -> None:
+        self.get_effects = list(get_effects or [])
+        self.post_effects = list(post_effects or [])
+        self.get_calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+        self.post_calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+        self.closed = False
+        self.last_response_stats: ResponseStats | None = None
+        self.last_response_etag: str | None = None
+
+    def get(self, *args, **kwargs) -> bytes:
+        self.get_calls.append((args, kwargs))
+        return self._pop_effect(self.get_effects)
+
+    def post(self, *args, **kwargs) -> bytes:
+        self.post_calls.append((args, kwargs))
+        return self._pop_effect(self.post_effects)
+
+    def _pop_effect(self, effects: list[bytes | Exception]) -> bytes:
+        if not effects:
+            raise AssertionError("unexpected fake datastore call")
+        effect = effects.pop(0)
+        if isinstance(effect, Exception):
+            raise effect
+        return effect
+
+
+class FakeManagedContext:
+    def __init__(self, effect: FakeManagedSession | Exception) -> None:
+        self.effect = effect
+
+    def __enter__(self):
+        if isinstance(self.effect, Exception):
+            raise self.effect
+        return self.effect
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        if isinstance(self.effect, FakeManagedSession):
+            self.effect.closed = True
+
+
+class FakeManagedOpener:
+    def __init__(self, effects: list[FakeManagedSession | Exception]) -> None:
+        self.effects = list(effects)
+        self.calls = 0
+
+    def __call__(self, _config):
+        self.calls += 1
+        if not self.effects:
+            raise AssertionError("unexpected datastore open")
+        return FakeManagedContext(self.effects.pop(0))
+
+
+def http_response(etag: str, body: bytes) -> bytes:
+    return b"HTTP/1.1 200 OK\r\nETag: " + etag.encode("ascii") + b"\r\n\r\n" + body
 
 
 class DatastoreTests(TestCase):
@@ -405,6 +496,149 @@ class DatastoreTests(TestCase):
         )
 
 
+class ManagedDatastoreTests(TestCase):
+    def test_device_loss_taxonomy_is_explicit(self) -> None:
+        self.assertTrue(is_reconnectable_device_loss(NoDeviceFound("missing"), during_open=True))
+        self.assertTrue(is_reconnectable_device_loss(OSError(errno.ENODEV, "device disappeared")))
+        self.assertTrue(is_reconnectable_device_loss(ShortUsbWrite("short write")))
+        self.assertTrue(is_reconnectable_device_loss(DatastoreNoResponse("init timed out"), during_open=True))
+
+        self.assertFalse(is_reconnectable_device_loss(PermissionError(errno.EACCES, "denied")))
+        self.assertFalse(is_reconnectable_device_loss(ResponseFrameError("CRC mismatch")))
+        self.assertFalse(is_reconnectable_device_loss(DatastoreNoResponse("request timed out")))
+        self.assertFalse(is_reconnectable_device_loss(ShortUsbFrame("short frame")))
+
+    def test_open_failure_maps_to_temporary_unavailable(self) -> None:
+        clock = ManualClock()
+        opener = FakeManagedOpener([NoDeviceFound("missing")])
+        manager = ManagedDatastore(
+            DatastoreConfig(),
+            opener=opener,
+            reconnect_initial_delay_s=1.0,
+            clock=clock,
+        )
+
+        with self.assertRaises(DatastoreDeviceUnavailable):
+            manager.get("/datastore/uid")
+
+        status = manager.status()
+        self.assertFalse(status["datastore_available"])
+        self.assertEqual(status["datastore_reconnect_state"], "backoff")
+        self.assertEqual(
+            status["datastore_last_reconnect_error"],
+            {"type": "NoDeviceFound", "message": "missing"},
+        )
+        self.assertEqual(status["datastore_next_retry_in_s"], 1.0)
+
+    def test_non_reconnectable_open_failure_stays_on_original_error_path(self) -> None:
+        clock = ManualClock()
+        opener = FakeManagedOpener(
+            [
+                PermissionError(errno.EACCES, "permission denied"),
+                PermissionError(errno.EACCES, "permission denied"),
+            ]
+        )
+        manager = ManagedDatastore(
+            DatastoreConfig(),
+            opener=opener,
+            reconnect_initial_delay_s=1.0,
+            clock=clock,
+        )
+
+        with self.assertRaises(PermissionError):
+            manager.get("/datastore/uid")
+        with self.assertRaises(PermissionError):
+            manager.get("/datastore/uid")
+
+        self.assertEqual(opener.calls, 2)
+        self.assertEqual(manager.status()["datastore_reconnect_state"], "unavailable")
+
+    def test_session_is_discarded_after_reconnectable_usb_loss(self) -> None:
+        session = FakeManagedSession(get_effects=[OSError(errno.ENODEV, "device disappeared")])
+        opener = FakeManagedOpener([session])
+        manager = ManagedDatastore(
+            DatastoreConfig(),
+            opener=opener,
+            reconnect_initial_delay_s=1.0,
+            clock=ManualClock(),
+        )
+
+        with self.assertRaises(DatastoreDeviceUnavailable):
+            manager.get("/datastore/uid")
+
+        self.assertTrue(session.closed)
+        self.assertFalse(manager.status()["datastore_available"])
+        self.assertEqual(manager.session_generation, 1)
+
+    def test_reconnect_succeeds_after_fake_device_returns(self) -> None:
+        clock = ManualClock()
+        recovered = FakeManagedSession(get_effects=[http_response("uid", b'{"value":"ok"}')])
+        opener = FakeManagedOpener([NoDeviceFound("missing"), recovered])
+        manager = ManagedDatastore(
+            DatastoreConfig(),
+            opener=opener,
+            reconnect_initial_delay_s=1.0,
+            clock=clock,
+        )
+
+        with self.assertRaises(DatastoreDeviceUnavailable):
+            manager.get("/datastore/uid")
+        clock.advance(1.0)
+        response = manager.get("/datastore/uid")
+
+        self.assertEqual(response, http_response("uid", b'{"value":"ok"}'))
+        self.assertTrue(manager.status()["datastore_available"])
+        self.assertEqual(manager.session_generation, 1)
+        self.assertEqual(opener.calls, 2)
+
+    def test_concurrent_outage_requests_share_one_reconnect_attempt(self) -> None:
+        opener = FakeManagedOpener([NoDeviceFound("missing")])
+        manager = ManagedDatastore(
+            DatastoreConfig(),
+            opener=opener,
+            reconnect_initial_delay_s=10.0,
+            clock=ManualClock(),
+        )
+        errors: list[Exception] = []
+
+        def request() -> None:
+            try:
+                manager.get("/datastore/uid")
+            except Exception as exc:
+                errors.append(exc)
+
+        threads = [threading.Thread(target=request) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=1)
+
+        self.assertEqual(opener.calls, 1)
+        self.assertEqual(len(errors), 2)
+        self.assertTrue(all(isinstance(exc, DatastoreDeviceUnavailable) for exc in errors))
+
+    def test_write_failure_is_not_replayed_after_reconnect(self) -> None:
+        clock = ManualClock()
+        first = FakeManagedSession(post_effects=[OSError(errno.ENODEV, "device disappeared")])
+        second = FakeManagedSession(post_effects=[http_response("2", b'{"ok":true}')])
+        opener = FakeManagedOpener([first, second])
+        manager = ManagedDatastore(
+            DatastoreConfig(),
+            opener=opener,
+            reconnect_initial_delay_s=1.0,
+            clock=clock,
+        )
+
+        with self.assertRaises(DatastoreDeviceUnavailable):
+            manager.post("/datastore/host/os", '{"value":"linux"}')
+        clock.advance(1.0)
+        response = manager.post("/datastore/host/os", '{"value":"linux"}')
+
+        self.assertEqual(response, http_response("2", b'{"ok":true}'))
+        self.assertEqual(len(first.post_calls), 1)
+        self.assertEqual(len(second.post_calls), 1)
+
+
 class DatastoreCoordinatorTests(TestCase):
     def test_non_poll_path_read_does_not_replace_global_etag(self) -> None:
         transport = FakeTransport(
@@ -457,6 +691,29 @@ class DatastoreCoordinatorTests(TestCase):
 
             self.assertEqual([result.body for result in results], [b'{"changed":true}', b'{"changed":true}'])
             self.assertEqual([result.etag for result in results], ["2", "2"])
+        finally:
+            coordinator.close()
+
+    def test_background_poller_initial_refresh_is_not_cancellable_native_hold(self) -> None:
+        initial = response_packet(b'HTTP/1.1 200 OK\r\nETag: 1\r\n\r\n{"state":1}')
+        transport = BlockingTransport()
+        coordinator = DatastoreCoordinator(
+            MotuUsbDatastore(transport),
+            long_poll_timeout_ms=5000,
+            poll_read_timeout_slice_ms=20,
+            poll_interval_s=0,
+        )
+        try:
+            coordinator.start()
+            self.assertTrue(transport.wait_for_writes(1))
+            self.assertTrue(transport.wait_for_read_timeouts(1))
+            self.assertEqual(transport.cancellable_read_timeouts, [])
+            self.assertLessEqual(transport.read_timeouts[0], DEFAULT_RESPONSE_TIMEOUT_MS)
+
+            transport.push(initial)
+            self.assertTrue(transport.wait_for_cancellable_reads(1))
+            self.assertEqual(coordinator.latest_etag, "1")
+            self.assertEqual(transport.cancellable_read_timeouts[0], 20)
         finally:
             coordinator.close()
 
@@ -538,6 +795,81 @@ class DatastoreCoordinatorTests(TestCase):
                 "response_bytes": 17,
             },
         )
+
+    def test_status_includes_managed_datastore_reconnect_state(self) -> None:
+        clock = ManualClock()
+        opener = FakeManagedOpener([NoDeviceFound("missing")])
+        manager = ManagedDatastore(
+            DatastoreConfig(),
+            opener=opener,
+            reconnect_initial_delay_s=1.0,
+            clock=clock,
+        )
+        coordinator = DatastoreCoordinator(manager)
+
+        with self.assertRaises(DatastoreDeviceUnavailable):
+            coordinator.read("/datastore/uid")
+        status = coordinator.status()
+
+        self.assertFalse(status["datastore_available"])
+        self.assertEqual(status["datastore_reconnect_state"], "backoff")
+        self.assertEqual(
+            status["datastore_last_reconnect_error"],
+            {"type": "NoDeviceFound", "message": "missing"},
+        )
+        self.assertEqual(status["datastore_next_retry_in_s"], 1.0)
+
+    def test_foreground_request_returns_after_reconnect_success(self) -> None:
+        clock = ManualClock()
+        recovered = FakeManagedSession(get_effects=[http_response("uid", b'{"value":"ok"}')])
+        opener = FakeManagedOpener([NoDeviceFound("missing"), recovered])
+        manager = ManagedDatastore(
+            DatastoreConfig(),
+            opener=opener,
+            reconnect_initial_delay_s=1.0,
+            clock=clock,
+        )
+        coordinator = DatastoreCoordinator(manager)
+
+        with self.assertRaises(DatastoreDeviceUnavailable):
+            coordinator.read("/datastore/uid")
+        clock.advance(1.0)
+        payload = coordinator.read("/datastore/uid")
+
+        self.assertEqual(payload.body, b'{"value":"ok"}')
+        self.assertEqual(payload.etag, "uid")
+        self.assertTrue(coordinator.status()["datastore_available"])
+
+    def test_reconnect_clears_etag_and_delta_history(self) -> None:
+        clock = ManualClock()
+        first = FakeManagedSession(
+            get_effects=[
+                http_response("1", b'{"state":1}'),
+                OSError(errno.ENODEV, "device disappeared"),
+            ]
+        )
+        second = FakeManagedSession(get_effects=[http_response("fresh", b'{"state":"fresh"}')])
+        opener = FakeManagedOpener([first, second])
+        manager = ManagedDatastore(
+            DatastoreConfig(),
+            opener=opener,
+            reconnect_initial_delay_s=1.0,
+            clock=clock,
+        )
+        coordinator = DatastoreCoordinator(manager)
+        self.assertEqual(coordinator.read("/datastore").etag, "1")
+        coordinator._publish_payload(DatastorePayload(b'{"delta":2}', etag="2"), None, from_etag="1")
+        self.assertEqual(len(coordinator.history), 1)
+
+        with self.assertRaises(DatastoreDeviceUnavailable):
+            coordinator.read("/datastore")
+        clock.advance(1.0)
+        recovered = coordinator.read("/datastore")
+
+        self.assertEqual(recovered.body, b'{"state":"fresh"}')
+        self.assertEqual(recovered.etag, "fresh")
+        self.assertEqual(coordinator.latest_etag, "fresh")
+        self.assertEqual(coordinator.history, ())
 
     def test_poller_error_logging_is_rate_limited(self) -> None:
         coordinator = DatastoreCoordinator(
@@ -913,6 +1245,7 @@ class DatastoreCoordinatorTests(TestCase):
             coordinator.close()
 
     def test_close_waits_for_blocked_long_poll_to_exit(self) -> None:
+        initial = response_packet(b'HTTP/1.1 200 OK\r\nETag: 1\r\n\r\n{"state":1}')
         transport = BlockingTransport()
         coordinator = DatastoreCoordinator(
             MotuUsbDatastore(transport),
@@ -923,6 +1256,7 @@ class DatastoreCoordinatorTests(TestCase):
         coordinator.start()
         try:
             self.assertTrue(transport.wait_for_writes(1))
+            transport.push(initial)
             self.assertTrue(transport.wait_for_cancellable_reads(1))
             self.assertEqual(transport.cancellable_read_timeouts[0], 20)
 

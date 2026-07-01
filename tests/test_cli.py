@@ -18,6 +18,7 @@ from motu_proxy.cli import (
     write_token_file,
 )
 from motu_proxy.datastore import DatastoreNoResponse, ResponseStats
+from motu_proxy.device import NoDeviceFound
 from motu_proxy.http_server import DatastoreDispatcher
 
 
@@ -105,6 +106,7 @@ class FakeServeDatastore:
         etag: str = "0",
         client: str | None = None,
         timeout_ms: int = 1200,
+        **kwargs,
     ) -> bytes:
         self.calls.append((path, client))
         return self.response
@@ -115,6 +117,7 @@ class FakeServeDatastore:
         json_body: str,
         client: str | None = None,
         timeout_ms: int = 1200,
+        **kwargs,
     ) -> bytes:
         raise AssertionError("unexpected post")
 
@@ -246,19 +249,48 @@ class CliServeSecurityTests(TestCase):
             remove_write_token_file(str(path), "replacement")
             self.assertFalse(path.exists())
 
-    def test_serve_does_not_create_write_token_before_usb_open(self) -> None:
+    def test_serve_removes_write_token_file_when_usb_is_unavailable(self) -> None:
+        class FakeServer:
+            def __init__(
+                self,
+                server_address,
+                allow_writes,
+                debug,
+                run_get,
+                run_post,
+                write_token=None,
+                write_token_file=None,
+                allow_remote_writes=False,
+                max_write_body_bytes=64 * 1024,
+                serialize_dispatch=True,
+                validate_writes=True,
+                allow_unknown_writes=False,
+                status_provider=None,
+            ) -> None:
+                self.write_token = write_token
+
         with TemporaryDirectory() as tmp:
             path = Path(tmp) / "write-token"
             args = build_parser().parse_args(["serve", "--allow-writes", "--write-token-file", str(path)])
+
+            def fake_serve(server, before_close=None) -> int:
+                self.assertTrue(path.exists())
+                self.assertEqual(path.read_text(encoding="ascii"), f"{server.write_token}\n")
+                if before_close is not None:
+                    before_close()
+                return 0
+
             with (
                 patch(
                     "motu_proxy.cli.open_datastore",
-                    side_effect=RuntimeError("open failed"),
+                    side_effect=NoDeviceFound("missing"),
                 ),
-                self.assertRaisesRegex(RuntimeError, "open failed"),
+                patch("motu_proxy.cli.MotuProxyServer", FakeServer),
+                patch("motu_proxy.cli.serve", side_effect=fake_serve),
             ):
-                args.func(args)
+                result = args.func(args)
 
+            self.assertEqual(result, 0)
             self.assertFalse(path.exists())
 
     def test_serve_removes_write_token_file_after_shutdown(self) -> None:

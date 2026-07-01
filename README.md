@@ -136,11 +136,31 @@ Check local proxy/coordinator health:
 curl http://127.0.0.1:1280/__motu_proxy/status
 ```
 
-By default the server binds to `127.0.0.1`, opens one USB datastore session for
-the server lifetime, and rejects POST/PATCH. A `DatastoreCoordinator` owns USB
-access for the HTTP server: foreground reads and writes are serialized against a
-background `/datastore` long-poller that tracks ETags and fans out changes to
-HTTP long-poll waiters.
+By default the server binds to `127.0.0.1` and rejects POST/PATCH. A
+`ManagedDatastore` owns MOTU USB discovery, usbfs open/close, datastore init,
+and hotplug recovery for the HTTP server. A `DatastoreCoordinator` owns
+foreground/background USB access: foreground reads and writes are serialized
+against a background `/datastore` long-poller that tracks ETags and fans out
+changes to HTTP long-poll waiters.
+
+If the configured MOTU is unplugged, power-cycled, reset, or temporarily absent
+when `serve` starts, the process stays alive and retries discovery/open/init with
+bounded backoff. Foreground datastore requests return `503 Service Unavailable`
+while no usable datastore session exists. The status endpoint reports recovery
+state without performing a datastore read, including:
+
+- `datastore_available`
+- `datastore_reconnect_state`
+- `datastore_session_generation`
+- `datastore_last_reconnect_error`
+- `datastore_retry_delay_s`
+- `datastore_next_retry_in_s`
+
+When a fresh USB datastore session is opened after reconnect, coordinated ETag
+and delta history from the previous session are discarded before service
+resumes. If a write loses the device before a valid write response is received,
+the proxy returns an error for that request and does not replay the write after
+reconnect; clients must decide whether to retry.
 
 GET responses include `Cache-Control: no-cache` and an `ETag` header when the
 device supplies one. A GET with `If-None-Match` waits against coordinated
@@ -156,6 +176,27 @@ USB meter polling in production.
 
 During shutdown the coordinator asks the background poller to stop and waits for
 it before the USB datastore context is released.
+
+### Live Hotplug Recovery Validation
+
+Use only the vendor-specific datastore control interface for live recovery
+validation; do not disturb ALSA audio ownership.
+
+```sh
+scp -r motu_proxy tools root@10.0.8.104:/tmp/motu-proxy-live/
+ssh root@10.0.8.104 'cd /tmp/motu-proxy-live && PYTHONPATH=. python3 -m motu_proxy serve --listen 127.0.0.1 --port 1280 --serial 0001f2fffe00c719'
+```
+
+In another shell, confirm a harmless read, disconnect or power-cycle the MOTU,
+observe `503` during the outage, then reconnect the same device and confirm reads
+resume without restarting `serve`:
+
+```sh
+ssh root@10.0.8.104 'curl -fsS http://127.0.0.1:1280/datastore/uid'
+ssh root@10.0.8.104 'curl -i http://127.0.0.1:1280/datastore/uid'
+ssh root@10.0.8.104 'curl -fsS http://127.0.0.1:1280/__motu_proxy/status'
+ssh root@10.0.8.104 'curl -fsS http://127.0.0.1:1280/datastore/uid'
+```
 
 ## Write Mode
 
