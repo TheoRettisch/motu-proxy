@@ -274,7 +274,7 @@ def command_serve(args) -> int:
     write_token_file_path: str | None = None
     coordinator.start()
     try:
-        if args.allow_writes:
+        if args.allow_writes and args.require_write_token:
             write_token, write_token_file_path = prepare_write_token(args.write_token_file)
         server = MotuProxyServer(
             (args.listen, args.port),
@@ -466,21 +466,26 @@ def build_parser() -> argparse.ArgumentParser:
     serve_parser.add_argument("--port", type=_port_arg, default=1280)
     serve_parser.add_argument("--allow-writes", action="store_true")
     serve_parser.add_argument(
+        "--require-write-token",
+        action="store_true",
+        help="require a generated token for HTTP writes when --allow-writes is enabled",
+    )
+    serve_parser.add_argument(
         "--write-token-file",
         default=str(DEFAULT_WRITE_TOKEN_FILE),
-        help="write the generated HTTP write token here for local automation",
+        help="write the generated HTTP write token here when --require-write-token is set",
     )
     serve_parser.add_argument(
         "--no-write-token-file",
         dest="write_token_file",
         action="store_const",
         const=None,
-        help="print the generated write token but do not write a token file",
+        help="print the generated write token but do not write a token file when --require-write-token is set",
     )
     serve_parser.add_argument(
         "--unsafe-allow-remote-writes",
         action="store_true",
-        help="allow --allow-writes on a non-loopback listen address; token is still required",
+        help="allow --allow-writes on a non-loopback listen address; combine with --require-write-token for token protection",
     )
     serve_parser.add_argument(
         "--max-write-body-bytes",

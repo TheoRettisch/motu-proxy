@@ -14,17 +14,18 @@ The system SHALL provide production service packaging artifacts for running `mot
 #### Scenario: Write mode requires explicit opt-in
 - **WHEN** the packaged service is installed with default configuration
 - **THEN** HTTP POST and PATCH remain disabled
-- **AND** enabling HTTP writes requires an explicit service configuration change that uses the normal write-token protections
+- **AND** enabling HTTP writes requires an explicit service configuration change
+- **AND** requiring HTTP write tokens requires a separate explicit service configuration option
 
 ### Requirement: Service-managed token runtime directory
-The system SHALL use service-manager runtime directory handling for the HTTP write-token path and SHALL avoid exposing generated write tokens in service logs by default.
+The system SHALL use service-manager runtime directory handling for the optional HTTP write-token path and SHALL avoid exposing generated write tokens in service logs by default when token protection is enabled.
 
 #### Scenario: Runtime directory is created for token file
 - **WHEN** the service starts under systemd
 - **THEN** `/run/motu-proxy` is available with owner-only permissions suitable for `/run/motu-proxy/write-token`
 
 #### Scenario: Token is not printed to journald by default
-- **WHEN** the service starts with HTTP writes enabled and a token file configured
+- **WHEN** the service starts with HTTP writes and token protection enabled with a token file configured
 - **THEN** the generated token is written to the token file and is not printed in normal service logs
 
 #### Scenario: Token file is removed on clean service stop

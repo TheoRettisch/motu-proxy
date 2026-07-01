@@ -206,8 +206,25 @@ HTTP writes require `--allow-writes`:
 motu-proxy serve --allow-writes
 ```
 
-When write mode is enabled, `motu-proxy` generates a random token and writes it
-to:
+With the default loopback bind, write mode is intended for trusted local
+automation and does not require a write token. Example write:
+
+```sh
+curl \
+  -X POST \
+  -H "Content-Type: application/json" \
+  --data '{"value":"linux"}' \
+  http://127.0.0.1:1280/datastore/host/os
+```
+
+To add token protection, enable it explicitly:
+
+```sh
+motu-proxy serve --allow-writes --require-write-token
+```
+
+In token-protected write mode, `motu-proxy` generates a random token and writes
+it to:
 
 ```text
 /run/motu-proxy/write-token
@@ -216,7 +233,8 @@ to:
 The token file is created with owner-only permissions on Linux. The token is not
 printed when the default token file is available; use `--debug` or
 `--no-write-token-file` for manual debugging where printing the token is useful.
-Every HTTP POST/PATCH must include the token using either:
+Every HTTP POST/PATCH must include the token when token protection is enabled,
+using either:
 
 ```text
 Authorization: Bearer <token>
@@ -248,7 +266,8 @@ HTTP writes accept either a raw JSON object body or an
 
 Additional write-mode protections:
 
-- Missing or incorrect write token is rejected.
+- Missing or incorrect write token is rejected when `--require-write-token` is
+  set.
 - Non-loopback `Host` headers are rejected by default.
 - Cross-origin browser writes are rejected when an `Origin` header is present.
 - `Origin: null` is rejected.
@@ -262,23 +281,20 @@ Additional write-mode protections:
   `--unsafe-allow-remote-writes`.
 
 Avoid exposing write mode on a LAN unless the host is otherwise isolated and
-the token is treated as a secret.
+consider `--require-write-token` if remote writes are enabled.
 
 ## Local Automation
 
-Buildroot or other local scripts can consume the generated token without user
-interaction by reading the token file and sending it as a bearer token:
+Buildroot or other local scripts running on the same host can use loopback write
+mode without a token:
 
 ```python
-from pathlib import Path
 from urllib.request import Request, urlopen
 
-token = Path("/run/motu-proxy/write-token").read_text(encoding="ascii").strip()
 request = Request(
     "http://127.0.0.1:1280/datastore/host/os",
     data=b'{"value":"linux"}',
     headers={
-        "Authorization": f"Bearer {token}",
         "Content-Type": "application/json",
     },
     method="POST",
@@ -287,16 +303,18 @@ request = Request(
 response = urlopen(request, timeout=2).read()
 ```
 
-The token path can be changed:
+If token protection is enabled, local scripts can consume the generated token by
+reading the token file and sending it as a bearer token. The token path can be
+changed:
 
 ```sh
-motu-proxy serve --allow-writes --write-token-file /run/my-service/motu-token
+motu-proxy serve --allow-writes --require-write-token --write-token-file /run/my-service/motu-token
 ```
 
 or disabled if an operator wants the token only on stderr:
 
 ```sh
-motu-proxy serve --allow-writes --no-write-token-file
+motu-proxy serve --allow-writes --require-write-token --no-write-token-file
 ```
 
 ## Development

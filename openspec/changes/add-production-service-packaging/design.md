@@ -8,7 +8,7 @@ The service must preserve the existing safety model: read-only HTTP by default, 
 
 **Goals:**
 - Provide systemd service artifacts that operators can install without hand-writing unit files.
-- Make the default service read-only, loopback-bound, restartable, and compatible with `/run/motu-proxy/write-token`.
+- Make the default service read-only, loopback-bound, restartable, and compatible with optional `/run/motu-proxy/write-token` protection.
 - Support environment-file configuration for listen address, port, serial/device selection, validation flags, debug flags, and explicit write-mode opt-in.
 - Ensure supervised shutdown closes the coordinator/server path and removes the runtime token file.
 - Include conservative hardening directives that do not block sysfs discovery or usbfs access.
@@ -30,13 +30,13 @@ The service must preserve the existing safety model: read-only HTTP by default, 
 
 2. Use a simple environment-file argument pattern.
 
-   The unit should run `motu-proxy serve` and read operator-controlled options from an environment file such as `/etc/motu-proxy/motu-proxy.env`. Defaults should bind to `127.0.0.1:1280`, keep writes disabled, and write the token to `/run/motu-proxy/write-token` only when writes are explicitly enabled. Device selection should be configurable with normal CLI flags, especially `--serial`.
+   The unit should run `motu-proxy serve` and read operator-controlled options from an environment file such as `/etc/motu-proxy/motu-proxy.env`. Defaults should bind to `127.0.0.1:1280`, keep writes disabled, and write the token to `/run/motu-proxy/write-token` only when writes and token protection are explicitly enabled. Device selection should be configurable with normal CLI flags, especially `--serial`.
 
    Alternative considered: invent a separate config-file parser. That adds runtime surface area and duplicates the CLI contract.
 
 3. Let systemd own the runtime directory.
 
-   The service unit should use `RuntimeDirectory=motu-proxy` and `RuntimeDirectoryMode=0700`. The application still generates and removes the write-token file, but the service manager creates the parent directory with predictable permissions and cleans it on service exit.
+   The service unit should use `RuntimeDirectory=motu-proxy` and `RuntimeDirectoryMode=0700`. When token protection is enabled, the application still generates and removes the write-token file, but the service manager creates the parent directory with predictable permissions and cleans it on service exit.
 
    Alternative considered: continue relying only on application-side `mkdir`. That works interactively, but systemd runtime directory management is clearer and avoids stale directory ownership surprises.
 

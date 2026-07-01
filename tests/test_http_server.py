@@ -111,7 +111,7 @@ class HttpServerTests(TestCase):
         allow_writes: bool = False,
         origin: str | None = None,
         host: str | None | object = _UNSET,
-        write_token: str | None = WRITE_TOKEN,
+        write_token: str | None = None,
         request_token: str | None | object = _UNSET,
         allow_remote_writes: bool = False,
         allow_unknown_writes: bool = False,
@@ -603,9 +603,27 @@ class HttpServerTests(TestCase):
             )
         self.assertEqual(calls, [])
 
-    def test_missing_write_token_is_rejected_when_writes_are_enabled(self) -> None:
+    def test_write_without_token_is_allowed_when_token_protection_is_disabled(self) -> None:
+        result, calls = self.dispatch(
+            "POST",
+            "/host/os",
+            body='{"value":"linux"}',
+            allow_writes=True,
+            request_token=None,
+        )
+        self.assertEqual(result.response, b'{"ok":true}')
+        self.assertEqual(calls, [("POST", "/datastore/host/os", '{"value":"linux"}')])
+
+    def test_missing_write_token_is_rejected_when_token_protection_is_enabled(self) -> None:
         with self.assertRaises(WriteTokenRequired):
-            self.dispatch("POST", "/host/os", body='{"value":"linux"}', allow_writes=True, request_token=None)
+            self.dispatch(
+                "POST",
+                "/host/os",
+                body='{"value":"linux"}',
+                allow_writes=True,
+                write_token=WRITE_TOKEN,
+                request_token=None,
+            )
 
     def test_non_ascii_write_token_is_rejected_without_type_error(self) -> None:
         with self.assertRaises(WriteTokenRequired):
@@ -614,6 +632,7 @@ class HttpServerTests(TestCase):
                 "/host/os",
                 body='{"value":"linux"}',
                 allow_writes=True,
+                write_token=WRITE_TOKEN,
                 request_token="tést-write-token",
             )
 
@@ -637,17 +656,18 @@ class HttpServerTests(TestCase):
                 origin="null",
             )
 
-    def test_unsafe_remote_write_mode_still_requires_token(self) -> None:
-        with self.assertRaises(WriteTokenRequired):
-            self.dispatch(
-                "POST",
-                "/host/os",
-                body='{"value":"linux"}',
-                allow_writes=True,
-                host="device.local:1280",
-                request_token=None,
-                allow_remote_writes=True,
-            )
+    def test_unsafe_remote_write_mode_allows_non_loopback_host_without_token_protection(self) -> None:
+        result, calls = self.dispatch(
+            "POST",
+            "/host/os",
+            body='{"value":"linux"}',
+            allow_writes=True,
+            host="device.local:1280",
+            request_token=None,
+            allow_remote_writes=True,
+        )
+        self.assertEqual(result.response, b'{"ok":true}')
+        self.assertEqual(calls, [("POST", "/datastore/host/os", '{"value":"linux"}')])
 
     def test_unsafe_remote_write_mode_allows_non_loopback_host_with_token(self) -> None:
         result, calls = self.dispatch(
@@ -656,6 +676,7 @@ class HttpServerTests(TestCase):
             body='{"value":"linux"}',
             allow_writes=True,
             host="device.local:1280",
+            write_token=WRITE_TOKEN,
             allow_remote_writes=True,
         )
         self.assertEqual(result.response, b'{"ok":true}')
@@ -1085,6 +1106,56 @@ class HttpServerTests(TestCase):
         self.assertEqual(result, 0)
         self.assertIn("write token: secret-token", stderr.getvalue())
 
+    def test_serve_reports_token_disabled_when_no_token_is_configured(self) -> None:
+        class Server:
+            server_address = ("127.0.0.1", 0)
+            allow_writes = True
+            debug = False
+            write_token = None
+            write_token_file = None
+            allow_remote_writes = False
+            validate_writes = True
+            allow_unknown_writes = False
+
+            def serve_forever(self):
+                raise KeyboardInterrupt
+
+            def server_close(self):
+                pass
+
+        stderr = StringIO()
+        with redirect_stderr(stderr):
+            result = serve(Server())
+
+        self.assertEqual(result, 0)
+        output = stderr.getvalue()
+        self.assertIn("write token: disabled", output)
+        self.assertNotIn("write token header", output)
+
+    def test_serve_warns_for_remote_writes_without_token_protection(self) -> None:
+        class Server:
+            server_address = ("0.0.0.0", 0)
+            allow_writes = True
+            debug = False
+            write_token = None
+            write_token_file = None
+            allow_remote_writes = True
+            validate_writes = True
+            allow_unknown_writes = False
+
+            def serve_forever(self):
+                raise KeyboardInterrupt
+
+            def server_close(self):
+                pass
+
+        stderr = StringIO()
+        with redirect_stderr(stderr):
+            result = serve(Server())
+
+        self.assertEqual(result, 0)
+        self.assertIn("remote HTTP writes are enabled without token protection", stderr.getvalue())
+
 
 class HttpHandlerTests(TestCase):
     def make_handler(
@@ -1398,6 +1469,25 @@ class HttpHandlerTests(TestCase):
         self.assertIn(("Content-Length", str(len(body))), handler.sent_headers)
         self.assertIn(("Connection", "close"), handler.sent_headers)
         self.assertIn("valid write token required", json.loads(body.decode("utf-8"))["error"])
+
+    def test_handler_accepts_write_without_token_when_token_protection_is_disabled(self) -> None:
+        calls: list[tuple[str, str]] = []
+
+        def get(path: str, client: str | None = None) -> bytes:
+            raise AssertionError("unexpected get")
+
+        def post(path: str, body: str, client: str | None = None) -> bytes:
+            calls.append((path, body))
+            return b'{"ok":true}'
+
+        dispatcher = DatastoreDispatcher(True, get, post, write_token=None, log_write=None)
+        handler = self.make_handler({"Content-Length": "17", "Host": "127.0.0.1:1280"}, b'{"value":"linux"}', dispatcher)
+        handler.path = "/host/os"
+        handler.handle_datastore_request("POST")
+
+        self.assertEqual(handler.statuses, [200])
+        self.assertEqual(handler.wfile.getvalue(), b'{"ok":true}')
+        self.assertEqual(calls, [("/datastore/host/os", '{"value":"linux"}')])
 
     def test_handler_rejects_unsafe_writes_before_reading_body(self) -> None:
         def get(path: str, client: str | None = None) -> bytes:

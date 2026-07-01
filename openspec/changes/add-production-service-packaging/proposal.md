@@ -6,7 +6,7 @@
 
 - Add systemd-oriented service packaging artifacts for running the HTTP proxy as a read-only service by default.
 - Provide a configurable environment-file pattern for listen address, port, serial/device selection, validation/debug flags, and explicit write-mode opt-in.
-- Use service-manager runtime directory handling for the write-token file so tokens are not printed to journald by default and are removed on shutdown.
+- Use service-manager runtime directory handling for optional write-token files so tokens are not printed to journald by default when token protection is enabled and are removed on shutdown.
 - Add clean signal/shutdown behavior for supervised `serve` mode so the coordinator closes and runtime token cleanup runs on service stop.
 - Add service hardening guidance/directives that preserve access to sysfs and the vendor-specific USB device while avoiding ALSA interface ownership changes.
 - Document installation, configuration, status checks, logs, and live MOTU validation workflow.

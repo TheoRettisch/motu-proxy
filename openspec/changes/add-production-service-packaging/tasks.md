@@ -25,7 +25,7 @@
 
 - [ ] 4.1 Update README or operations documentation with install, environment-file configuration, start/stop/enable, and rollback steps.
 - [ ] 4.2 Document how to check service logs, `/__motu_proxy/status`, and a harmless datastore read.
-- [ ] 4.3 Document write-mode enablement, token-file location, and the reason tokens are not printed to journald by default.
+- [ ] 4.3 Document write-mode enablement, optional token-protection enablement, token-file location, and the reason tokens are not printed to journald by default when token protection is enabled.
 - [ ] 4.4 Document live service validation against `root@10.0.8.104` using only vendor-specific datastore read paths and avoiding parallel USB validations.
 
 ## 5. Verification

@@ -182,9 +182,9 @@ def validate_write_origin(method: str, allow_writes: bool, origin: str | None, h
 
 
 def validate_write_token(method: str, allow_writes: bool, expected_token: str | None, request_token: str | None) -> None:
-    if method == "GET" or not allow_writes:
+    if method == "GET" or not allow_writes or expected_token is None:
         return
-    if not expected_token or not request_token:
+    if not request_token:
         raise WriteTokenRequired("valid write token required")
     if not hmac.compare_digest(_token_bytes(expected_token), _token_bytes(request_token)):
         raise WriteTokenRequired("valid write token required")
@@ -652,15 +652,21 @@ def serve(server: MotuProxyServer, before_close: Callable[[], None] | None = Non
     host, port = server.server_address[:2]
     print(f"listening on http://{host}:{port} writes={'on' if server.allow_writes else 'off'}", file=sys.stderr)
     if server.allow_writes:
-        if server.debug or not server.write_token_file:
-            print(f"write token: {server.write_token}", file=sys.stderr)
+        if server.write_token is None:
+            print("write token: disabled (use --require-write-token to require one)", file=sys.stderr)
         else:
-            print("write token: stored in token file (use --debug to print)", file=sys.stderr)
-        print(f"write token header: {WRITE_TOKEN_HEADER} or Authorization: Bearer", file=sys.stderr)
-        if server.write_token_file:
-            print(f"write token file: {server.write_token_file}", file=sys.stderr)
+            if server.debug or not server.write_token_file:
+                print(f"write token: {server.write_token}", file=sys.stderr)
+            else:
+                print("write token: stored in token file (use --debug to print)", file=sys.stderr)
+            print(f"write token header: {WRITE_TOKEN_HEADER} or Authorization: Bearer", file=sys.stderr)
+            if server.write_token_file:
+                print(f"write token file: {server.write_token_file}", file=sys.stderr)
         if server.allow_remote_writes:
-            print("WARNING: remote HTTP writes are enabled; keep the token secret", file=sys.stderr)
+            if server.write_token is None:
+                print("WARNING: remote HTTP writes are enabled without token protection", file=sys.stderr)
+            else:
+                print("WARNING: remote HTTP writes are enabled; keep the token secret", file=sys.stderr)
         if not server.validate_writes:
             print("WARNING: datastore write validation is disabled", file=sys.stderr)
         elif server.allow_unknown_writes:
