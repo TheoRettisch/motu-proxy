@@ -4,13 +4,12 @@ from __future__ import annotations
 
 import math
 import re
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from numbers import Real
-from typing import Callable, Iterable
 
 from .json_body import InvalidJsonBody, load_json_object
 from .paths import normalize_path
-
 
 DATASTORE_PREFIX = "/datastore/"
 SEMVER_RE = re.compile(r"^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$")
@@ -541,7 +540,7 @@ def _match_score(
         return None
     exact = 0
     placeholders = 0
-    for pattern_segment, requested_segment in zip(pattern, requested):
+    for pattern_segment, requested_segment in zip(pattern, requested, strict=True):
         if pattern_segment == requested_segment:
             exact += 1
             continue

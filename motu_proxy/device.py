@@ -7,7 +7,6 @@ from pathlib import Path
 
 from .protocol import DEFAULT_MAX_USB_CHUNK
 
-
 DEFAULT_SYSFS_ROOT = Path("/sys/bus/usb/devices")
 DEFAULT_DEVFS_ROOT = Path("/dev/bus/usb")
 

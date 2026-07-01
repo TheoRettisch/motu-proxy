@@ -75,18 +75,20 @@ class UsbFsTransportTests(TestCase):
             patch("motu_proxy.transports.usbfs.os.open", return_value=77),
             patch("motu_proxy.transports.usbfs.claim_interface", side_effect=OSError("claim failed")),
             patch("motu_proxy.transports.usbfs.os.close") as close,
+            self.assertRaises(OSError),
         ):
-            with self.assertRaises(OSError):
-                transport.__enter__()
+            transport.__enter__()
         close.assert_called_once_with(77)
         self.assertIsNone(transport.fd)
 
     def test_bulk_write_rejects_short_write(self) -> None:
         transport = UsbFsTransport(device_info())
         transport.fd = 77
-        with patch("motu_proxy.transports.usbfs._ioctl", return_value=3):
-            with self.assertRaisesRegex(OSError, "short USB bulk write"):
-                transport.bulk_write(b"1234")
+        with (
+            patch("motu_proxy.transports.usbfs._ioctl", return_value=3),
+            self.assertRaisesRegex(OSError, "short USB bulk write"),
+        ):
+            transport.bulk_write(b"1234")
 
     def test_cancellable_read_surfaces_device_disconnect(self) -> None:
         def no_submit() -> None:

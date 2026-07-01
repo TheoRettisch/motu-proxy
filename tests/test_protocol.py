@@ -59,6 +59,8 @@ class ProtocolTests(TestCase):
 
     def test_host_sequence_rejects_invalid_start(self) -> None:
         for seq_start in (0x1F, 0x40, 0x120):
-            with self.subTest(seq_start=seq_start):
-                with self.assertRaisesRegex(InvalidHostSequence, "0x20..0x3f"):
-                    HostSequencer(seq_start)
+            with (
+                self.subTest(seq_start=seq_start),
+                self.assertRaisesRegex(InvalidHostSequence, "0x20..0x3f"),
+            ):
+                HostSequencer(seq_start)

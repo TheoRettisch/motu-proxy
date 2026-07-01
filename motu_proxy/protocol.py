@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import struct
 
-
 MOTU_VID = 0x07FD
 MOTU_AVB_PID = 0x0005
 

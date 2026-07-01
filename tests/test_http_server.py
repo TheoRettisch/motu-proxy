@@ -1,7 +1,6 @@
 import json
-from io import BytesIO
 from contextlib import redirect_stderr
-from io import StringIO
+from io import BytesIO, StringIO
 from types import SimpleNamespace
 from unittest import TestCase
 
@@ -17,10 +16,10 @@ from motu_proxy.http_server import (
     HostNotAllowed,
     MotuProxyHandler,
     MotuProxyServer,
-    RequestBodyTooLarge,
     RequestBodyTimeout,
-    WriteTokenRequired,
+    RequestBodyTooLarge,
     WritesDisabled,
+    WriteTokenRequired,
     dispatch_datastore_request,
     log_write_attempt,
     log_write_attempt_debug,
@@ -31,7 +30,6 @@ from motu_proxy.json_body import InvalidJsonBody
 from motu_proxy.parser import DatastorePayload
 from motu_proxy.protocol import ProtocolFrameTooLarge, max_post_json_body_bytes
 from motu_proxy.schema import DatastorePermissionError, DatastoreValidationError
-
 
 WRITE_TOKEN = "test-write-token"
 _UNSET = object()
@@ -557,20 +555,22 @@ class HttpServerTests(TestCase):
             return b"{}"
 
         for body in ("[]", "5", "true", '"x"'):
-            with self.subTest(body=body):
-                with self.assertRaisesRegex(InvalidJsonBody, "JSON object"):
-                    dispatch_datastore_request(
-                        "POST",
-                        "/host/os",
-                        body,
-                        "application/json",
-                        True,
-                        lambda path, client=None: b"{}",
-                        post,
-                        host="127.0.0.1:1280",
-                        write_token=WRITE_TOKEN,
-                        request_token=WRITE_TOKEN,
-                    )
+            with (
+                self.subTest(body=body),
+                self.assertRaisesRegex(InvalidJsonBody, "JSON object"),
+            ):
+                dispatch_datastore_request(
+                    "POST",
+                    "/host/os",
+                    body,
+                    "application/json",
+                    True,
+                    lambda path, client=None: b"{}",
+                    post,
+                    host="127.0.0.1:1280",
+                    write_token=WRITE_TOKEN,
+                    request_token=WRITE_TOKEN,
+                )
         self.assertEqual(calls, [])
 
     def test_read_only_write_is_rejected_before_usb_call(self) -> None:

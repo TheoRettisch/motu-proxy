@@ -5,12 +5,11 @@ from __future__ import annotations
 import hmac
 import ipaddress
 import json
-import socket
 import sys
 import threading
+from collections.abc import Callable
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Callable
 from urllib.parse import parse_qs, urlparse
 
 from .datastore import (
@@ -22,11 +21,18 @@ from .datastore import (
 )
 from .device import DeviceDiscoveryError
 from .json_body import InvalidJsonBody, validate_json_body
-from .paths import normalize_path
 from .parser import DatastorePayload, ResponseFrameError
-from .protocol import ProtocolFrameTooLarge, max_post_json_body_bytes, validate_post_frame_size
-from .schema import DatastorePermissionError, DatastoreValidationError, validate_datastore_write
-
+from .paths import normalize_path
+from .protocol import (
+    ProtocolFrameTooLarge,
+    max_post_json_body_bytes,
+    validate_post_frame_size,
+)
+from .schema import (
+    DatastorePermissionError,
+    DatastoreValidationError,
+    validate_datastore_write,
+)
 
 DatastoreRead = Callable[..., bytes | DatastorePayload]
 DatastoreWrite = Callable[[str, str, str | None], bytes | DatastorePayload]
@@ -410,7 +416,7 @@ class MotuProxyHandler(BaseHTTPRequestHandler):
             timeout_was_set = True
         try:
             return self.rfile.read(length)
-        except (TimeoutError, socket.timeout) as exc:
+        except TimeoutError as exc:
             self.close_connection = True
             raise RequestBodyTimeout("request body read timed out") from exc
         finally:

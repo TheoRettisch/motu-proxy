@@ -8,9 +8,9 @@ import json
 import sys
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -22,9 +22,18 @@ from motu_proxy.datastore import (  # noqa: E402
     DatastoreCoordinator,
     MotuUsbDatastore,
 )
-from motu_proxy.device import DEFAULT_DEVFS_ROOT, DEFAULT_SYSFS_ROOT, find_motu_device  # noqa: E402
+from motu_proxy.device import (  # noqa: E402
+    DEFAULT_DEVFS_ROOT,
+    DEFAULT_SYSFS_ROOT,
+    find_motu_device,
+)
 from motu_proxy.parser import DatastorePayload  # noqa: E402
-from motu_proxy.protocol import DEFAULT_MESSAGE_SEQ, DEFAULT_SEQ_START, MOTU_AVB_PID, MOTU_VID  # noqa: E402
+from motu_proxy.protocol import (  # noqa: E402
+    DEFAULT_MESSAGE_SEQ,
+    DEFAULT_SEQ_START,
+    MOTU_AVB_PID,
+    MOTU_VID,
+)
 from motu_proxy.transports.usbfs import UsbFsTransport  # noqa: E402
 
 

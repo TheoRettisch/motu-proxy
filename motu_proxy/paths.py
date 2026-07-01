@@ -5,7 +5,6 @@ from __future__ import annotations
 import re
 from urllib.parse import unquote, urlparse
 
-
 UID_PREFIX_RE = re.compile(r"^/[0-9a-fA-F]{16}(/.*)$")
 
 

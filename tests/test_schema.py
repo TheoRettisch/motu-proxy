@@ -96,12 +96,14 @@ class DatastoreSchemaTests(TestCase):
 
     def test_rejects_non_finite_json_numbers(self) -> None:
         for value in ("NaN", "Infinity", "-Infinity"):
-            with self.subTest(value=value):
-                with self.assertRaisesRegex(DatastoreValidationError, "valid JSON"):
-                    validate_datastore_write(
-                        "/datastore/mix/chan/0/matrix/fader",
-                        f'{{"value":{value}}}',
-                    )
+            with (
+                self.subTest(value=value),
+                self.assertRaisesRegex(DatastoreValidationError, "valid JSON"),
+            ):
+                validate_datastore_write(
+                    "/datastore/mix/chan/0/matrix/fader",
+                    f'{{"value":{value}}}',
+                )
 
     def test_validates_type(self) -> None:
         with self.assertRaisesRegex(DatastoreValidationError, "integer"):

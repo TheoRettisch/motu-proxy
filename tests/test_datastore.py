@@ -1,7 +1,7 @@
-from contextlib import redirect_stderr
-from io import StringIO
 import threading
 import time
+from contextlib import redirect_stderr
+from io import StringIO
 from unittest import TestCase
 
 from motu_proxy.datastore import (

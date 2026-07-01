@@ -25,7 +25,6 @@ from motu_proxy.protocol import (
 )
 from motu_proxy.transports.usbfs import UsbFsTransport
 
-
 DEFAULT_PATHS = (
     "/datastore/uid",
     "/datastore/host/mode",

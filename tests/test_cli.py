@@ -1,8 +1,8 @@
-from contextlib import redirect_stderr, redirect_stdout
-from io import StringIO
 import json
 import os
 import stat
+from contextlib import redirect_stderr, redirect_stdout
+from io import StringIO
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest import TestCase, skipIf
@@ -233,9 +233,14 @@ class CliServeSecurityTests(TestCase):
         with TemporaryDirectory() as tmp:
             path = Path(tmp) / "write-token"
             args = build_parser().parse_args(["serve", "--allow-writes", "--write-token-file", str(path)])
-            with patch("motu_proxy.cli.open_datastore", side_effect=RuntimeError("open failed")):
-                with self.assertRaisesRegex(RuntimeError, "open failed"):
-                    args.func(args)
+            with (
+                patch(
+                    "motu_proxy.cli.open_datastore",
+                    side_effect=RuntimeError("open failed"),
+                ),
+                self.assertRaisesRegex(RuntimeError, "open failed"),
+            ):
+                args.func(args)
 
             self.assertFalse(path.exists())
 
@@ -301,9 +306,9 @@ class CliServeSecurityTests(TestCase):
             with (
                 patch("motu_proxy.cli.open_datastore", return_value=FakeOpenDatastore(datastore)),
                 patch("motu_proxy.cli.MotuProxyServer", FailingServer),
+                self.assertRaisesRegex(RuntimeError, "bind failed"),
             ):
-                with self.assertRaisesRegex(RuntimeError, "bind failed"):
-                    args.func(args)
+                args.func(args)
 
             self.assertFalse(path.exists())
 
@@ -486,9 +491,14 @@ class CliServeSecurityTests(TestCase):
 class CliPostValidationTests(TestCase):
     def test_post_validation_failure_happens_before_opening_datastore(self) -> None:
         args = build_parser().parse_args(["post", "/uid", '{"value":"changed"}'])
-        with patch("motu_proxy.cli.open_datastore", side_effect=AssertionError("opened USB")):
-            with self.assertRaisesRegex(RuntimeError, "read-only"):
-                args.func(args)
+        with (
+            patch(
+                "motu_proxy.cli.open_datastore",
+                side_effect=AssertionError("opened USB"),
+            ),
+            self.assertRaisesRegex(RuntimeError, "read-only"),
+        ):
+            args.func(args)
 
     def test_post_no_validate_bypasses_schema_validation(self) -> None:
         datastore = FakePostDatastore()
@@ -505,9 +515,14 @@ class CliPostValidationTests(TestCase):
 
     def test_post_unknown_path_rejected_before_opening_datastore(self) -> None:
         args = build_parser().parse_args(["post", "/future/path", '{"value":{"new":true}}'])
-        with patch("motu_proxy.cli.open_datastore", side_effect=AssertionError("opened USB")):
-            with self.assertRaisesRegex(RuntimeError, "known writable schema"):
-                args.func(args)
+        with (
+            patch(
+                "motu_proxy.cli.open_datastore",
+                side_effect=AssertionError("opened USB"),
+            ),
+            self.assertRaisesRegex(RuntimeError, "known writable schema"),
+        ):
+            args.func(args)
 
     def test_post_allow_unknown_writes_forwards_unknown_path(self) -> None:
         datastore = FakePostDatastore()

@@ -205,7 +205,7 @@ class UsbFsTransport:
         self.debug = debug
         self.fd: int | None = None
 
-    def __enter__(self) -> "UsbFsTransport":
+    def __enter__(self) -> UsbFsTransport:
         flags = os.O_RDWR
         if hasattr(os, "O_CLOEXEC"):
             flags |= os.O_CLOEXEC

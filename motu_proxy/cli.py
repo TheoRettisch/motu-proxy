@@ -7,7 +7,6 @@ import ipaddress
 import json
 import os
 import secrets
-import socket
 import stat
 import sys
 import time
@@ -16,10 +15,10 @@ from pathlib import Path
 from .datastore import (
     CAPABILITY_SECTIONS,
     IDENTITY_KEYS,
+    MAX_MESSAGE_SEQ,
     DatastoreConfig,
     DatastoreCoordinator,
     DeviceCapabilityInfo,
-    MAX_MESSAGE_SEQ,
     ResponseStats,
     open_datastore,
     read_device_capability_info,
@@ -47,7 +46,6 @@ from .protocol import (
     validate_host_seq,
 )
 from .schema import validate_datastore_write
-
 
 DEFAULT_WRITE_TOKEN_FILE = Path("/run/motu-proxy/write-token")
 DEFAULT_SMOKE_PATHS = ("/datastore/uid", "/datastore/ext/maxUSBToHost", "/datastore/host/mode")
@@ -491,6 +489,6 @@ def main(argv: list[str] | None = None) -> int:
         return args.func(args)
     except BrokenPipeError:
         return 1
-    except (OSError, RuntimeError, AssertionError, socket.error) as exc:
+    except (OSError, RuntimeError, AssertionError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1

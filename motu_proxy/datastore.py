@@ -3,15 +3,16 @@
 from __future__ import annotations
 
 import json
-import sys
 import struct
+import sys
 import threading
 import time
 from collections import deque
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Iterator, Protocol
+from typing import Protocol
 
 from .device import DEFAULT_DEVFS_ROOT, DEFAULT_SYSFS_ROOT, find_motu_device
 from .parser import (
@@ -38,7 +39,6 @@ from .protocol import (
     build_post_frame,
 )
 from .transports.usbfs import UsbFsTransport
-
 
 DEFAULT_RESPONSE_TIMEOUT_MS = DEFAULT_TIMEOUT_MS * 2
 DEFAULT_LONG_POLL_TIMEOUT_MS = 16_000
@@ -425,7 +425,7 @@ class MotuUsbDatastore:
                 if message_seq is not None and message_seq != expected_message_seq:
                     try:
                         parsed_stale = parse_response_frame(packet, message_seq)
-                    except ResponseFrameError:
+                    except ResponseFrameError as exc:
                         ignored_packets += 1
                         self._write_frame(build_ack(self._next_host_seq()))
                         if ignored_packets > max_ignored_packets:
@@ -447,7 +447,7 @@ class MotuUsbDatastore:
                                     ignored_packets,
                                     ack_packets,
                                 )
-                            )
+                            ) from exc
                         continue
                     if stale_message_seq != message_seq:
                         stale_message_seq = message_seq
@@ -488,7 +488,7 @@ class MotuUsbDatastore:
                     continue
                 try:
                     parsed = parse_response_frame(packet, expected_message_seq)
-                except ResponseFrameError:
+                except ResponseFrameError as exc:
                     if message_seq == expected_message_seq:
                         self._record_response_stats(
                             timeout_ms,
@@ -520,7 +520,7 @@ class MotuUsbDatastore:
                                 ignored_packets,
                                 ack_packets,
                             )
-                        )
+                        ) from exc
                     continue
                 frames.append(packet)
                 total += len(packet)

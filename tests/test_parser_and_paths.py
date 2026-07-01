@@ -12,8 +12,8 @@ from motu_proxy.parser import (
     response_status_code,
     response_to_text,
 )
-from motu_proxy.protocol import sized_word, u32
 from motu_proxy.paths import normalize_path
+from motu_proxy.protocol import sized_word, u32
 
 from tests.helpers import response_packet
 
