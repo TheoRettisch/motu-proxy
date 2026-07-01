@@ -887,6 +887,8 @@ class DatastoreCoordinator:
         client: str | int | None = None,
         query_fields: Iterable[QueryField] | None = None,
     ) -> DatastorePayload:
+        query_fields = None if query_fields is None else tuple(query_fields)
+        can_use_cached_transition = _long_poll_query_fields_cacheable(query_fields)
         deadline = time.monotonic() + (self.http_wait_timeout_ms / 1000)
         client_id = _client_string(client)
         while True:
@@ -895,7 +897,7 @@ class DatastoreCoordinator:
             with self._condition:
                 transition, should_refresh = self._find_wait_outcome_locked(etag, client_id)
                 if transition is not None:
-                    if path == self.poll_path:
+                    if path == self.poll_path and can_use_cached_transition:
                         return DatastorePayload(transition.body, etag=transition.to_etag)
                     should_refresh = True
                 if should_refresh:
@@ -1203,6 +1205,12 @@ def _device_query_fields(
     if client is not None and not any(name == "client" for name, _value in fields):
         return (*fields, ("client", client))
     return fields
+
+
+def _long_poll_query_fields_cacheable(query_fields: tuple[QueryField, ...] | None) -> bool:
+    return query_fields is None or not query_fields or (
+        len(query_fields) == 1 and query_fields[0][0] == "client"
+    )
 
 
 def _exception_status(exc: Exception | None) -> dict[str, str] | None:

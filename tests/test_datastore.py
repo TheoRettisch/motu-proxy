@@ -578,6 +578,42 @@ class DatastoreCoordinatorTests(TestCase):
         self.assertEqual(stale.body, b'{"state":4}')
         self.assertEqual(stale.etag, "4")
 
+    def test_non_client_query_fields_bypass_cached_long_poll_transition(self) -> None:
+        transport = FakeTransport(
+            [
+                response_packet(b'HTTP/1.1 200 OK\r\nETag: 1\r\n\r\n{"state":1}'),
+                response_packet(
+                    b'HTTP/1.1 200 OK\r\nETag: 2\r\n\r\n{"future":"raw"}',
+                    message_seq=3,
+                ),
+            ]
+        )
+        coordinator = DatastoreCoordinator(
+            MotuUsbDatastore(transport),
+            http_wait_timeout_ms=1,
+        )
+        self.assertEqual(coordinator.read("/datastore").etag, "1")
+        coordinator._publish_payload(DatastorePayload(b'{"delta":2}', etag="2"), None, from_etag="1")
+
+        result = coordinator.get(
+            "/datastore",
+            if_none_match="1",
+            query_fields=(("future", "raw"),),
+        )
+
+        self.assertEqual(result.body, b'{"future":"raw"}')
+        self.assertEqual(result.etag, "2")
+        get_writes = [write for write in transport.writes if len(write) > 1 and write[1] == 0x80]
+        self.assertEqual(
+            get_writes[-1],
+            build_get_frame(
+                0x22,
+                3,
+                "/datastore",
+                query_fields=(("future", "raw"),),
+            ),
+        )
+
     def test_post_publishes_refreshed_datastore_instead_of_post_body(self) -> None:
         transport = FakeTransport(
             [

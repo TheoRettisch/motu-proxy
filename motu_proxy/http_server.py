@@ -134,8 +134,9 @@ def parse_get_query_fields(request_path: str) -> tuple[tuple[tuple[str, str], ..
             raise BadRequest("query field name must not be empty")
         if name == "client":
             value = validate_client_query_value(value)
-            if client is None:
-                client = value
+            if client is not None:
+                raise BadRequest("client query field must not be repeated")
+            client = value
         fields.append((name, value))
     return tuple(fields), client
 

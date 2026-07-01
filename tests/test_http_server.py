@@ -318,6 +318,30 @@ class HttpServerTests(TestCase):
             )
         self.assertEqual(calls, [])
 
+    def test_get_rejects_repeated_client_query_fields_before_usb_call(self) -> None:
+        calls: list[str] = []
+
+        def get(
+            path: str,
+            client: str | None = None,
+            if_none_match: str | None = None,
+            query_fields: tuple[tuple[str, str], ...] = (),
+        ) -> bytes:
+            calls.append(path)
+            return b"{}"
+
+        with self.assertRaisesRegex(BadRequest, "client.*repeated"):
+            dispatch_datastore_request(
+                "GET",
+                "/datastore?client=1&client=2",
+                "",
+                "",
+                False,
+                get,
+                lambda path, body, client=None: b"{}",
+            )
+        self.assertEqual(calls, [])
+
     def test_meters_response_body_and_etag_are_forwarded(self) -> None:
         body = b'{"unknown/future":[123,456]}'
         calls: list[tuple[tuple[tuple[str, str], ...]]] = []
