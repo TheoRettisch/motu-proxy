@@ -802,7 +802,7 @@ class DatastoreCoordinator:
                     self._release_io()
                 self.last_poller_error = None
                 self._publish_payload(payload, origin_client=None, from_etag=etag)
-            except DatastoreCancelled as exc:
+            except DatastoreCancelled:
                 if self._is_closed():
                     return
                 self.last_poller_error = None
