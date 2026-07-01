@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
-from .protocol import DEFAULT_EP_IN, DEFAULT_EP_OUT, DEFAULT_INTERFACE, DEFAULT_MAX_USB_CHUNK
+from .protocol import DEFAULT_MAX_USB_CHUNK
 
 
 DEFAULT_SYSFS_ROOT = Path("/sys/bus/usb/devices")
@@ -128,6 +128,13 @@ def find_motu_device(
     sysfs_root = Path(sysfs_root)
     devfs_root = Path(devfs_root)
     matches: list[UsbDeviceInfo] = []
+    missing_control: list[str] = []
+    overrides = (interface, ep_out, ep_in)
+    if any(value is not None for value in overrides) and not all(
+        value is not None for value in overrides
+    ):
+        raise DeviceDiscoveryError("manual USB overrides require interface, ep_out, and ep_in together")
+    use_manual_overrides = all(value is not None for value in overrides)
 
     try:
         device_paths = sorted(sysfs_root.iterdir())
@@ -157,27 +164,39 @@ def find_motu_device(
 
         discovered = _discover_control_interface(path, sysfs_root)
         if discovered is None:
-            if interface is None or ep_out is None or ep_in is None:
-                raise NoControlInterfaceFound(
-                    f"no unbound vendor-specific bulk control interface found for "
-                    f"{device_product or f'{vid:04x}:{pid:04x}'} {device_serial or '(no serial)'}"
-                )
-            discovered = (DEFAULT_INTERFACE, DEFAULT_EP_OUT, DEFAULT_EP_IN, DEFAULT_MAX_USB_CHUNK)
+            label = f"{device_product or f'{vid:04x}:{pid:04x}'} {device_serial or '(no serial)'}"
+            if not use_manual_overrides:
+                if serial:
+                    raise NoControlInterfaceFound(
+                        f"no unbound vendor-specific bulk control interface found for {label}"
+                    )
+                missing_control.append(label)
+                continue
+            assert interface is not None and ep_out is not None and ep_in is not None
+            discovered = (interface, ep_out, ep_in, DEFAULT_MAX_USB_CHUNK)
         discovered_interface, discovered_ep_out, discovered_ep_in, max_packet_size = discovered
+        if use_manual_overrides:
+            assert interface is not None and ep_out is not None and ep_in is not None
+            discovered_interface, discovered_ep_out, discovered_ep_in = interface, ep_out, ep_in
         matches.append(
             UsbDeviceInfo(
                 sysfs_path=path,
                 devfs_path=devfs_root / f"{bus:03d}" / f"{dev:03d}",
                 serial=device_serial,
                 product=device_product,
-                interface=discovered_interface if interface is None else interface,
-                ep_out=discovered_ep_out if ep_out is None else ep_out,
-                ep_in=discovered_ep_in if ep_in is None else ep_in,
+                interface=discovered_interface,
+                ep_out=discovered_ep_out,
+                ep_in=discovered_ep_in,
                 max_packet_size=max_packet_size,
             )
         )
 
     if not matches:
+        if missing_control:
+            devices = ", ".join(missing_control)
+            raise NoControlInterfaceFound(
+                f"no unbound vendor-specific bulk control interface found for {devices}"
+            )
         serial_text = f" serial {serial}" if serial else ""
         raise NoDeviceFound(f"no MOTU USB device found for {vid:04x}:{pid:04x}{serial_text}")
     if len(matches) > 1:

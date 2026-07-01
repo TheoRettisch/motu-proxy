@@ -334,6 +334,31 @@ class MotuUsbDatastore:
 
             body = packet[4:] if len(packet) >= 4 else packet
             if body.startswith((b"NREK", b"PTTH")):
+                message_seq = _response_message_seq(packet)
+                if message_seq is not None and message_seq != expected_message_seq:
+                    ignored_packets += 1
+                    self._write_frame(build_ack(self._next_host_seq()))
+                    if ignored_packets > max_ignored_packets:
+                        self._record_response_stats(
+                            timeout_ms,
+                            started,
+                            reads,
+                            len(frames),
+                            ignored_packets,
+                            ack_packets,
+                            total,
+                        )
+                        raise DatastoreTimeout(
+                            _response_wait_message(
+                                f"response ignored packet limit exceeded after {max_ignored_packets} packets",
+                                timeout_ms,
+                                reads,
+                                len(frames),
+                                ignored_packets,
+                                ack_packets,
+                            )
+                        )
+                    continue
                 parsed = parse_response_frame(packet, expected_message_seq)
                 frames.append(packet)
                 total += len(packet)
@@ -731,6 +756,8 @@ class DatastoreCoordinator:
     ) -> None:
         if payload.etag is None:
             return
+        if not record_transition:
+            return
         with self._condition:
             if payload.not_modified:
                 self._latest_etag = payload.etag
@@ -800,6 +827,18 @@ def _response_wait_message(
         f"{reason}; timeout_ms={timeout_ms} reads={reads} "
         f"accepted={accepted} ignored={ignored} ack={ack}"
     )
+
+
+def _response_message_seq(packet: bytes) -> int | None:
+    if len(packet) < 16:
+        return None
+    wrapper_len = struct.unpack_from("<H", packet, 2)[0]
+    if wrapper_len < 16 or wrapper_len > len(packet):
+        return None
+    body = packet[4:wrapper_len]
+    if len(body) < 12 or body[:4] not in (b"NREK", b"PTTH"):
+        return None
+    return struct.unpack_from("<I", body, 8)[0]
 
 
 def _clean_etag(value: str | None) -> str | None:

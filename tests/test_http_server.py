@@ -44,6 +44,16 @@ class RecordingLock:
         self.exits += 1
 
 
+class TrackingBody(BytesIO):
+    def __init__(self, body: bytes) -> None:
+        super().__init__(body)
+        self.reads = 0
+
+    def read(self, *args, **kwargs):
+        self.reads += 1
+        return super().read(*args, **kwargs)
+
+
 class HttpServerTests(TestCase):
     def dispatch(
         self,
@@ -637,7 +647,7 @@ class HttpHandlerTests(TestCase):
     def make_handler(self, headers=None, body: bytes = b"", dispatcher=None, max_write_body_bytes: int = 64 * 1024):
         handler = object.__new__(MotuProxyHandler)
         handler.headers = headers or {}
-        handler.rfile = BytesIO(body)
+        handler.rfile = body if hasattr(body, "read") else BytesIO(body)
         handler.wfile = BytesIO()
         handler.path = "/datastore"
         handler.server = SimpleNamespace(
@@ -712,6 +722,58 @@ class HttpHandlerTests(TestCase):
         self.assertEqual(handler.statuses, [403])
         self.assertIn(("Content-Type", "application/json"), handler.sent_headers)
         self.assertIn("valid write token required", json.loads(handler.wfile.getvalue().decode("utf-8"))["error"])
+
+    def test_handler_rejects_unsafe_writes_before_reading_body(self) -> None:
+        def get(path: str, client: str | None = None) -> bytes:
+            raise AssertionError("unexpected get")
+
+        def post(path: str, body: str, client: str | None = None) -> bytes:
+            raise AssertionError("unexpected post")
+
+        cases = [
+            (
+                "disabled",
+                DatastoreDispatcher(False, get, post, log_write=None),
+                {"Content-Length": "17"},
+                "writes require --allow-writes",
+            ),
+            (
+                "bad host",
+                DatastoreDispatcher(True, get, post, write_token=WRITE_TOKEN, log_write=None),
+                {
+                    "Content-Length": "17",
+                    "Host": "device.local:1280",
+                    WRITE_TOKEN_HEADER: WRITE_TOKEN,
+                },
+                "loopback Host",
+            ),
+            (
+                "bad origin",
+                DatastoreDispatcher(True, get, post, write_token=WRITE_TOKEN, log_write=None),
+                {
+                    "Content-Length": "17",
+                    "Host": "127.0.0.1:1280",
+                    "Origin": "https://127.0.0.1:1280",
+                    WRITE_TOKEN_HEADER: WRITE_TOKEN,
+                },
+                "cross-origin",
+            ),
+            (
+                "bad token",
+                DatastoreDispatcher(True, get, post, write_token=WRITE_TOKEN, log_write=None),
+                {"Content-Length": "17", "Host": "127.0.0.1:1280"},
+                "valid write token required",
+            ),
+        ]
+
+        for name, dispatcher, headers, message in cases:
+            with self.subTest(name=name):
+                body = TrackingBody(b'{"value":"linux"}')
+                handler = self.make_handler(headers, body, dispatcher)
+                handler.handle_datastore_request("POST")
+                self.assertEqual(handler.statuses, [403])
+                self.assertEqual(body.reads, 0)
+                self.assertIn(message, json.loads(handler.wfile.getvalue().decode("utf-8"))["error"])
 
     def test_handler_returns_json_403_for_read_only_path(self) -> None:
         class Dispatcher:

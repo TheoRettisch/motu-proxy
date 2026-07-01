@@ -229,6 +229,21 @@ class DatastoreDispatcher:
         self.validate_writes = validate_writes
         self.allow_unknown_writes = allow_unknown_writes
 
+    def validate_write_headers(
+        self,
+        method: str,
+        origin: str | None = None,
+        host: str | None = None,
+        request_token: str | None = None,
+    ) -> None:
+        if method == "GET":
+            return
+        if not self.allow_writes:
+            raise WritesDisabled("writes require --allow-writes")
+        validate_write_host(method, self.allow_writes, host, self.allow_remote_writes)
+        validate_write_origin(method, self.allow_writes, origin, host)
+        validate_write_token(method, self.allow_writes, self.write_token, request_token)
+
     def dispatch(
         self,
         method: str,
@@ -280,15 +295,22 @@ class MotuProxyHandler(BaseHTTPRequestHandler):
 
     def handle_datastore_request(self, method: str) -> None:
         try:
+            origin = self.headers.get("Origin")
+            host = self.headers.get("Host")
+            request_token = self.read_write_token() if method != "GET" else None
+            if method != "GET":
+                validator = getattr(self.server.dispatcher, "validate_write_headers", None)
+                if validator is not None:
+                    validator(method, origin=origin, host=host, request_token=request_token)
             raw_body = self.read_raw_body() if method != "GET" else ""
             result = self.server.dispatcher.dispatch(
                 method,
                 self.path,
                 raw_body,
                 self.headers.get("Content-Type", ""),
-                origin=self.headers.get("Origin"),
-                host=self.headers.get("Host"),
-                request_token=self.read_write_token(),
+                origin=origin,
+                host=host,
+                request_token=request_token,
                 if_none_match=self.headers.get("If-None-Match") if method == "GET" else None,
             )
             body = result.response

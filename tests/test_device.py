@@ -83,6 +83,29 @@ class DeviceDiscoveryTests(TestCase):
             with self.assertRaisesRegex(RuntimeError, "no unbound vendor-specific bulk control interface"):
                 find_motu_device(0x07FD, 0x0005, sysfs_root=root, devfs_root=root / "dev")
 
+    def test_unavailable_candidate_is_skipped_when_another_device_is_usable(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            add_device(root, "3-3", "aaa", 3, 4, with_control=False)
+            add_device(root, "3-4", "bbb", 3, 5)
+            device = find_motu_device(0x07FD, 0x0005, sysfs_root=root, devfs_root=root / "dev")
+            self.assertEqual(device.serial, "bbb")
+            self.assertEqual(device.devfs_path, root / "dev" / "003" / "005")
+
+    def test_exact_serial_without_control_interface_still_raises(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            add_device(root, "3-3", "aaa", 3, 4, with_control=False)
+            add_device(root, "3-4", "bbb", 3, 5)
+            with self.assertRaisesRegex(RuntimeError, "aaa"):
+                find_motu_device(
+                    0x07FD,
+                    0x0005,
+                    serial="aaa",
+                    sysfs_root=root,
+                    devfs_root=root / "dev",
+                )
+
     def test_missing_control_interface_allows_explicit_manual_override(self) -> None:
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -99,6 +122,19 @@ class DeviceDiscoveryTests(TestCase):
             self.assertEqual(device.interface, 3)
             self.assertEqual(device.ep_out, 0x03)
             self.assertEqual(device.ep_in, 0x83)
+
+    def test_partial_manual_override_is_rejected(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            add_device(root, "3-3", "aaa", 3, 4)
+            with self.assertRaisesRegex(DeviceDiscoveryError, "interface, ep_out, and ep_in"):
+                find_motu_device(
+                    0x07FD,
+                    0x0005,
+                    sysfs_root=root,
+                    devfs_root=root / "dev",
+                    interface=4,
+                )
 
     def test_missing_sysfs_root_reports_discovery_error(self) -> None:
         with TemporaryDirectory() as tmp:

@@ -11,6 +11,7 @@ from unittest.mock import patch
 from motu_proxy.cli import (
     DEFAULT_WRITE_TOKEN_FILE,
     build_parser,
+    config_from_args,
     prepare_write_token,
     validate_serve_write_safety,
     write_token_file,
@@ -125,6 +126,20 @@ class FakePostDatastore:
     def post(self, path: str, json_body: str) -> bytes:
         self.calls.append((path, json_body))
         return self.response
+
+
+class CliUsbOverrideTests(TestCase):
+    def test_partial_manual_usb_override_is_rejected(self) -> None:
+        args = build_parser().parse_args(["get", "--interface", "4"])
+        with self.assertRaisesRegex(RuntimeError, "--interface, --ep-out, and --ep-in"):
+            config_from_args(args)
+
+    def test_complete_manual_usb_override_is_accepted(self) -> None:
+        args = build_parser().parse_args(["get", "--interface", "4", "--ep-out", "0x04", "--ep-in", "0x84"])
+        config = config_from_args(args)
+        self.assertEqual(config.interface, 4)
+        self.assertEqual(config.ep_out, 0x04)
+        self.assertEqual(config.ep_in, 0x84)
 
 
 class CliServeSecurityTests(TestCase):

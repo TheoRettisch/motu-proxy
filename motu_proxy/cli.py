@@ -47,6 +47,7 @@ DEFAULT_SMOKE_PATHS = ("/datastore/uid", "/datastore/ext/maxUSBToHost", "/datast
 
 
 def config_from_args(args) -> DatastoreConfig:
+    validate_usb_overrides(args.interface, args.ep_out, args.ep_in)
     return DatastoreConfig(
         vid=args.vid,
         pid=args.pid,
@@ -62,6 +63,14 @@ def config_from_args(args) -> DatastoreConfig:
         sysfs_root=Path(args.sysfs_root),
         devfs_root=Path(args.devfs_root),
     )
+
+
+def validate_usb_overrides(interface: int | None, ep_out: int | None, ep_in: int | None) -> None:
+    overrides = (interface, ep_out, ep_in)
+    if any(value is not None for value in overrides) and not all(
+        value is not None for value in overrides
+    ):
+        raise RuntimeError("--interface, --ep-out, and --ep-in must be provided together")
 
 
 def _is_loopback_listen_address(address: str) -> bool:

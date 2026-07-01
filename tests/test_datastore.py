@@ -11,7 +11,7 @@ from motu_proxy.datastore import (
     ShortUsbWrite,
     read_device_capability_info,
 )
-from motu_proxy.parser import DatastorePayload, ResponseFrameError
+from motu_proxy.parser import DatastorePayload
 from motu_proxy.protocol import build_get_frame, build_post_frame
 
 from tests.helpers import response_packet
@@ -181,12 +181,25 @@ class DatastoreTests(TestCase):
             build_post_frame(0x20, 2, "/datastore/host/os", '{"value":"linux"}', client=1479701624),
         )
 
-    def test_get_rejects_response_with_wrong_message_sequence(self) -> None:
-        transport = FakeTransport([response_packet(b'{"value":"wrong"}', message_seq=3)])
-        datastore = MotuUsbDatastore(transport)
-        with self.assertRaises(ResponseFrameError):
-            datastore.get("/datastore/uid")
-        self.assertEqual(transport.writes, [build_get_frame(0x20, 2, "/datastore/uid")])
+    def test_get_ignores_stale_wrong_sequence_before_current_response(self) -> None:
+        transport = FakeTransport(
+            [
+                response_packet(b'{"value":"late"}', message_seq=2, wrapper_seq=0x40),
+                response_packet(b'{"value":"ok"}', message_seq=3, wrapper_seq=0x41),
+            ]
+        )
+        datastore = MotuUsbDatastore(transport, message_seq=3)
+
+        response = datastore.get("/datastore/uid")
+
+        self.assertEqual(response, b'{"value":"ok"}')
+        self.assertIsNotNone(datastore.last_response_stats)
+        assert datastore.last_response_stats is not None
+        self.assertEqual(datastore.last_response_stats.ignored_packets, 1)
+        self.assertEqual(datastore.last_response_stats.accepted_frames, 1)
+        self.assertEqual(transport.writes[0], build_get_frame(0x20, 3, "/datastore/uid"))
+        self.assertEqual(transport.writes[1], bytes.fromhex("21 81 04 00"))
+        self.assertEqual(transport.writes[2], bytes.fromhex("22 81 04 00"))
 
     def test_get_allows_response_padding_after_logical_wrapper(self) -> None:
         transport = FakeTransport([response_packet(b'{"value":"ok"}', padding=b"\x00")])
@@ -241,6 +254,24 @@ class DatastoreTests(TestCase):
 
 
 class DatastoreCoordinatorTests(TestCase):
+    def test_non_poll_path_read_does_not_replace_global_etag(self) -> None:
+        transport = FakeTransport(
+            [
+                response_packet(b'HTTP/1.1 200 OK\r\nETag: 1\r\n\r\n{"state":1}'),
+                response_packet(
+                    b'HTTP/1.1 200 OK\r\nETag: uid\r\n\r\n{"value":"0001f2fffe00c719"}',
+                    message_seq=3,
+                ),
+            ]
+        )
+        coordinator = DatastoreCoordinator(MotuUsbDatastore(transport))
+
+        self.assertEqual(coordinator.read("/datastore").etag, "1")
+        self.assertEqual(coordinator.read("/datastore/uid").etag, "uid")
+
+        self.assertEqual(coordinator.latest_etag, "1")
+        self.assertEqual(coordinator.history, ())
+
     def test_background_poller_fans_out_to_multiple_waiters(self) -> None:
         initial = response_packet(b'HTTP/1.1 200 OK\r\nETag: 1\r\n\r\n{"state":1}')
         changed = response_packet(
