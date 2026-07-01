@@ -1,11 +1,14 @@
 import json
 from io import BytesIO
+from contextlib import redirect_stderr
+from io import StringIO
 from types import SimpleNamespace
 from unittest import TestCase
 
 from motu_proxy.cli import build_parser
 from motu_proxy.datastore import DatastoreNoResponse
 from motu_proxy.http_server import (
+    STATUS_PATH,
     WRITE_TOKEN_HEADER,
     BadRequest,
     CrossOriginWrite,
@@ -19,6 +22,8 @@ from motu_proxy.http_server import (
     WriteTokenRequired,
     WritesDisabled,
     dispatch_datastore_request,
+    log_write_attempt,
+    log_write_attempt_debug,
     response_content_type,
     serve,
 )
@@ -203,6 +208,35 @@ class HttpServerTests(TestCase):
         self.assertEqual(result.status, 304)
         self.assertEqual(result.response, b"")
         self.assertEqual(result.etag, "5678")
+
+    def test_status_endpoint_returns_provider_json_without_datastore_dispatch(self) -> None:
+        def get(path: str, client: str | None = None) -> bytes:
+            raise AssertionError("unexpected get")
+
+        result = dispatch_datastore_request(
+            "GET",
+            STATUS_PATH,
+            "",
+            "",
+            False,
+            get,
+            lambda path, body, client=None: b"{}",
+            status_provider=lambda: {
+                "long_poll_mode": "native-preemptive",
+                "latest_etag": "5678",
+                "last_poller_error": None,
+            },
+        )
+
+        self.assertEqual(result.path, STATUS_PATH)
+        self.assertEqual(
+            json.loads(result.response.decode("utf-8")),
+            {
+                "long_poll_mode": "native-preemptive",
+                "latest_etag": "5678",
+                "last_poller_error": None,
+            },
+        )
 
     def test_invalid_client_identifier_is_rejected(self) -> None:
         with self.assertRaisesRegex(BadRequest, "client"):
@@ -429,6 +463,20 @@ class HttpServerTests(TestCase):
             request_token=WRITE_TOKEN,
         )
         self.assertEqual(logs, [("POST", "/datastore/host/os", '{"value":"linux"}')])
+
+    def test_default_write_logger_redacts_body(self) -> None:
+        stderr = StringIO()
+        with redirect_stderr(stderr):
+            log_write_attempt("POST", "/datastore/host/os", '{"value":"linux"}')
+        output = stderr.getvalue()
+        self.assertIn("body_bytes=17", output)
+        self.assertNotIn("linux", output)
+
+    def test_debug_write_logger_includes_body(self) -> None:
+        stderr = StringIO()
+        with redirect_stderr(stderr):
+            log_write_attempt_debug("POST", "/datastore/host/os", '{"value":"linux"}')
+        self.assertIn('body=\'{"value":"linux"}\'', stderr.getvalue())
 
     def test_invalid_write_json_is_rejected_before_usb_call(self) -> None:
         calls: list[tuple[str, str]] = []
@@ -667,6 +715,56 @@ class HttpServerTests(TestCase):
 
         self.assertEqual(result, 0)
         self.assertEqual(calls, ["serve", "before_close", "close"])
+
+    def test_serve_redacts_token_when_token_file_is_available(self) -> None:
+        class Server:
+            server_address = ("127.0.0.1", 0)
+            allow_writes = True
+            debug = False
+            write_token = "secret-token"
+            write_token_file = "/run/motu-proxy/write-token"
+            allow_remote_writes = False
+            validate_writes = True
+            allow_unknown_writes = False
+
+            def serve_forever(self):
+                raise KeyboardInterrupt
+
+            def server_close(self):
+                pass
+
+        stderr = StringIO()
+        with redirect_stderr(stderr):
+            result = serve(Server())
+
+        self.assertEqual(result, 0)
+        output = stderr.getvalue()
+        self.assertIn("stored in token file", output)
+        self.assertNotIn("secret-token", output)
+
+    def test_serve_prints_token_in_debug_mode(self) -> None:
+        class Server:
+            server_address = ("127.0.0.1", 0)
+            allow_writes = True
+            debug = True
+            write_token = "secret-token"
+            write_token_file = "/run/motu-proxy/write-token"
+            allow_remote_writes = False
+            validate_writes = True
+            allow_unknown_writes = False
+
+            def serve_forever(self):
+                raise KeyboardInterrupt
+
+            def server_close(self):
+                pass
+
+        stderr = StringIO()
+        with redirect_stderr(stderr):
+            result = serve(Server())
+
+        self.assertEqual(result, 0)
+        self.assertIn("write token: secret-token", stderr.getvalue())
 
 
 class HttpHandlerTests(TestCase):

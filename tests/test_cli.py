@@ -143,9 +143,28 @@ class CliUsbOverrideTests(TestCase):
         self.assertEqual(config.ep_in, 0x84)
 
     def test_invalid_seq_start_is_rejected_before_usb_open(self) -> None:
-        args = build_parser().parse_args(["get", "--seq-start", "0x40"])
-        with self.assertRaisesRegex(RuntimeError, "0x20..0x3f"):
-            config_from_args(args)
+        stderr = StringIO()
+        with redirect_stderr(stderr), self.assertRaises(SystemExit):
+            build_parser().parse_args(["get", "--seq-start", "0x40"])
+        self.assertIn("0x20..0x3f", stderr.getvalue())
+
+    def test_invalid_timeout_is_rejected_by_argparse(self) -> None:
+        stderr = StringIO()
+        with redirect_stderr(stderr), self.assertRaises(SystemExit):
+            build_parser().parse_args(["get", "--timeout-ms", "-1"])
+        self.assertIn("value must be > 0", stderr.getvalue())
+
+    def test_invalid_message_sequence_is_rejected_by_argparse(self) -> None:
+        stderr = StringIO()
+        with redirect_stderr(stderr), self.assertRaises(SystemExit):
+            build_parser().parse_args(["get", "--message-seq", "0x100000000"])
+        self.assertIn("message sequence", stderr.getvalue())
+
+    def test_invalid_endpoint_override_is_rejected_by_argparse(self) -> None:
+        stderr = StringIO()
+        with redirect_stderr(stderr), self.assertRaises(SystemExit):
+            build_parser().parse_args(["get", "--interface", "3", "--ep-out", "0x83", "--ep-in", "0x83"])
+        self.assertIn("OUT endpoint", stderr.getvalue())
 
 
 class CliServeSecurityTests(TestCase):
@@ -159,6 +178,18 @@ class CliServeSecurityTests(TestCase):
 
     def test_allow_writes_accepts_non_loopback_listen_with_unsafe_flag(self) -> None:
         validate_serve_write_safety("0.0.0.0", allow_writes=True, unsafe_allow_remote_writes=True)
+
+    def test_invalid_serve_port_is_rejected_by_argparse(self) -> None:
+        stderr = StringIO()
+        with redirect_stderr(stderr), self.assertRaises(SystemExit):
+            build_parser().parse_args(["serve", "--port", "0"])
+        self.assertIn("port", stderr.getvalue())
+
+    def test_invalid_max_write_body_size_is_rejected_by_argparse(self) -> None:
+        stderr = StringIO()
+        with redirect_stderr(stderr), self.assertRaises(SystemExit):
+            build_parser().parse_args(["serve", "--max-write-body-bytes", "0"])
+        self.assertIn("value must be > 0", stderr.getvalue())
 
     def test_write_token_file_is_owner_only(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -226,6 +257,7 @@ class CliServeSecurityTests(TestCase):
                 serialize_dispatch=True,
                 validate_writes=True,
                 allow_unknown_writes=False,
+                status_provider=None,
             ) -> None:
                 self.server_address = server_address
                 self.allow_writes = allow_writes
@@ -294,6 +326,7 @@ class CliServeSecurityTests(TestCase):
                 serialize_dispatch=True,
                 validate_writes=True,
                 allow_unknown_writes=False,
+                status_provider=None,
             ) -> None:
                 self.server_address = server_address
                 self.allow_writes = allow_writes
@@ -325,7 +358,7 @@ class CliServeSecurityTests(TestCase):
                 server.server_close()
             return 0
 
-        args = build_parser().parse_args(["serve", "--port", "0"])
+        args = build_parser().parse_args(["serve", "--port", "1281"])
         with (
             patch("motu_proxy.cli.open_datastore", return_value=FakeOpenDatastore(datastore)),
             patch("motu_proxy.cli.MotuProxyServer", FakeServer),
@@ -356,6 +389,7 @@ class CliServeSecurityTests(TestCase):
                 serialize_dispatch=True,
                 validate_writes=True,
                 allow_unknown_writes=False,
+                status_provider=None,
             ) -> None:
                 captured["validate_writes"] = validate_writes
                 captured["allow_unknown_writes"] = allow_unknown_writes
@@ -380,7 +414,7 @@ class CliServeSecurityTests(TestCase):
             def server_close(self) -> None:
                 pass
 
-        args = build_parser().parse_args(["serve", "--no-validate", "--port", "0"])
+        args = build_parser().parse_args(["serve", "--no-validate", "--port", "1281"])
         with (
             patch("motu_proxy.cli.open_datastore", return_value=FakeOpenDatastore(datastore)),
             patch("motu_proxy.cli.MotuProxyServer", FakeServer),
@@ -411,6 +445,7 @@ class CliServeSecurityTests(TestCase):
                 serialize_dispatch=True,
                 validate_writes=True,
                 allow_unknown_writes=False,
+                status_provider=None,
             ) -> None:
                 captured["validate_writes"] = validate_writes
                 captured["allow_unknown_writes"] = allow_unknown_writes
@@ -435,7 +470,7 @@ class CliServeSecurityTests(TestCase):
             def server_close(self) -> None:
                 pass
 
-        args = build_parser().parse_args(["serve", "--allow-unknown-writes", "--port", "0"])
+        args = build_parser().parse_args(["serve", "--allow-unknown-writes", "--port", "1281"])
         with (
             patch("motu_proxy.cli.open_datastore", return_value=FakeOpenDatastore(datastore)),
             patch("motu_proxy.cli.MotuProxyServer", FakeServer),

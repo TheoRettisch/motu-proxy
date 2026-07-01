@@ -118,6 +118,12 @@ curl 'http://127.0.0.1:1280/datastore/uid?client=1479701624'
 curl -i -H 'If-None-Match: 5678' http://127.0.0.1:1280/datastore
 ```
 
+Check local proxy/coordinator health:
+
+```sh
+curl http://127.0.0.1:1280/__motu_proxy/status
+```
+
 By default the server binds to `127.0.0.1`, opens one USB datastore session for
 the server lifetime, and rejects POST/PATCH. A `DatastoreCoordinator` owns USB
 access for the HTTP server: foreground reads and writes are serialized against a
@@ -140,15 +146,17 @@ HTTP writes require `--allow-writes`:
 motu-proxy serve --allow-writes
 ```
 
-When write mode is enabled, `motu-proxy` generates a random token, prints it to
-stderr, and writes it to:
+When write mode is enabled, `motu-proxy` generates a random token and writes it
+to:
 
 ```text
 /run/motu-proxy/write-token
 ```
 
-The token file is created with owner-only permissions on Linux. Every HTTP
-POST/PATCH must include the token using either:
+The token file is created with owner-only permissions on Linux. The token is not
+printed when the default token file is available; use `--debug` or
+`--no-write-token-file` for manual debugging where printing the token is useful.
+Every HTTP POST/PATCH must include the token using either:
 
 ```text
 Authorization: Bearer <token>

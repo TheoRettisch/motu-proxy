@@ -19,13 +19,19 @@ from .datastore import (
     DatastoreConfig,
     DatastoreCoordinator,
     DeviceCapabilityInfo,
+    MAX_MESSAGE_SEQ,
     ResponseStats,
     open_datastore,
     read_device_capability_info,
 )
 from .device import DEFAULT_DEVFS_ROOT, DEFAULT_SYSFS_ROOT
 from .fixtures import EXPECTED_GET_DATASTORE, EXPECTED_POST_HOST_OS
-from .http_server import DEFAULT_MAX_WRITE_BODY_BYTES, MotuProxyServer, serve
+from .http_server import (
+    DEFAULT_MAX_WRITE_BODY_BYTES,
+    MAX_CONFIGURABLE_WRITE_BODY_BYTES,
+    MotuProxyServer,
+    serve,
+)
 from .json_body import validate_json_body
 from .parser import response_to_text
 from .paths import normalize_path
@@ -50,6 +56,8 @@ DEFAULT_SMOKE_PATHS = ("/datastore/uid", "/datastore/ext/maxUSBToHost", "/datast
 def config_from_args(args) -> DatastoreConfig:
     validate_usb_overrides(args.interface, args.ep_out, args.ep_in)
     validate_host_seq(args.seq_start)
+    validate_cli_range(args.timeout_ms, 1, None, "--timeout-ms")
+    validate_cli_range(args.message_seq, 0, MAX_MESSAGE_SEQ, "--message-seq")
     return DatastoreConfig(
         vid=args.vid,
         pid=args.pid,
@@ -73,6 +81,18 @@ def validate_usb_overrides(interface: int | None, ep_out: int | None, ep_in: int
         value is not None for value in overrides
     ):
         raise RuntimeError("--interface, --ep-out, and --ep-in must be provided together")
+
+
+def validate_cli_range(
+    value: int,
+    minimum: int,
+    maximum: int | None,
+    name: str,
+) -> None:
+    if value < minimum:
+        raise RuntimeError(f"{name} must be >= {minimum}")
+    if maximum is not None and value > maximum:
+        raise RuntimeError(f"{name} must be <= {maximum}")
 
 
 def _is_loopback_listen_address(address: str) -> bool:
@@ -256,6 +276,7 @@ def command_serve(args) -> int:
                 serialize_dispatch=False,
                 validate_writes=not args.no_validate,
                 allow_unknown_writes=args.allow_unknown_writes,
+                status_provider=coordinator.status,
             )
             return serve(server, before_close=coordinator.close)
         finally:
@@ -277,19 +298,83 @@ def command_selftest(_args) -> int:
 
 
 def _int_arg(value: str) -> int:
-    return int(value, 0)
+    try:
+        return int(value, 0)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be an integer") from exc
+
+
+def _bounded_int_arg(value: str, minimum: int, maximum: int, name: str) -> int:
+    parsed = _int_arg(value)
+    if not minimum <= parsed <= maximum:
+        raise argparse.ArgumentTypeError(f"{name} must be in range {minimum}..{maximum}")
+    return parsed
+
+
+def _positive_int_arg(value: str) -> int:
+    parsed = _int_arg(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("value must be > 0")
+    return parsed
+
+
+def _u16_arg(value: str) -> int:
+    return _bounded_int_arg(value, 0, 0xFFFF, "value")
+
+
+def _interface_arg(value: str) -> int:
+    return _bounded_int_arg(value, 0, 0xFF, "interface")
+
+
+def _ep_out_arg(value: str) -> int:
+    endpoint = _int_arg(value)
+    if not 0x01 <= endpoint <= 0x0F:
+        raise argparse.ArgumentTypeError("--ep-out must be an OUT endpoint address 0x01..0x0f")
+    return endpoint
+
+
+def _ep_in_arg(value: str) -> int:
+    endpoint = _int_arg(value)
+    if not 0x81 <= endpoint <= 0x8F:
+        raise argparse.ArgumentTypeError("--ep-in must be an IN endpoint address 0x81..0x8f")
+    return endpoint
+
+
+def _host_seq_arg(value: str) -> int:
+    seq = _int_arg(value)
+    try:
+        return validate_host_seq(seq)
+    except RuntimeError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+
+
+def _message_seq_arg(value: str) -> int:
+    return _bounded_int_arg(value, 0, MAX_MESSAGE_SEQ, "message sequence")
+
+
+def _port_arg(value: str) -> int:
+    return _bounded_int_arg(value, 1, 65535, "port")
+
+
+def _max_write_body_bytes_arg(value: str) -> int:
+    parsed = _positive_int_arg(value)
+    if parsed > MAX_CONFIGURABLE_WRITE_BODY_BYTES:
+        raise argparse.ArgumentTypeError(
+            f"--max-write-body-bytes must be <= {MAX_CONFIGURABLE_WRITE_BODY_BYTES}"
+        )
+    return parsed
 
 
 def add_usb_args(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--vid", type=_int_arg, default=MOTU_VID)
-    parser.add_argument("--pid", type=_int_arg, default=MOTU_AVB_PID)
+    parser.add_argument("--vid", type=_u16_arg, default=MOTU_VID)
+    parser.add_argument("--pid", type=_u16_arg, default=MOTU_AVB_PID)
     parser.add_argument("--serial")
-    parser.add_argument("--interface", type=_int_arg)
-    parser.add_argument("--ep-out", type=_int_arg)
-    parser.add_argument("--ep-in", type=_int_arg)
-    parser.add_argument("--timeout-ms", type=int, default=DEFAULT_TIMEOUT_MS)
-    parser.add_argument("--seq-start", type=_int_arg, default=DEFAULT_SEQ_START)
-    parser.add_argument("--message-seq", type=int, default=DEFAULT_MESSAGE_SEQ)
+    parser.add_argument("--interface", type=_interface_arg)
+    parser.add_argument("--ep-out", type=_ep_out_arg)
+    parser.add_argument("--ep-in", type=_ep_in_arg)
+    parser.add_argument("--timeout-ms", type=_positive_int_arg, default=DEFAULT_TIMEOUT_MS)
+    parser.add_argument("--seq-start", type=_host_seq_arg, default=DEFAULT_SEQ_START)
+    parser.add_argument("--message-seq", type=_message_seq_arg, default=DEFAULT_MESSAGE_SEQ)
     parser.add_argument("--no-init", action="store_true")
     parser.add_argument("--debug", action="store_true")
     parser.add_argument("--sysfs-root", default=str(DEFAULT_SYSFS_ROOT))
@@ -356,7 +441,7 @@ def build_parser() -> argparse.ArgumentParser:
     serve_parser = sub.add_parser("serve", help="serve a tiny localhost datastore proxy")
     add_usb_args(serve_parser)
     serve_parser.add_argument("--listen", default="127.0.0.1")
-    serve_parser.add_argument("--port", type=int, default=1280)
+    serve_parser.add_argument("--port", type=_port_arg, default=1280)
     serve_parser.add_argument("--allow-writes", action="store_true")
     serve_parser.add_argument(
         "--write-token-file",
@@ -377,7 +462,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     serve_parser.add_argument(
         "--max-write-body-bytes",
-        type=int,
+        type=_max_write_body_bytes_arg,
         default=DEFAULT_MAX_WRITE_BODY_BYTES,
         help="maximum accepted HTTP write body size",
     )

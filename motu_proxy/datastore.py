@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import sys
 import struct
 import threading
 import time
@@ -43,13 +44,14 @@ DEFAULT_RESPONSE_TIMEOUT_MS = DEFAULT_TIMEOUT_MS * 2
 DEFAULT_LONG_POLL_TIMEOUT_MS = 16_000
 DEFAULT_HTTP_LONG_POLL_WAIT_MS = 15_500
 DEFAULT_ETAG_HISTORY_SIZE = 64
-DEFAULT_MAX_RESPONSE_READS = 256
-DEFAULT_MAX_IGNORED_PACKETS = 32
 DEFAULT_MAX_RESPONSE_FRAMES = 256
+DEFAULT_MAX_IGNORED_PACKETS = 32
+DEFAULT_MAX_RESPONSE_READS = (DEFAULT_MAX_RESPONSE_FRAMES * 2) + DEFAULT_MAX_IGNORED_PACKETS + 2
 DEFAULT_POLL_PATH = "/datastore"
 DEFAULT_POLL_READ_TIMEOUT_SLICE_MS = 250
 DEFAULT_FOREGROUND_PREEMPTION_BUDGET_MS = 500
 DEFAULT_DEGRADED_REFRESH_INTERVAL_S = 0.5
+DEFAULT_POLL_ERROR_LOG_INTERVAL_S = 30.0
 MAX_MESSAGE_SEQ = 0xFFFFFFFF
 CAPABILITY_SECTIONS = ("avb", "router", "mixer")
 IDENTITY_KEYS = ("uid", "model_name", "firmware_version", "serial_number")
@@ -320,6 +322,9 @@ class MotuUsbDatastore:
         reads = 0
         ignored_packets = 0
         ack_packets = 0
+        stale_message_seq: int | None = None
+        stale_frames = 0
+        stale_total = 0
         started = time.monotonic()
         deadline = time.monotonic() + (timeout_ms / 1000)
 
@@ -418,9 +423,41 @@ class MotuUsbDatastore:
             if body.startswith((b"NREK", b"PTTH")):
                 message_seq = _response_message_seq(packet)
                 if message_seq is not None and message_seq != expected_message_seq:
+                    try:
+                        parsed_stale = parse_response_frame(packet, message_seq)
+                    except ResponseFrameError:
+                        ignored_packets += 1
+                        self._write_frame(build_ack(self._next_host_seq()))
+                        if ignored_packets > max_ignored_packets:
+                            self._record_response_stats(
+                                timeout_ms,
+                                started,
+                                reads,
+                                len(frames),
+                                ignored_packets,
+                                ack_packets,
+                                total,
+                            )
+                            raise DatastoreTimeout(
+                                _response_wait_message(
+                                    f"response ignored packet limit exceeded after {max_ignored_packets} packets",
+                                    timeout_ms,
+                                    reads,
+                                    len(frames),
+                                    ignored_packets,
+                                    ack_packets,
+                                )
+                            )
+                        continue
+                    if stale_message_seq != message_seq:
+                        stale_message_seq = message_seq
+                        stale_frames = 0
+                        stale_total = 0
+                    stale_frames += 1
+                    stale_total += len(packet)
                     ignored_packets += 1
                     self._write_frame(build_ack(self._next_host_seq()))
-                    if ignored_packets > max_ignored_packets:
+                    if stale_frames > max_response_frames:
                         self._record_response_stats(
                             timeout_ms,
                             started,
@@ -430,20 +467,39 @@ class MotuUsbDatastore:
                             ack_packets,
                             total,
                         )
-                        raise DatastoreTimeout(
-                            _response_wait_message(
-                                f"response ignored packet limit exceeded after {max_ignored_packets} packets",
-                                timeout_ms,
-                                reads,
-                                len(frames),
-                                ignored_packets,
-                                ack_packets,
-                            )
+                        raise DatastoreResponseLimit(
+                            f"stale response exceeded {max_response_frames} frames"
                         )
+                    if stale_total > max_bytes:
+                        self._record_response_stats(
+                            timeout_ms,
+                            started,
+                            reads,
+                            len(frames),
+                            ignored_packets,
+                            ack_packets,
+                            total,
+                        )
+                        raise DatastoreResponseLimit(f"stale response exceeded {max_bytes} bytes")
+                    if parsed_stale.final:
+                        stale_message_seq = None
+                        stale_frames = 0
+                        stale_total = 0
                     continue
                 try:
                     parsed = parse_response_frame(packet, expected_message_seq)
                 except ResponseFrameError:
+                    if message_seq == expected_message_seq:
+                        self._record_response_stats(
+                            timeout_ms,
+                            started,
+                            reads,
+                            len(frames),
+                            ignored_packets,
+                            ack_packets,
+                            total,
+                        )
+                        raise
                     ignored_packets += 1
                     if ignored_packets > max_ignored_packets:
                         self._record_response_stats(
@@ -669,6 +725,7 @@ class DatastoreCoordinator:
         poll_read_timeout_slice_ms: int = DEFAULT_POLL_READ_TIMEOUT_SLICE_MS,
         foreground_preemption_budget_ms: int = DEFAULT_FOREGROUND_PREEMPTION_BUDGET_MS,
         degraded_refresh_interval_s: float = DEFAULT_DEGRADED_REFRESH_INTERVAL_S,
+        poll_error_log_interval_s: float = DEFAULT_POLL_ERROR_LOG_INTERVAL_S,
     ) -> None:
         self.datastore = datastore
         self.poll_path = poll_path
@@ -678,6 +735,7 @@ class DatastoreCoordinator:
         self.poll_read_timeout_slice_ms = poll_read_timeout_slice_ms
         self.foreground_preemption_budget_ms = foreground_preemption_budget_ms
         self.degraded_refresh_interval_s = degraded_refresh_interval_s
+        self.poll_error_log_interval_s = poll_error_log_interval_s
         self.foreground_preemptive_native_long_poll_available = bool(
             getattr(datastore, "supports_cancellable_bulk_reads", False)
         )
@@ -694,6 +752,8 @@ class DatastoreCoordinator:
         self._closed = False
         self._worker: threading.Thread | None = None
         self.last_poller_error: Exception | None = None
+        self._last_poller_error_log_at = 0.0
+        self._last_poller_error_log_key: tuple[str, str] | None = None
 
     @property
     def long_poll_mode(self) -> str:
@@ -710,6 +770,23 @@ class DatastoreCoordinator:
     def history(self) -> tuple[DatastoreTransition, ...]:
         with self._condition:
             return tuple(self._history)
+
+    def status(self) -> dict[str, object | None]:
+        with self._condition:
+            latest_etag = self._latest_etag
+            last_poller_error = self.last_poller_error
+            poller_running = self._worker is not None and self._worker.is_alive()
+            io_owner = self._io_owner
+            foreground_waiters = self._foreground_waiters
+        return {
+            "long_poll_mode": self.long_poll_mode,
+            "latest_etag": latest_etag,
+            "last_poller_error": _exception_status(last_poller_error),
+            "last_response_stats": _response_stats_status(self.datastore.last_response_stats),
+            "poller_running": poller_running,
+            "io_owner": io_owner,
+            "foreground_waiters": foreground_waiters,
+        }
 
     def start(self) -> None:
         with self._condition:
@@ -771,9 +848,9 @@ class DatastoreCoordinator:
             payload = self._payload_from_response(response)
             try:
                 refresh = self._read_locked(self.poll_path, etag="0", client=None)
-                self.last_poller_error = None
+                self._clear_poller_error()
             except Exception as exc:
-                self.last_poller_error = exc
+                self._record_poller_error(exc)
         finally:
             self._release_io()
         if refresh is not None:
@@ -822,9 +899,9 @@ class DatastoreCoordinator:
             if refresh_poll_path:
                 try:
                     self.read(self.poll_path, etag="0", client=None, timeout_ms=refresh_timeout_ms)
-                    self.last_poller_error = None
+                    self._clear_poller_error()
                 except (DatastoreNoResponse, DatastoreTimeout) as exc:
-                    self.last_poller_error = exc
+                    self._record_poller_error(exc)
                     continue
                 finally:
                     with self._condition:
@@ -854,20 +931,38 @@ class DatastoreCoordinator:
                     payload = self._payload_from_response(response)
                 finally:
                     self._release_io()
-                self.last_poller_error = None
+                self._clear_poller_error()
                 self._publish_payload(payload, origin_client=None, from_etag=etag)
             except DatastoreCancelled:
                 if self._is_closed():
                     return
-                self.last_poller_error = None
+                self._clear_poller_error()
             except (DatastoreNoResponse, DatastoreTimeout) as exc:
-                self.last_poller_error = exc
+                self._record_poller_error(exc)
             except Exception as exc:
-                self.last_poller_error = exc
+                self._record_poller_error(exc)
             with self._condition:
                 if self._closed:
                     return
                 self._condition.wait(self.poll_interval_s)
+
+    def _clear_poller_error(self) -> None:
+        self.last_poller_error = None
+
+    def _record_poller_error(self, exc: Exception) -> None:
+        self.last_poller_error = exc
+        now = time.monotonic()
+        key = (exc.__class__.__name__, str(exc))
+        should_log = (
+            self.poll_error_log_interval_s <= 0
+            or key != self._last_poller_error_log_key
+            or now - self._last_poller_error_log_at >= self.poll_error_log_interval_s
+        )
+        if not should_log:
+            return
+        self._last_poller_error_log_at = now
+        self._last_poller_error_log_key = key
+        print(f"motu-proxy poller error: {key[0]}: {key[1]}", file=sys.stderr)
 
     def _is_closed(self) -> bool:
         with self._condition:
@@ -1062,3 +1157,26 @@ def _client_string(value: str | int | None) -> str | None:
     if value is None:
         return None
     return str(value)
+
+
+def _exception_status(exc: Exception | None) -> dict[str, str] | None:
+    if exc is None:
+        return None
+    return {
+        "type": exc.__class__.__name__,
+        "message": str(exc),
+    }
+
+
+def _response_stats_status(stats: ResponseStats | None) -> dict[str, float | int] | None:
+    if stats is None:
+        return None
+    return {
+        "timeout_ms": stats.timeout_ms,
+        "elapsed_ms": stats.elapsed_ms,
+        "reads": stats.reads,
+        "accepted_frames": stats.accepted_frames,
+        "ignored_packets": stats.ignored_packets,
+        "ack_packets": stats.ack_packets,
+        "response_bytes": stats.response_bytes,
+    }

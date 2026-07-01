@@ -1,3 +1,5 @@
+from contextlib import redirect_stderr
+from io import StringIO
 import threading
 import time
 from unittest import TestCase
@@ -7,11 +9,12 @@ from motu_proxy.datastore import (
     DatastoreNoResponse,
     DatastoreTimeout,
     MotuUsbDatastore,
+    ResponseStats,
     ShortUsbFrame,
     ShortUsbWrite,
     read_device_capability_info,
 )
-from motu_proxy.parser import DatastorePayload
+from motu_proxy.parser import DatastorePayload, ResponseFrameError
 from motu_proxy.protocol import build_ack, build_get_frame, build_post_frame
 
 from tests.helpers import response_packet
@@ -230,12 +233,28 @@ class DatastoreTests(TestCase):
             datastore.get("/datastore/uid")
         self.assertEqual(transport.writes, [build_get_frame(0x20, 2, "/datastore/uid")])
 
-    def test_get_ignores_corrupt_response_frame_and_collects_retry(self) -> None:
+    def test_get_rejects_corrupt_current_sequence_frame(self) -> None:
         corrupt = bytearray(response_packet(b'{"value":"bad"}'))
         corrupt[24] ^= 0x01
         valid = response_packet(b'{"value":"ok"}')
         transport = FakeTransport([bytes(corrupt), valid])
         datastore = MotuUsbDatastore(transport)
+
+        with self.assertRaisesRegex(ResponseFrameError, "CRC mismatch"):
+            datastore.get("/datastore/uid")
+
+        self.assertIsNotNone(datastore.last_response_stats)
+        assert datastore.last_response_stats is not None
+        self.assertEqual(datastore.last_response_stats.ignored_packets, 0)
+        self.assertEqual(datastore.last_response_stats.accepted_frames, 0)
+        self.assertEqual(transport.writes, [build_get_frame(0x20, 2, "/datastore/uid")])
+
+    def test_get_ignores_corrupt_stale_sequence_frame_and_collects_current(self) -> None:
+        corrupt = bytearray(response_packet(b'{"value":"late"}', message_seq=2))
+        corrupt[24] ^= 0x01
+        valid = response_packet(b'{"value":"ok"}', message_seq=3)
+        transport = FakeTransport([bytes(corrupt), valid])
+        datastore = MotuUsbDatastore(transport, message_seq=3)
 
         self.assertEqual(datastore.get("/datastore/uid"), b'{"value":"ok"}')
 
@@ -243,7 +262,14 @@ class DatastoreTests(TestCase):
         assert datastore.last_response_stats is not None
         self.assertEqual(datastore.last_response_stats.ignored_packets, 1)
         self.assertEqual(datastore.last_response_stats.accepted_frames, 1)
-        self.assertEqual(transport.writes, [build_get_frame(0x20, 2, "/datastore/uid"), build_ack(0x21)])
+        self.assertEqual(
+            transport.writes,
+            [
+                build_get_frame(0x20, 3, "/datastore/uid"),
+                build_ack(0x21),
+                build_ack(0x22),
+            ],
+        )
 
     def test_post_uses_post_frame(self) -> None:
         transport = FakeTransport([response_packet(b'{"ok":true}')])
@@ -286,6 +312,31 @@ class DatastoreTests(TestCase):
         self.assertEqual(transport.writes[0], build_get_frame(0x20, 3, "/datastore/uid"))
         self.assertEqual(transport.writes[1], bytes.fromhex("21 81 04 00"))
         self.assertEqual(transport.writes[2], bytes.fromhex("22 81 04 00"))
+
+    def test_get_drains_large_stale_wrong_sequence_response_before_current(self) -> None:
+        stale_frames = [
+            response_packet(
+                b"x",
+                message_seq=2,
+                wrapper_seq=0x40 + index,
+                final=index == 63,
+                segment_index=index,
+            )
+            for index in range(64)
+        ]
+        current = response_packet(b'{"value":"ok"}', message_seq=3, wrapper_seq=0x90)
+        transport = FakeTransport([*stale_frames, current])
+        datastore = MotuUsbDatastore(transport, message_seq=3)
+
+        response = datastore.get("/datastore/uid")
+
+        self.assertEqual(response, b'{"value":"ok"}')
+        self.assertIsNotNone(datastore.last_response_stats)
+        assert datastore.last_response_stats is not None
+        self.assertEqual(datastore.last_response_stats.ignored_packets, 64)
+        self.assertEqual(datastore.last_response_stats.accepted_frames, 1)
+        ack_writes = [write for write in transport.writes[1:] if len(write) > 1 and write[1] == 0x81]
+        self.assertEqual(len(ack_writes), 65)
 
     def test_get_allows_response_padding_after_logical_wrapper(self) -> None:
         transport = FakeTransport([response_packet(b'{"value":"ok"}', padding=b"\x00")])
@@ -403,6 +454,52 @@ class DatastoreCoordinatorTests(TestCase):
         self.assertTrue(result.not_modified)
         self.assertEqual(result.etag, "5678")
         self.assertEqual(result.body, b"")
+
+    def test_status_reports_poller_error_and_response_stats(self) -> None:
+        coordinator = DatastoreCoordinator(MotuUsbDatastore(FakeTransport([])))
+        coordinator.last_poller_error = DatastoreNoResponse("no datastore response")
+        coordinator.datastore.last_response_stats = ResponseStats(
+            timeout_ms=1200,
+            elapsed_ms=10.5,
+            reads=2,
+            accepted_frames=1,
+            ignored_packets=0,
+            ack_packets=1,
+            response_bytes=17,
+        )
+
+        status = coordinator.status()
+
+        self.assertEqual(status["long_poll_mode"], "degraded-refresh")
+        self.assertEqual(status["last_poller_error"], {"type": "DatastoreNoResponse", "message": "no datastore response"})
+        self.assertEqual(
+            status["last_response_stats"],
+            {
+                "timeout_ms": 1200,
+                "elapsed_ms": 10.5,
+                "reads": 2,
+                "accepted_frames": 1,
+                "ignored_packets": 0,
+                "ack_packets": 1,
+                "response_bytes": 17,
+            },
+        )
+
+    def test_poller_error_logging_is_rate_limited(self) -> None:
+        coordinator = DatastoreCoordinator(
+            MotuUsbDatastore(FakeTransport([])),
+            poll_error_log_interval_s=60,
+        )
+        stderr = StringIO()
+        with redirect_stderr(stderr):
+            coordinator._record_poller_error(DatastoreTimeout("poll failed"))
+            coordinator._record_poller_error(DatastoreTimeout("poll failed"))
+            coordinator._record_poller_error(DatastoreTimeout("different failure"))
+
+        output = stderr.getvalue()
+        self.assertEqual(output.count("motu-proxy poller error"), 2)
+        self.assertIn("poll failed", output)
+        self.assertIn("different failure", output)
 
     def test_history_returns_adjacent_delta_and_stale_refreshes(self) -> None:
         transport = FakeTransport(

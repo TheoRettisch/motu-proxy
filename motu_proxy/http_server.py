@@ -24,19 +24,22 @@ from .device import DeviceDiscoveryError
 from .json_body import InvalidJsonBody, validate_json_body
 from .paths import normalize_path
 from .parser import DatastorePayload, ResponseFrameError
-from .protocol import ProtocolFrameTooLarge, validate_post_frame_size
+from .protocol import ProtocolFrameTooLarge, max_post_json_body_bytes, validate_post_frame_size
 from .schema import DatastorePermissionError, DatastoreValidationError, validate_datastore_write
 
 
 DatastoreRead = Callable[..., bytes | DatastorePayload]
 DatastoreWrite = Callable[[str, str, str | None], bytes | DatastorePayload]
 WriteLogger = Callable[[str, str, str], None]
+StatusProvider = Callable[[], dict[str, object | None]]
 # Keep the default comfortably below the protocol's single-frame u16 limits.
 # Path/client-specific validation below catches exact frame overflows.
 DEFAULT_MAX_WRITE_BODY_BYTES = 60 * 1024
+MAX_CONFIGURABLE_WRITE_BODY_BYTES = max_post_json_body_bytes("/datastore")
 DEFAULT_WRITE_BODY_READ_TIMEOUT_S = 5.0
 WRITE_TOKEN_HEADER = "X-Motu-Proxy-Token"
 MAX_CLIENT_ID = 0xFFFFFFFF
+STATUS_PATH = "/__motu_proxy/status"
 
 
 class WritesDisabled(RuntimeError):
@@ -166,8 +169,13 @@ def dispatch_datastore_request(
     if_none_match: str | None = None,
     validate_writes: bool = True,
     allow_unknown_writes: bool = False,
+    status_provider: StatusProvider | None = None,
 ) -> DispatchResult:
-    path = normalize_path(urlparse(request_path).path)
+    request_url = urlparse(request_path)
+    if method == "GET" and request_url.path == STATUS_PATH and status_provider is not None:
+        body = json.dumps(status_provider(), sort_keys=True).encode("utf-8")
+        return DispatchResult(body, STATUS_PATH)
+    path = normalize_path(request_url.path)
     client = parse_client_query(request_path)
     if method == "GET":
         if if_none_match is None:
@@ -208,6 +216,11 @@ class _NullLock:
 
 
 def log_write_attempt(method: str, path: str, body: str) -> None:
+    body_bytes = len(body.encode("utf-8"))
+    print(f"write attempt method={method} path={path} body_bytes={body_bytes}", file=sys.stderr)
+
+
+def log_write_attempt_debug(method: str, path: str, body: str) -> None:
     print(f"write attempt method={method} path={path} body={body!r}", file=sys.stderr)
 
 
@@ -224,6 +237,7 @@ class DatastoreDispatcher:
         serialize_dispatch: bool = True,
         validate_writes: bool = True,
         allow_unknown_writes: bool = False,
+        status_provider: StatusProvider | None = None,
     ) -> None:
         self.allow_writes = allow_writes
         self.run_get = run_get
@@ -234,6 +248,7 @@ class DatastoreDispatcher:
         self.lock = lock if lock is not None else (threading.Lock() if serialize_dispatch else _NullLock())
         self.validate_writes = validate_writes
         self.allow_unknown_writes = allow_unknown_writes
+        self.status_provider = status_provider
 
     def validate_write_headers(
         self,
@@ -279,6 +294,7 @@ class DatastoreDispatcher:
                 if_none_match=if_none_match,
                 validate_writes=self.validate_writes,
                 allow_unknown_writes=self.allow_unknown_writes,
+                status_provider=self.status_provider,
             )
 
 
@@ -452,6 +468,7 @@ class MotuProxyServer(ThreadingHTTPServer):
         serialize_dispatch: bool = True,
         validate_writes: bool = True,
         allow_unknown_writes: bool = False,
+        status_provider: StatusProvider | None = None,
     ) -> None:
         super().__init__(server_address, MotuProxyHandler)
         self.allow_writes = allow_writes
@@ -469,9 +486,11 @@ class MotuProxyServer(ThreadingHTTPServer):
             run_post,
             write_token=write_token,
             allow_remote_writes=allow_remote_writes,
+            log_write=log_write_attempt_debug if debug else log_write_attempt,
             serialize_dispatch=serialize_dispatch,
             validate_writes=validate_writes,
             allow_unknown_writes=allow_unknown_writes,
+            status_provider=status_provider,
         )
 
 
@@ -524,7 +543,10 @@ def serve(server: MotuProxyServer, before_close: Callable[[], None] | None = Non
     host, port = server.server_address[:2]
     print(f"listening on http://{host}:{port} writes={'on' if server.allow_writes else 'off'}", file=sys.stderr)
     if server.allow_writes:
-        print(f"write token: {server.write_token}", file=sys.stderr)
+        if server.debug or not server.write_token_file:
+            print(f"write token: {server.write_token}", file=sys.stderr)
+        else:
+            print("write token: stored in token file (use --debug to print)", file=sys.stderr)
         print(f"write token header: {WRITE_TOKEN_HEADER} or Authorization: Bearer", file=sys.stderr)
         if server.write_token_file:
             print(f"write token file: {server.write_token_file}", file=sys.stderr)
