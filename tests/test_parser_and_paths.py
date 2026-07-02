@@ -2,12 +2,12 @@ from unittest import TestCase
 
 from motu_proxy.parser import (
     ResponseFrameError,
-    datastore_payload,
     extract_datastore_body,
     extract_json_bytes,
     extract_response_etag,
     is_device_ack,
     join_response_frames,
+    parse_datastore_response,
     parse_response_frame,
     response_status_code,
     response_to_text,
@@ -111,6 +111,10 @@ class ParserTests(TestCase):
         response = join_response_frames([response_packet(payload)], expected_message_seq=2)
         self.assertEqual(extract_response_etag(response), "5678")
 
+    def test_extract_response_etag_does_not_scan_raw_body_for_sized_words(self) -> None:
+        response = b"raw-prefix" + sized_word("ETag") + sized_word("body-value") + b'{"value":"ok"}'
+        self.assertIsNone(extract_response_etag(response))
+
     def test_extract_response_etag_from_http_header_text(self) -> None:
         response = b"HTTP/1.1 200 OK\r\nETag: 5678\r\nCache-Control: no-cache\r\n\r\n{}"
         self.assertEqual(extract_response_etag(response), "5678")
@@ -122,13 +126,13 @@ class ParserTests(TestCase):
     def test_extract_response_etag_ignores_non_http_text(self) -> None:
         self.assertIsNone(extract_response_etag(b"ETag: body-value\n{}"))
 
-    def test_datastore_payload_keeps_json_body_and_etag(self) -> None:
-        payload = datastore_payload(b"HTTP/1.1 200 OK\r\nETag: 5678\r\n\r\n{\"value\":\"ok\"}")
+    def test_parse_datastore_response_keeps_json_body_and_etag(self) -> None:
+        payload = parse_datastore_response(b"HTTP/1.1 200 OK\r\nETag: 5678\r\n\r\n{\"value\":\"ok\"}")
         self.assertEqual(payload.body, b'{"value":"ok"}')
         self.assertEqual(payload.etag, "5678")
 
-    def test_datastore_payload_marks_text_304_not_modified(self) -> None:
-        payload = datastore_payload(b"HTTP/1.1 304 Not Modified\r\nETag: 5678\r\n\r\n")
+    def test_parse_datastore_response_marks_text_304_not_modified(self) -> None:
+        payload = parse_datastore_response(b"HTTP/1.1 304 Not Modified\r\nETag: 5678\r\n\r\n")
         self.assertTrue(payload.not_modified)
         self.assertEqual(payload.etag, "5678")
         self.assertEqual(payload.body, b"")
@@ -138,9 +142,9 @@ class ParserTests(TestCase):
         response = b"UTOM" + u32(8) + u32(1) + u32(0) + u32(len(metadata)) + metadata
         self.assertEqual(response_status_code(response), 304)
 
-    def test_datastore_payload_does_not_truncate_raw_concatenated_json(self) -> None:
+    def test_parse_datastore_response_does_not_truncate_raw_concatenated_json(self) -> None:
         response = b'{"first":true}{"second":true}'
-        payload = datastore_payload(response)
+        payload = parse_datastore_response(response)
         self.assertEqual(payload.body, response)
 
     def test_extract_datastore_body_strips_only_recognized_utom_envelope(self) -> None:

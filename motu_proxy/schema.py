@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import math
 import re
-from collections.abc import Callable, Iterable
-from dataclasses import dataclass
+from collections.abc import Callable, Iterable, Mapping
+from dataclasses import dataclass, field
 from numbers import Real
 
 from .json_body import InvalidJsonBody, load_json_object
@@ -37,10 +37,10 @@ class PathSchema:
     minimum: int | float | None = None
     maximum: int | float | None = None
     enum_values: tuple[int | float | str, ...] | None = None
+    segments: tuple[str, ...] = field(init=False, repr=False)
 
-    @property
-    def segments(self) -> tuple[str, ...]:
-        return tuple(self.path.split("/"))
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "segments", tuple(self.path.split("/")))
 
 
 RAW_SCHEMA: tuple[
@@ -466,6 +466,10 @@ SCHEMA: tuple[PathSchema, ...] = tuple(
     PathSchema(path, value_type, permission, minimum, maximum, _parse_enum(enum_values))
     for path, value_type, permission, minimum, maximum, enum_values in RAW_SCHEMA
 )
+SCHEMA_BY_SEGMENT_COUNT: dict[int, tuple[PathSchema, ...]] = {
+    count: tuple(entry for entry in SCHEMA if len(entry.segments) == count)
+    for count in {len(entry.segments) for entry in SCHEMA}
+}
 
 
 def find_path_schema(path: str) -> PathSchema | None:
@@ -474,7 +478,7 @@ def find_path_schema(path: str) -> PathSchema | None:
         return None
     requested = tuple(segment for segment in relative.split("/") if segment)
     best: tuple[tuple[int, int], PathSchema] | None = None
-    for entry in SCHEMA:
+    for entry in SCHEMA_BY_SEGMENT_COUNT.get(len(requested), ()):
         score = _match_score(entry.segments, requested)
         if score is None:
             continue
@@ -494,6 +498,20 @@ def validate_datastore_write(
         body = load_json_object(json_body)
     except InvalidJsonBody as exc:
         raise DatastoreValidationError(str(exc)) from exc
+    validate_datastore_write_object(
+        path,
+        body,
+        warn_unknown=warn_unknown,
+        allow_unknown=allow_unknown,
+    )
+
+
+def validate_datastore_write_object(
+    path: str,
+    body: Mapping[str, object],
+    warn_unknown: Callable[[str], None] | None = None,
+    allow_unknown: bool = False,
+) -> None:
     if _relative_datastore_path(path) is None:
         raise DatastoreValidationError(
             f"{normalize_path(path)} is not in the known writable schema"
@@ -522,7 +540,10 @@ def _relative_datastore_path(path: str) -> str | None:
     return normalized[len(DATASTORE_PREFIX) :]
 
 
-def _iter_write_values(base_path: str, body: dict) -> Iterable[tuple[str, object]]:
+def _iter_write_values(
+    base_path: str,
+    body: Mapping[str, object],
+) -> Iterable[tuple[str, object]]:
     base = normalize_path(base_path).rstrip("/")
     for key, value in body.items():
         if key == "value":

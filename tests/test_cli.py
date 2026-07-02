@@ -114,7 +114,7 @@ class FakeServeDatastore:
     def post(
         self,
         path: str,
-        json_body: str,
+        json_body: bytes,
         client: str | None = None,
         timeout_ms: int = 1200,
         **kwargs,
@@ -125,9 +125,9 @@ class FakeServeDatastore:
 class FakePostDatastore:
     def __init__(self, response: bytes = b'{"ok":true}') -> None:
         self.response = response
-        self.calls: list[tuple[str, str]] = []
+        self.calls: list[tuple[str, bytes]] = []
 
-    def post(self, path: str, json_body: str) -> bytes:
+    def post(self, path: str, json_body: bytes) -> bytes:
         self.calls.append((path, json_body))
         return self.response
 
@@ -618,7 +618,7 @@ class CliPostValidationTests(TestCase):
             result = args.func(args)
 
         self.assertEqual(result, 0)
-        self.assertEqual(datastore.calls, [("/datastore/uid", '{"value":"changed"}')])
+        self.assertEqual(datastore.calls, [("/datastore/uid", b'{"value":"changed"}')])
 
     def test_post_unknown_path_rejected_before_opening_datastore(self) -> None:
         args = build_parser().parse_args(["post", "/future/path", '{"value":{"new":true}}'])
@@ -644,7 +644,7 @@ class CliPostValidationTests(TestCase):
             result = args.func(args)
 
         self.assertEqual(result, 0)
-        self.assertEqual(datastore.calls, [("/datastore/future/path", '{"value":{"new":true}}')])
+        self.assertEqual(datastore.calls, [("/datastore/future/path", b'{"value":{"new":true}}')])
 
 
 class CliMetersTests(TestCase):

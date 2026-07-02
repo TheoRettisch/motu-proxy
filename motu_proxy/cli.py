@@ -32,7 +32,7 @@ from .http_server import (
     MotuProxyServer,
     serve,
 )
-from .json_body import validate_json_body
+from .json_body import load_json_object
 from .parser import response_to_text
 from .paths import normalize_path
 from .protocol import (
@@ -46,7 +46,7 @@ from .protocol import (
     crc32,
     validate_host_seq,
 )
-from .schema import validate_datastore_write
+from .schema import validate_datastore_write_object
 
 DEFAULT_WRITE_TOKEN_FILE = Path("/run/motu-proxy/write-token")
 DEFAULT_SMOKE_PATHS = ("/datastore/uid", "/datastore/ext/maxUSBToHost", "/datastore/host/mode")
@@ -207,11 +207,16 @@ def command_meters(args) -> int:
 
 def command_post(args) -> int:
     path = normalize_path(args.path)
-    validate_json_body(args.json_body)
+    write_object = load_json_object(args.json_body)
+    write_body = args.json_body.encode("utf-8")
     if not args.no_validate:
-        validate_datastore_write(path, args.json_body, allow_unknown=args.allow_unknown_writes)
+        validate_datastore_write_object(
+            path,
+            write_object,
+            allow_unknown=args.allow_unknown_writes,
+        )
     with open_datastore(config_from_args(args)) as datastore:
-        response = datastore.post(path, args.json_body)
+        response = datastore.post(path, write_body)
     if args.raw:
         sys.stdout.buffer.write(response)
     else:
@@ -300,7 +305,7 @@ def command_serve(args) -> int:
 
 def command_selftest(_args) -> int:
     got_get = build_get_frame(0x24, 2, "/datastore")
-    got_post = build_post_frame(0x23, 2, "/datastore/host/os", '{"value": "win"}', header="PTTH")
+    got_post = build_post_frame(0x23, 2, "/datastore/host/os", b'{"value": "win"}', header="PTTH")
     if got_get != EXPECTED_GET_DATASTORE:
         raise AssertionError("GET frame does not match capture")
     if got_post != EXPECTED_POST_HOST_OS:

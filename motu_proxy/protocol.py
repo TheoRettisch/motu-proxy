@@ -48,15 +48,19 @@ def u32(value: int) -> bytes:
 
 
 def sized_word(value: str | bytes) -> bytes:
-    if isinstance(value, str):
-        value = value.encode("utf-8")
+    value = _value_bytes(value)
     return u32(len(value)) + value
 
 
 def sized_word_len(value: str | bytes) -> int:
-    if isinstance(value, str):
-        value = value.encode("utf-8")
+    value = _value_bytes(value)
     return 4 + len(value)
+
+
+def _value_bytes(value: str | bytes) -> bytes:
+    if isinstance(value, str):
+        return value.encode("utf-8")
+    return value
 
 
 QueryFieldValue = str | int
@@ -160,11 +164,11 @@ def max_post_json_body_bytes(
 
 def validate_post_frame_size(
     path: str,
-    json_body: str,
+    json_body: bytes,
     header: str = "NREK",
     client: str | int | None = None,
 ) -> None:
-    body_len = len(json_body.encode("utf-8"))
+    body_len = len(json_body)
     max_body_len = max_post_json_body_bytes(path, header=header, client=client)
     if body_len > max_body_len:
         raise ProtocolFrameTooLarge(
@@ -218,7 +222,7 @@ def build_post_frame(
     seq: int,
     message_seq: int,
     path: str,
-    json_body: str,
+    json_body: bytes,
     header: str = "NREK",
     client: str | int | None = None,
 ) -> bytes:

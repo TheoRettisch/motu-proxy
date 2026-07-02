@@ -26,11 +26,12 @@ from .device import (
 )
 from .parser import (
     DatastorePayload,
+    ResponseFrame,
     ResponseFrameError,
-    datastore_payload,
-    extract_response_etag,
+    datastore_body_content_type,
     is_device_ack,
-    join_response_frames,
+    join_parsed_response_frames,
+    parse_datastore_response,
     parse_response_frame,
     response_status_code,
 )
@@ -168,6 +169,7 @@ class DatastoreTransition:
     to_etag: str
     body: bytes
     origin_client: str | None = None
+    content_type: str | None = None
 
 
 @dataclass(frozen=True)
@@ -211,6 +213,7 @@ class MotuUsbDatastore:
         self.message_seq = message_seq
         self.last_response_stats: ResponseStats | None = None
         self.last_response_etag: str | None = None
+        self.last_response_payload: DatastorePayload | None = None
 
     @property
     def supports_cancellable_bulk_reads(self) -> bool:
@@ -269,7 +272,7 @@ class MotuUsbDatastore:
     def post(
         self,
         path: str,
-        json_body: str,
+        json_body: bytes,
         client: str | int | None = None,
         timeout_ms: int = DEFAULT_RESPONSE_TIMEOUT_MS,
     ) -> bytes:
@@ -354,7 +357,8 @@ class MotuUsbDatastore:
     ) -> bytes:
         self.last_response_stats = None
         self.last_response_etag = None
-        frames: list[bytes] = []
+        self.last_response_payload = None
+        frames: list[ResponseFrame] = []
         total = 0
         quiet_reads = 0
         reads = 0
@@ -560,7 +564,7 @@ class MotuUsbDatastore:
                             )
                         ) from exc
                     continue
-                frames.append(packet)
+                frames.append(parsed)
                 total += len(packet)
                 if len(frames) > max_response_frames:
                     self._record_response_stats(
@@ -634,7 +638,7 @@ class MotuUsbDatastore:
                 )
             )
         try:
-            response = join_response_frames(frames, expected_message_seq)
+            response = join_parsed_response_frames(frames)
         except ResponseFrameError:
             self._record_response_stats(
                 timeout_ms,
@@ -646,7 +650,8 @@ class MotuUsbDatastore:
                 total,
             )
             raise
-        self.last_response_etag = extract_response_etag(response)
+        self.last_response_payload = parse_datastore_response(response)
+        self.last_response_etag = self.last_response_payload.etag
         self._record_response_stats(
             timeout_ms,
             started,
@@ -746,6 +751,7 @@ class ManagedDatastore:
         self._closed = False
         self._last_response_stats: ResponseStats | None = None
         self._last_response_etag: str | None = None
+        self._last_response_payload: DatastorePayload | None = None
 
     @property
     def supports_cancellable_bulk_reads(self) -> bool:
@@ -775,10 +781,18 @@ class ManagedDatastore:
                 return getattr(datastore, "last_response_etag", None)
             return self._last_response_etag
 
+    @property
+    def last_response_payload(self) -> DatastorePayload | None:
+        with self._state_lock:
+            datastore = self._datastore
+            if datastore is not None:
+                return getattr(datastore, "last_response_payload", None)
+            return self._last_response_payload
+
     def get(self, path: str, **kwargs) -> bytes:
         return self._call("get", path, **kwargs)
 
-    def post(self, path: str, json_body: str, **kwargs) -> bytes:
+    def post(self, path: str, json_body: bytes, **kwargs) -> bytes:
         return self._call("post", path, json_body, **kwargs)
 
     def close(self) -> None:
@@ -909,6 +923,7 @@ class ManagedDatastore:
             if datastore is self._datastore:
                 self._last_response_stats = getattr(datastore, "last_response_stats", None)
                 self._last_response_etag = getattr(datastore, "last_response_etag", None)
+                self._last_response_payload = getattr(datastore, "last_response_payload", None)
 
 
 def read_device_capability_info(datastore: DatastoreReader) -> DeviceCapabilityInfo:
@@ -950,7 +965,7 @@ def _read_optional_datastore_value(datastore: DatastoreReader, path: str) -> tup
 
 
 def _decode_datastore_value(response: bytes) -> object | None:
-    body = datastore_payload(response).body.strip()
+    body = parse_datastore_response(response).body.strip()
     if not body:
         return None
     try:
@@ -1111,7 +1126,7 @@ class DatastoreCoordinator:
             self._release_io()
         return payload
 
-    def post(self, path: str, json_body: str, client: str | int | None = None) -> DatastorePayload:
+    def post(self, path: str, json_body: bytes, client: str | int | None = None) -> DatastorePayload:
         origin_client = _client_string(client)
         refresh: DatastorePayload | None = None
         self._acquire_foreground_io()
@@ -1147,13 +1162,17 @@ class DatastoreCoordinator:
                 transition, should_refresh = self._find_wait_outcome_locked(etag, client_id)
                 if transition is not None:
                     if path == self.poll_path and can_use_cached_transition:
-                        return DatastorePayload(transition.body, etag=transition.to_etag)
+                        return DatastorePayload(
+                            transition.body,
+                            etag=transition.to_etag,
+                            content_type=transition.content_type,
+                        )
                     should_refresh = True
                 if should_refresh:
                     break
                 remaining = deadline - time.monotonic()
                 if remaining <= 0 or self._closed:
-                    return DatastorePayload(b"", etag=etag, not_modified=True)
+                    return DatastorePayload(b"", etag=etag, status=304)
                 if not self.foreground_preemptive_native_long_poll_available:
                     now = time.monotonic()
                     if self._degraded_refresh_in_progress:
@@ -1202,9 +1221,7 @@ class DatastoreCoordinator:
                         if initial_refresh
                         else self.long_poll_timeout_ms,
                         should_cancel=self._is_closed,
-                        read_timeout_slice_ms=None
-                        if initial_refresh
-                        else self.poll_read_timeout_slice_ms,
+                        read_timeout_slice_ms=None,
                         use_cancellable_read=not initial_refresh,
                         read_started=None if initial_refresh else self._set_active_poll_read,
                     )
@@ -1337,11 +1354,15 @@ class DatastoreCoordinator:
 
     def _payload_from_response(self, response: bytes) -> DatastorePayload:
         self._reset_if_session_generation_changed()
-        payload = datastore_payload(response)
+        payload = getattr(self.datastore, "last_response_payload", None)
+        if not isinstance(payload, DatastorePayload):
+            payload = parse_datastore_response(response)
+        content_type = payload.content_type or datastore_body_content_type(payload.body)
         return DatastorePayload(
             payload.body,
             etag=payload.etag or getattr(self.datastore, "last_response_etag", None),
-            not_modified=payload.not_modified,
+            status=payload.status,
+            content_type=content_type,
         )
 
     def _publish_payload(
@@ -1368,6 +1389,7 @@ class DatastoreCoordinator:
                         to_etag=payload.etag,
                         body=payload.body,
                         origin_client=origin_client,
+                        content_type=payload.content_type or datastore_body_content_type(payload.body),
                     )
                 )
             self._latest_etag = payload.etag

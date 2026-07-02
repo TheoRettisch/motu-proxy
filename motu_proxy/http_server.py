@@ -21,8 +21,13 @@ from .datastore import (
     ShortUsbWrite,
 )
 from .device import DeviceDiscoveryError
-from .json_body import InvalidJsonBody, validate_json_body
-from .parser import DatastorePayload, ResponseFrameError
+from .json_body import InvalidJsonBody, load_json_object
+from .parser import (
+    DatastorePayload,
+    ResponseFrameError,
+    datastore_body_content_type,
+    is_single_json_container,
+)
 from .paths import normalize_path
 from .protocol import (
     ProtocolFrameTooLarge,
@@ -32,12 +37,12 @@ from .protocol import (
 from .schema import (
     DatastorePermissionError,
     DatastoreValidationError,
-    validate_datastore_write,
+    validate_datastore_write_object,
 )
 
 DatastoreRead = Callable[..., bytes | DatastorePayload]
-DatastoreWrite = Callable[[str, str, str | None], bytes | DatastorePayload]
-WriteLogger = Callable[[str, str, str], None]
+DatastoreWrite = Callable[[str, bytes, str | None], bytes | DatastorePayload]
+WriteLogger = Callable[[str, str, bytes], None]
 StatusProvider = Callable[[], dict[str, object | None]]
 # Keep the default comfortably below the protocol's single-frame u16 limits.
 # Path/client-specific validation below catches exact frame overflows.
@@ -84,6 +89,7 @@ class DispatchResult:
     path: str
     etag: str | None = None
     status: int = 200
+    content_type: str | None = None
 
 
 def parse_write_body(raw: str, content_type: str) -> str:
@@ -216,13 +222,19 @@ def dispatch_datastore_request(
     request_url = urlparse(request_path)
     if method == "GET" and request_url.path == STATUS_PATH and status_provider is not None:
         body = json.dumps(status_provider(), sort_keys=True).encode("utf-8")
-        return DispatchResult(body, STATUS_PATH)
+        return DispatchResult(body, STATUS_PATH, content_type="application/json")
     path = normalize_path(request_url.path)
     if method == "GET":
         query_fields, client = parse_get_query_fields(request_path)
-        payload = _datastore_payload(_run_get(run_get, path, client, if_none_match, query_fields))
+        payload = _coerce_datastore_payload(_run_get(run_get, path, client, if_none_match, query_fields))
         status = 304 if payload.not_modified else 200
-        return DispatchResult(payload.body, path, payload.etag, status=status)
+        return DispatchResult(
+            payload.body,
+            path,
+            payload.etag,
+            status=status,
+            content_type=payload.content_type,
+        )
     client = parse_client_query(request_path)
     if not allow_writes:
         raise WritesDisabled("writes require --allow-writes")
@@ -230,15 +242,20 @@ def dispatch_datastore_request(
     validate_write_origin(method, allow_writes, origin, host)
     validate_write_token(method, allow_writes, write_token, request_token)
     write_body = parse_write_body(raw_body, content_type)
-    validate_json_body(write_body)
+    write_object = load_json_object(write_body)
+    write_body_bytes = write_body.encode("utf-8")
     if validate_writes:
-        validate_datastore_write(path, write_body, allow_unknown=allow_unknown_writes)
-    validate_post_frame_size(path, write_body, client=client)
+        validate_datastore_write_object(
+            path,
+            write_object,
+            allow_unknown=allow_unknown_writes,
+        )
+    validate_post_frame_size(path, write_body_bytes, client=client)
     if log_write is not None:
-        log_write(method, path, write_body)
+        log_write(method, path, write_body_bytes)
     # HTTP PATCH is a compatibility alias for the MOTU datastore POST write.
-    payload = _datastore_payload(run_post(path, write_body, client))
-    return DispatchResult(payload.body, path, payload.etag)
+    payload = _coerce_datastore_payload(run_post(path, write_body_bytes, client))
+    return DispatchResult(payload.body, path, payload.etag, content_type=payload.content_type)
 
 
 def _run_get(
@@ -262,7 +279,7 @@ def _uses_legacy_get_signature(query_fields: tuple[tuple[str, str], ...]) -> boo
     )
 
 
-def _datastore_payload(value: bytes | DatastorePayload) -> DatastorePayload:
+def _coerce_datastore_payload(value: bytes | DatastorePayload) -> DatastorePayload:
     if isinstance(value, DatastorePayload):
         return value
     return DatastorePayload(value)
@@ -276,12 +293,11 @@ class _NullLock:
         return None
 
 
-def log_write_attempt(method: str, path: str, body: str) -> None:
-    body_bytes = len(body.encode("utf-8"))
-    print(f"write attempt method={method} path={path} body_bytes={body_bytes}", file=sys.stderr)
+def log_write_attempt(method: str, path: str, body: bytes) -> None:
+    print(f"write attempt method={method} path={path} body_bytes={len(body)}", file=sys.stderr)
 
 
-def log_write_attempt_debug(method: str, path: str, body: str) -> None:
+def log_write_attempt_debug(method: str, path: str, body: bytes) -> None:
     print(f"write attempt method={method} path={path} body={body!r}", file=sys.stderr)
 
 
@@ -409,7 +425,10 @@ class MotuProxyHandler(BaseHTTPRequestHandler):
             self.send_response(result.status)
             response_started = True
             if result.status != 304:
-                self.send_header("Content-Type", response_content_type(body))
+                self.send_header(
+                    "Content-Type",
+                    result.content_type or response_content_type(body),
+                )
             self.send_header("Cache-Control", "no-cache")
             if method == "GET" and result.etag is not None:
                 self.send_header("ETag", result.etag)
@@ -604,48 +623,11 @@ class MotuProxyServer(ThreadingHTTPServer):
 
 
 def response_content_type(body: bytes) -> str:
-    if _is_single_json_container(body):
-        return "application/json"
-    return "application/octet-stream"
+    return datastore_body_content_type(body)
 
 
 def _is_single_json_container(body: bytes) -> bool:
-    stripped = body.strip()
-    if not stripped:
-        return False
-    if stripped[0] == ord("{"):
-        expected_stack = [ord("}")]
-    elif stripped[0] == ord("["):
-        expected_stack = [ord("]")]
-    else:
-        return False
-
-    in_string = False
-    escaped = False
-    for index, byte in enumerate(stripped[1:], start=1):
-        if in_string:
-            if escaped:
-                escaped = False
-            elif byte == ord("\\"):
-                escaped = True
-            elif byte == ord('"'):
-                in_string = False
-            continue
-        if byte == ord('"'):
-            in_string = True
-            continue
-        if byte == ord("{"):
-            expected_stack.append(ord("}"))
-            continue
-        if byte == ord("["):
-            expected_stack.append(ord("]"))
-            continue
-        if byte in (ord("}"), ord("]")):
-            if not expected_stack or byte != expected_stack.pop():
-                return False
-            if not expected_stack:
-                return index == len(stripped) - 1
-    return False
+    return is_single_json_container(body)
 
 
 def serve(server: MotuProxyServer, before_close: Callable[[], None] | None = None) -> int:

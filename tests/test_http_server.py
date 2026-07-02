@@ -116,13 +116,13 @@ class HttpServerTests(TestCase):
         allow_remote_writes: bool = False,
         allow_unknown_writes: bool = False,
     ):
-        calls: list[tuple[str, str, str | None]] = []
+        calls: list[tuple[str, str, bytes | None]] = []
 
         def get(path: str, client: str | None = None) -> bytes:
             calls.append(("GET", path, None))
             return b'{"value":"0001f2fffe00c719"}'
 
-        def post(path: str, body: str, client: str | None = None) -> bytes:
+        def post(path: str, body: bytes, client: str | None = None) -> bytes:
             calls.append(("POST", path, body))
             return b'{"ok":true}'
 
@@ -413,7 +413,7 @@ class HttpServerTests(TestCase):
             if_none_match: str | None = None,
             query_fields: tuple[tuple[str, str], ...] = (),
         ) -> DatastorePayload:
-            return DatastorePayload(b"", etag=if_none_match, not_modified=True)
+            return DatastorePayload(b"", etag=if_none_match, status=304)
 
         result = dispatch_datastore_request(
             "GET",
@@ -462,7 +462,7 @@ class HttpServerTests(TestCase):
             lambda path, client=None, if_none_match=None: DatastorePayload(
                 b"",
                 etag=if_none_match,
-                not_modified=True,
+                status=304,
             ),
             lambda path, body, client=None: b"{}",
             if_none_match="5678",
@@ -525,12 +525,12 @@ class HttpServerTests(TestCase):
             allow_writes=True,
         )
         self.assertEqual(result.response, b'{"ok":true}')
-        self.assertEqual(calls, [("POST", "/datastore/host/os", '{"value":"linux"}')])
+        self.assertEqual(calls, [("POST", "/datastore/host/os", b'{"value":"linux"}')])
 
     def test_post_forwards_client_identifier(self) -> None:
-        calls: list[tuple[str, str, str | None]] = []
+        calls: list[tuple[str, bytes, str | None]] = []
 
-        def post(path: str, body: str, client: str | None = None) -> bytes:
+        def post(path: str, body: bytes, client: str | None = None) -> bytes:
             calls.append((path, body, client))
             return b'{"ok":true}'
 
@@ -547,12 +547,12 @@ class HttpServerTests(TestCase):
             request_token=WRITE_TOKEN,
         )
         self.assertEqual(result.path, "/datastore/host/os")
-        self.assertEqual(calls, [("/datastore/host/os", '{"value":"linux"}', "1479701624")])
+        self.assertEqual(calls, [("/datastore/host/os", b'{"value":"linux"}', "1479701624")])
 
     def test_post_ignores_non_client_query_fields(self) -> None:
-        calls: list[tuple[str, str, str | None]] = []
+        calls: list[tuple[str, bytes, str | None]] = []
 
-        def post(path: str, body: str, client: str | None = None) -> bytes:
+        def post(path: str, body: bytes, client: str | None = None) -> bytes:
             calls.append((path, body, client))
             return b'{"ok":true}'
 
@@ -569,21 +569,21 @@ class HttpServerTests(TestCase):
             request_token=WRITE_TOKEN,
         )
 
-        self.assertEqual(calls, [("/datastore/host/os", '{"value":"linux"}', "1479701624")])
+        self.assertEqual(calls, [("/datastore/host/os", b'{"value":"linux"}', "1479701624")])
 
     def test_patch_is_post_alias_not_partial_update(self) -> None:
         result, calls = self.dispatch("PATCH", "/host/os", body='{"value":"linux"}', allow_writes=True)
         self.assertEqual(result.response, b'{"ok":true}')
-        self.assertEqual(calls, [("POST", "/datastore/host/os", '{"value":"linux"}')])
+        self.assertEqual(calls, [("POST", "/datastore/host/os", b'{"value":"linux"}')])
 
     def test_cross_origin_write_is_rejected_when_writes_are_enabled(self) -> None:
-        calls: list[tuple[str, str, str | None]] = []
+        calls: list[tuple[str, str, bytes | None]] = []
 
         def get(path: str, client: str | None = None) -> bytes:
             calls.append(("GET", path, None))
             return b"{}"
 
-        def post(path: str, body: str, client: str | None = None) -> bytes:
+        def post(path: str, body: bytes, client: str | None = None) -> bytes:
             calls.append(("POST", path, body))
             return b"{}"
 
@@ -612,7 +612,7 @@ class HttpServerTests(TestCase):
             request_token=None,
         )
         self.assertEqual(result.response, b'{"ok":true}')
-        self.assertEqual(calls, [("POST", "/datastore/host/os", '{"value":"linux"}')])
+        self.assertEqual(calls, [("POST", "/datastore/host/os", b'{"value":"linux"}')])
 
     def test_missing_write_token_is_rejected_when_token_protection_is_enabled(self) -> None:
         with self.assertRaises(WriteTokenRequired):
@@ -667,7 +667,7 @@ class HttpServerTests(TestCase):
             allow_remote_writes=True,
         )
         self.assertEqual(result.response, b'{"ok":true}')
-        self.assertEqual(calls, [("POST", "/datastore/host/os", '{"value":"linux"}')])
+        self.assertEqual(calls, [("POST", "/datastore/host/os", b'{"value":"linux"}')])
 
     def test_unsafe_remote_write_mode_allows_non_loopback_host_with_token(self) -> None:
         result, calls = self.dispatch(
@@ -680,7 +680,7 @@ class HttpServerTests(TestCase):
             allow_remote_writes=True,
         )
         self.assertEqual(result.response, b'{"ok":true}')
-        self.assertEqual(calls, [("POST", "/datastore/host/os", '{"value":"linux"}')])
+        self.assertEqual(calls, [("POST", "/datastore/host/os", b'{"value":"linux"}')])
 
     def test_https_origin_is_rejected_for_plain_http_server(self) -> None:
         with self.assertRaises(CrossOriginWrite):
@@ -705,16 +705,16 @@ class HttpServerTests(TestCase):
             host="127.0.0.1:1280",
         )
         self.assertEqual(result.response, b'{"ok":true}')
-        self.assertEqual(calls, [("POST", "/datastore/host/os", '{"value":"linux"}')])
+        self.assertEqual(calls, [("POST", "/datastore/host/os", b'{"value":"linux"}')])
 
     def test_dispatcher_serializes_access_with_lock(self) -> None:
-        calls: list[tuple[str, str]] = []
+        calls: list[tuple[str, bytes]] = []
 
         def get(path: str, client: str | None = None) -> bytes:
             calls.append(("GET", path))
             return b"{}"
 
-        def post(path: str, body: str, client: str | None = None) -> bytes:
+        def post(path: str, body: bytes, client: str | None = None) -> bytes:
             calls.append(("POST", path))
             return b"{}"
 
@@ -726,7 +726,7 @@ class HttpServerTests(TestCase):
         self.assertEqual(calls, [("GET", "/datastore/uid")])
 
     def test_disabled_write_attempts_do_not_log_body(self) -> None:
-        logs: list[tuple[str, str, str]] = []
+        logs: list[tuple[str, str, bytes]] = []
         dispatcher = DatastoreDispatcher(
             False,
             lambda path, client=None: b"{}",
@@ -739,7 +739,7 @@ class HttpServerTests(TestCase):
         self.assertEqual(logs, [])
 
     def test_write_attempts_are_not_logged_before_token_validation(self) -> None:
-        logs: list[tuple[str, str, str]] = []
+        logs: list[tuple[str, str, bytes]] = []
         dispatcher = DatastoreDispatcher(
             True,
             lambda path, client=None: b"{}",
@@ -760,7 +760,7 @@ class HttpServerTests(TestCase):
         self.assertEqual(logs, [])
 
     def test_write_attempts_are_logged_when_enabled(self) -> None:
-        logs: list[tuple[str, str, str]] = []
+        logs: list[tuple[str, str, bytes]] = []
         dispatcher = DatastoreDispatcher(
             True,
             lambda path, client=None: b"{}",
@@ -777,12 +777,12 @@ class HttpServerTests(TestCase):
             host="127.0.0.1:1280",
             request_token=WRITE_TOKEN,
         )
-        self.assertEqual(logs, [("POST", "/datastore/host/os", '{"value":"linux"}')])
+        self.assertEqual(logs, [("POST", "/datastore/host/os", b'{"value":"linux"}')])
 
     def test_default_write_logger_redacts_body(self) -> None:
         stderr = StringIO()
         with redirect_stderr(stderr):
-            log_write_attempt("POST", "/datastore/host/os", '{"value":"linux"}')
+            log_write_attempt("POST", "/datastore/host/os", b'{"value":"linux"}')
         output = stderr.getvalue()
         self.assertIn("body_bytes=17", output)
         self.assertNotIn("linux", output)
@@ -790,13 +790,13 @@ class HttpServerTests(TestCase):
     def test_debug_write_logger_includes_body(self) -> None:
         stderr = StringIO()
         with redirect_stderr(stderr):
-            log_write_attempt_debug("POST", "/datastore/host/os", '{"value":"linux"}')
-        self.assertIn('body=\'{"value":"linux"}\'', stderr.getvalue())
+            log_write_attempt_debug("POST", "/datastore/host/os", b'{"value":"linux"}')
+        self.assertIn('body=b\'{"value":"linux"}\'', stderr.getvalue())
 
     def test_invalid_write_json_is_rejected_before_usb_call(self) -> None:
-        calls: list[tuple[str, str]] = []
+        calls: list[tuple[str, bytes]] = []
 
-        def post(path: str, body: str, client: str | None = None) -> bytes:
+        def post(path: str, body: bytes, client: str | None = None) -> bytes:
             calls.append((path, body))
             return b"{}"
 
@@ -816,9 +816,9 @@ class HttpServerTests(TestCase):
         self.assertEqual(calls, [])
 
     def test_non_finite_write_json_is_rejected_before_usb_call(self) -> None:
-        calls: list[tuple[str, str]] = []
+        calls: list[tuple[str, bytes]] = []
 
-        def post(path: str, body: str, client: str | None = None) -> bytes:
+        def post(path: str, body: bytes, client: str | None = None) -> bytes:
             calls.append((path, body))
             return b"{}"
 
@@ -838,12 +838,12 @@ class HttpServerTests(TestCase):
         self.assertEqual(calls, [])
 
     def test_oversized_write_frame_is_rejected_before_usb_call(self) -> None:
-        calls: list[tuple[str, str]] = []
-        logs: list[tuple[str, str, str]] = []
+        calls: list[tuple[str, bytes]] = []
+        logs: list[tuple[str, str, bytes]] = []
         max_body = max_post_json_body_bytes("/datastore/host/os")
         body = '{"value":"' + ("x" * (max_body - 11)) + '"}'
 
-        def post(path: str, body: str, client: str | None = None) -> bytes:
+        def post(path: str, body: bytes, client: str | None = None) -> bytes:
             calls.append((path, body))
             return b"{}"
 
@@ -865,9 +865,9 @@ class HttpServerTests(TestCase):
         self.assertEqual(logs, [])
 
     def test_non_object_write_json_is_rejected_before_usb_call(self) -> None:
-        calls: list[tuple[str, str]] = []
+        calls: list[tuple[str, bytes]] = []
 
-        def post(path: str, body: str, client: str | None = None) -> bytes:
+        def post(path: str, body: bytes, client: str | None = None) -> bytes:
             calls.append((path, body))
             return b"{}"
 
@@ -891,9 +891,9 @@ class HttpServerTests(TestCase):
         self.assertEqual(calls, [])
 
     def test_read_only_write_is_rejected_before_usb_call(self) -> None:
-        calls: list[tuple[str, str]] = []
+        calls: list[tuple[str, bytes]] = []
 
-        def post(path: str, body: str, client: str | None = None) -> bytes:
+        def post(path: str, body: bytes, client: str | None = None) -> bytes:
             calls.append((path, body))
             return b"{}"
 
@@ -913,9 +913,9 @@ class HttpServerTests(TestCase):
         self.assertEqual(calls, [])
 
     def test_invalid_known_write_value_is_rejected_before_usb_call(self) -> None:
-        calls: list[tuple[str, str]] = []
+        calls: list[tuple[str, bytes]] = []
 
-        def post(path: str, body: str, client: str | None = None) -> bytes:
+        def post(path: str, body: bytes, client: str | None = None) -> bytes:
             calls.append((path, body))
             return b"{}"
 
@@ -935,9 +935,9 @@ class HttpServerTests(TestCase):
         self.assertEqual(calls, [])
 
     def test_unknown_path_is_rejected_by_default(self) -> None:
-        calls: list[tuple[str, str]] = []
+        calls: list[tuple[str, bytes]] = []
 
-        def post(path: str, body: str, client: str | None = None) -> bytes:
+        def post(path: str, body: bytes, client: str | None = None) -> bytes:
             calls.append((path, body))
             return b"{}"
 
@@ -966,12 +966,12 @@ class HttpServerTests(TestCase):
             allow_unknown_writes=True,
         )
         self.assertEqual(result.response, b'{"ok":true}')
-        self.assertEqual(calls, [("POST", "/datastore/future/path", '{"value":{"new":true}}')])
+        self.assertEqual(calls, [("POST", "/datastore/future/path", b'{"value":{"new":true}}')])
 
     def test_allow_unknown_writes_does_not_allow_non_datastore_paths(self) -> None:
-        calls: list[tuple[str, str]] = []
+        calls: list[tuple[str, bytes]] = []
 
-        def post(path: str, body: str, client: str | None = None) -> bytes:
+        def post(path: str, body: bytes, client: str | None = None) -> bytes:
             calls.append((path, body))
             return b'{"ok":true}'
 
@@ -992,9 +992,9 @@ class HttpServerTests(TestCase):
         self.assertEqual(calls, [])
 
     def test_no_validate_bypasses_read_only_and_value_checks(self) -> None:
-        calls: list[tuple[str, str]] = []
+        calls: list[tuple[str, bytes]] = []
 
-        def post(path: str, body: str, client: str | None = None) -> bytes:
+        def post(path: str, body: bytes, client: str | None = None) -> bytes:
             calls.append((path, body))
             return b'{"ok":true}'
 
@@ -1012,7 +1012,7 @@ class HttpServerTests(TestCase):
             validate_writes=False,
         )
         self.assertEqual(result.response, b'{"ok":true}')
-        self.assertEqual(calls, [("/datastore/uid", '{"value":"changed"}')])
+        self.assertEqual(calls, [("/datastore/uid", b'{"value":"changed"}')])
 
     def test_serve_defaults_are_read_only_localhost(self) -> None:
         args = build_parser().parse_args(["serve"])
@@ -1418,6 +1418,20 @@ class HttpHandlerTests(TestCase):
         self.assertIn(("Cache-Control", "no-cache"), handler.sent_headers)
         self.assertEqual(handler.wfile.getvalue(), b'{"first":true}{"second":true}')
 
+    def test_handler_uses_dispatch_content_type_metadata(self) -> None:
+        class Dispatcher:
+            def dispatch(self, *args, **kwargs):
+                return DispatchResult(
+                    b'{"first":true}{"second":true}',
+                    "/datastore",
+                    content_type="application/vnd.motu.test",
+                )
+
+        handler = self.make_handler(dispatcher=Dispatcher())
+        handler.handle_datastore_request("GET")
+        self.assertEqual(handler.statuses, [200])
+        self.assertIn(("Content-Type", "application/vnd.motu.test"), handler.sent_headers)
+
     def test_handler_emits_etag_for_get_response(self) -> None:
         class Dispatcher:
             def dispatch(self, *args, **kwargs):
@@ -1471,12 +1485,12 @@ class HttpHandlerTests(TestCase):
         self.assertIn("valid write token required", json.loads(body.decode("utf-8"))["error"])
 
     def test_handler_accepts_write_without_token_when_token_protection_is_disabled(self) -> None:
-        calls: list[tuple[str, str]] = []
+        calls: list[tuple[str, bytes]] = []
 
         def get(path: str, client: str | None = None) -> bytes:
             raise AssertionError("unexpected get")
 
-        def post(path: str, body: str, client: str | None = None) -> bytes:
+        def post(path: str, body: bytes, client: str | None = None) -> bytes:
             calls.append((path, body))
             return b'{"ok":true}'
 
@@ -1487,13 +1501,13 @@ class HttpHandlerTests(TestCase):
 
         self.assertEqual(handler.statuses, [200])
         self.assertEqual(handler.wfile.getvalue(), b'{"ok":true}')
-        self.assertEqual(calls, [("/datastore/host/os", '{"value":"linux"}')])
+        self.assertEqual(calls, [("/datastore/host/os", b'{"value":"linux"}')])
 
     def test_handler_rejects_unsafe_writes_before_reading_body(self) -> None:
         def get(path: str, client: str | None = None) -> bytes:
             raise AssertionError("unexpected get")
 
-        def post(path: str, body: str, client: str | None = None) -> bytes:
+        def post(path: str, body: bytes, client: str | None = None) -> bytes:
             raise AssertionError("unexpected post")
 
         cases = [

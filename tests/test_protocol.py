@@ -46,8 +46,8 @@ class ProtocolTests(TestCase):
 
     def test_post_frame_single_client_encoding_is_unchanged(self) -> None:
         self.assertEqual(
-            build_post_frame(0x23, 2, "/datastore/host/os", '{"value":"linux"}', client=1479701624),
-            build_post_frame(0x23, 2, "/datastore/host/os", '{"value":"linux"}', client="1479701624"),
+            build_post_frame(0x23, 2, "/datastore/host/os", b'{"value":"linux"}', client=1479701624),
+            build_post_frame(0x23, 2, "/datastore/host/os", b'{"value":"linux"}', client="1479701624"),
         )
 
     def test_get_frame_preserves_multiple_query_field_order(self) -> None:
@@ -91,25 +91,25 @@ class ProtocolTests(TestCase):
 
     def test_post_frame_matches_fixture(self) -> None:
         self.assertEqual(
-            build_post_frame(0x23, 2, "/datastore/host/os", '{"value": "win"}', header="PTTH"),
+            build_post_frame(0x23, 2, "/datastore/host/os", b'{"value": "win"}', header="PTTH"),
             EXPECTED_POST_HOST_OS,
         )
 
     def test_post_frame_can_forward_client_identifier(self) -> None:
-        frame = build_post_frame(0x23, 2, "/datastore/host/os", '{"value":"linux"}', client=1479701624)
+        frame = build_post_frame(0x23, 2, "/datastore/host/os", b'{"value":"linux"}', client=1479701624)
         self.assertIn(sized_word("/datastore/host/os"), frame)
         self.assertIn(sized_word("client") + sized_word("1479701624"), frame)
         self.assertNotIn(b"/datastore/host/os?client", frame)
 
     def test_post_frame_accepts_calculated_single_frame_limit(self) -> None:
         max_body = max_post_json_body_bytes("/datastore/host/os")
-        frame = build_post_frame(0x23, 2, "/datastore/host/os", "x" * max_body)
+        frame = build_post_frame(0x23, 2, "/datastore/host/os", b"x" * max_body)
         self.assertEqual(len(frame), MAX_U16)
 
     def test_post_frame_rejects_body_over_single_frame_limit(self) -> None:
         max_body = max_post_json_body_bytes("/datastore/host/os")
         with self.assertRaises(ProtocolFrameTooLarge):
-            build_post_frame(0x23, 2, "/datastore/host/os", "x" * (max_body + 1))
+            build_post_frame(0x23, 2, "/datastore/host/os", b"x" * (max_body + 1))
 
     def test_host_sequence_rolls_over_to_0x20(self) -> None:
         sequencer = HostSequencer(0x3E)

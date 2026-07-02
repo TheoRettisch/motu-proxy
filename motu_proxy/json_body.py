@@ -22,7 +22,3 @@ def load_json_object(body: str) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise InvalidJsonBody("write body must be a JSON object")
     return value
-
-
-def validate_json_body(body: str) -> None:
-    load_json_object(body)

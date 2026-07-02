@@ -136,6 +136,26 @@ Check local proxy/coordinator health:
 curl http://127.0.0.1:1280/__motu_proxy/status
 ```
 
+### Compatibility Boundary
+
+The stable compatibility boundary is the HTTP API exposed by `motu-proxy
+serve`, not the internal Python helper signatures. Internal datastore,
+protocol, parser, and coordinator APIs may change while the project is still in
+development.
+
+The HTTP proxy is intended to remain compatible with MOTU datastore clients,
+including browser clients served from the same origin as the proxy. That means
+preserving datastore GET/POST/PATCH routing, `/datastore/...` path behavior,
+`client` query forwarding, `ETag`/`If-None-Match` handling, `Cache-Control:
+no-cache`, and the JSON response shapes returned by the device.
+
+The proxy also has deliberate safety behavior that is not part of the native
+MOTU device API: writes are disabled by default, optional write-token
+protection can be enabled, known read-only/invalid writes can be rejected before
+USB I/O, and browser writes from another origin are blocked. A MOTU-style web
+app should be served from the proxy's origin unless an explicit CORS/static
+hosting compatibility mode is added later.
+
 By default the server binds to `127.0.0.1` and rejects POST/PATCH. A
 `ManagedDatastore` owns MOTU USB discovery, usbfs open/close, datastore init,
 and hotplug recovery for the HTTP server. A `DatastoreCoordinator` owns
@@ -379,5 +399,8 @@ This project is licensed under the MIT License. See `LICENSE`.
 
 ## Known Follow-Ups
 
+- Add lightweight performance instrumentation or benchmarks for idle native
+  long-poll churn, large `/datastore` response parsing, and HTTP fan-out so
+  future transport/parser changes can be measured against live MOTU hardware.
 - Add service packaging and deployment-specific udev/systemd integration when
   the target image layout is settled.

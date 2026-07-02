@@ -380,23 +380,23 @@ class DatastoreTests(TestCase):
     def test_post_uses_post_frame(self) -> None:
         transport = FakeTransport([response_packet(b'{"ok":true}')])
         datastore = MotuUsbDatastore(transport)
-        datastore.post("/datastore/host/os", '{"value":"linux"}')
-        self.assertEqual(transport.writes[0], build_post_frame(0x20, 2, "/datastore/host/os", '{"value":"linux"}'))
+        datastore.post("/datastore/host/os", b'{"value":"linux"}')
+        self.assertEqual(transport.writes[0], build_post_frame(0x20, 2, "/datastore/host/os", b'{"value":"linux"}'))
 
     def test_post_short_write_does_not_advance_message_sequence(self) -> None:
         transport = FakeTransport([], short_writes=True)
         datastore = MotuUsbDatastore(transport)
         with self.assertRaises(ShortUsbWrite):
-            datastore.post("/datastore/host/os", '{"value":"linux"}')
+            datastore.post("/datastore/host/os", b'{"value":"linux"}')
         self.assertEqual(datastore.message_seq, 2)
 
     def test_post_forwards_client_identifier(self) -> None:
         transport = FakeTransport([response_packet(b'{"ok":true}')])
         datastore = MotuUsbDatastore(transport)
-        datastore.post("/datastore/host/os", '{"value":"linux"}', client=1479701624)
+        datastore.post("/datastore/host/os", b'{"value":"linux"}', client=1479701624)
         self.assertEqual(
             transport.writes[0],
-            build_post_frame(0x20, 2, "/datastore/host/os", '{"value":"linux"}', client=1479701624),
+            build_post_frame(0x20, 2, "/datastore/host/os", b'{"value":"linux"}', client=1479701624),
         )
 
     def test_get_ignores_stale_wrong_sequence_before_current_response(self) -> None:
@@ -716,9 +716,9 @@ class ManagedDatastoreTests(TestCase):
         )
 
         with self.assertRaises(DatastoreDeviceUnavailable):
-            manager.post("/datastore/host/os", '{"value":"linux"}')
+            manager.post("/datastore/host/os", b'{"value":"linux"}')
         clock.advance(1.0)
-        response = manager.post("/datastore/host/os", '{"value":"linux"}')
+        response = manager.post("/datastore/host/os", b'{"value":"linux"}')
 
         self.assertEqual(response, http_response("2", b'{"ok":true}'))
         self.assertEqual(len(first.post_calls), 1)
@@ -851,7 +851,8 @@ class DatastoreCoordinatorTests(TestCase):
             transport.push(initial)
             self.assertTrue(transport.wait_for_cancellable_reads(1))
             self.assertEqual(coordinator.latest_etag, "1")
-            self.assertEqual(transport.cancellable_read_timeouts[0], 20)
+            self.assertGreaterEqual(transport.cancellable_read_timeouts[0], 4900)
+            self.assertLessEqual(transport.cancellable_read_timeouts[0], 5000)
         finally:
             coordinator.close()
 
@@ -1048,6 +1049,32 @@ class DatastoreCoordinatorTests(TestCase):
         self.assertEqual(stale.body, b'{"state":4}')
         self.assertEqual(stale.etag, "4")
 
+    def test_cached_transition_carries_content_type(self) -> None:
+        coordinator = DatastoreCoordinator(MotuUsbDatastore(FakeTransport([])))
+        coordinator._publish_payload(
+            DatastorePayload(b'{"first":true}{"second":true}', etag="2"),
+            None,
+            from_etag="1",
+        )
+
+        result = coordinator.wait_for_change("/datastore", "1")
+
+        self.assertEqual(result.content_type, "application/octet-stream")
+
+    def test_direct_read_carries_content_type(self) -> None:
+        transport = FakeTransport(
+            [
+                response_packet(
+                    b'HTTP/1.1 200 OK\r\nETag: 1\r\n\r\n{"first":true}{"second":true}'
+                ),
+            ]
+        )
+        coordinator = DatastoreCoordinator(MotuUsbDatastore(transport))
+
+        result = coordinator.read("/datastore")
+
+        self.assertEqual(result.content_type, "application/octet-stream")
+
     def test_non_client_query_fields_bypass_cached_long_poll_transition(self) -> None:
         transport = FakeTransport(
             [
@@ -1104,7 +1131,7 @@ class DatastoreCoordinatorTests(TestCase):
         )
         coordinator.read("/datastore")
 
-        returned = coordinator.post("/datastore/host/os", '{"value":"linux"}', client="7")
+        returned = coordinator.post("/datastore/host/os", b'{"value":"linux"}', client="7")
         other = coordinator.wait_for_change("/datastore", "1", client="8")
         own = coordinator.wait_for_change("/datastore", "1", client="7")
 
@@ -1141,7 +1168,7 @@ class DatastoreCoordinatorTests(TestCase):
 
         coordinator._release_io = record_release_etag
 
-        returned = coordinator.post("/datastore/host/os", '{"value":"linux"}', client="7")
+        returned = coordinator.post("/datastore/host/os", b'{"value":"linux"}', client="7")
 
         self.assertEqual(returned.body, b'{"post":true}')
         self.assertEqual(release_etags, ["2"])
@@ -1157,7 +1184,7 @@ class DatastoreCoordinatorTests(TestCase):
             http_wait_timeout_ms=1,
         )
 
-        returned = coordinator.post("/datastore/host/os", '{"value":"linux"}', client="7")
+        returned = coordinator.post("/datastore/host/os", b'{"value":"linux"}', client="7")
 
         self.assertEqual(returned.body, b'{"post":true}')
         self.assertEqual(returned.etag, "2")
@@ -1322,14 +1349,14 @@ class DatastoreCoordinatorTests(TestCase):
             post_results: list[DatastorePayload] = []
             post = threading.Thread(
                 target=lambda: post_results.append(
-                    coordinator.post("/datastore/host/os", '{"value":"linux"}', client="7")
+                    coordinator.post("/datastore/host/os", b'{"value":"linux"}', client="7")
                 )
             )
             post.start()
             self.assertTrue(transport.wait_for_writes(4, timeout=0.25))
             self.assertEqual(
                 transport.writes[3],
-                build_post_frame(0x23, 4, "/datastore/host/os", '{"value":"linux"}', client="7"),
+                build_post_frame(0x23, 4, "/datastore/host/os", b'{"value":"linux"}', client="7"),
             )
 
             transport.push(post_response, refresh_response)
@@ -1396,7 +1423,8 @@ class DatastoreCoordinatorTests(TestCase):
             self.assertTrue(transport.wait_for_writes(1))
             transport.push(initial)
             self.assertTrue(transport.wait_for_cancellable_reads(1))
-            self.assertEqual(transport.cancellable_read_timeouts[0], 20)
+            self.assertGreaterEqual(transport.cancellable_read_timeouts[0], 900)
+            self.assertLessEqual(transport.cancellable_read_timeouts[0], 1000)
 
             started = time.monotonic()
             coordinator.close()

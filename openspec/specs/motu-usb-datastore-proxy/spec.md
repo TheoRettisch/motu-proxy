@@ -71,6 +71,17 @@ The system SHALL provide a localhost HTTP proxy compatible with the handover MVP
 - **WHEN** the proxy is running with `--allow-writes` and a client sends PATCH with a body
 - **THEN** the proxy routes the request through the datastore POST write implementation without applying PATCH-specific merge or partial-update behavior
 
+### Requirement: MOTU HTTP compatibility boundary
+The system SHALL treat the `serve` HTTP API as the stable MOTU compatibility boundary while allowing internal Python helper, parser, protocol, datastore, and coordinator APIs to change during development.
+
+#### Scenario: MOTU-facing HTTP behavior remains stable
+- **WHEN** implementation cleanup changes internal Python call signatures or data structures
+- **THEN** datastore HTTP clients still observe compatible GET/POST/PATCH routing, `/datastore/...` path behavior, `client` query forwarding, `ETag`/`If-None-Match` handling, `Cache-Control: no-cache`, and device response body shapes
+
+#### Scenario: Proxy-specific safety behavior is explicit
+- **WHEN** a browser or HTTP client uses the proxy instead of a native MOTU device
+- **THEN** proxy-specific write gating, optional token protection, write validation, Host/Origin protections, and proxy status endpoints are documented as proxy behavior rather than native MOTU API behavior
+
 ### Requirement: Optional HTTP write-token protection
 The system SHALL enforce HTTP write-token authentication only when token protection is explicitly enabled for `serve` mode. Token protection SHALL be separate from HTTP write enablement: `--allow-writes` SHALL still be required for HTTP POST/PATCH, and Host, Origin, request-body, datastore validation, and frame-size protections SHALL remain active regardless of token configuration.
 

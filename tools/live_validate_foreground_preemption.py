@@ -160,7 +160,7 @@ def validate_idempotent_write(
 
     def write_host_os() -> None:
         try:
-            results.append(coordinator.post("/datastore/host/os", body))
+            results.append(coordinator.post("/datastore/host/os", body.encode("utf-8")))
         except BaseException as exc:
             errors.append(exc)
 
