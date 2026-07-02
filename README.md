@@ -14,8 +14,8 @@ path on the unbound vendor-specific interface.
 - Runtime support is Linux-only. The USB backend uses sysfs and usbfs.
 - Development and hardware-independent tests should work on non-Linux hosts.
 - The package has no runtime Python dependencies beyond the standard library.
-- HTTP writes are disabled by default and require explicit opt-in plus a write
-  token.
+- HTTP writes are disabled by default. Enabling writes is explicit, and write
+  token protection is available as a separate opt-in.
 
 ## Install
 
@@ -144,10 +144,11 @@ protocol, parser, and coordinator APIs may change while the project is still in
 development.
 
 The HTTP proxy is intended to remain compatible with MOTU datastore clients,
-including browser clients served from the same origin as the proxy. That means
-preserving datastore GET/POST/PATCH routing, `/datastore/...` path behavior,
-`client` query forwarding, `ETag`/`If-None-Match` handling, `Cache-Control:
-no-cache`, and the JSON response shapes returned by the device.
+including browser clients served from the same origin as the proxy. The
+compatibility contract covers datastore GET/POST/PATCH routing,
+`/datastore/...` path behavior, `client` query forwarding,
+`ETag`/`If-None-Match` handling, `Cache-Control: no-cache`, and the JSON
+response shapes returned by the device.
 
 The proxy also has deliberate safety behavior that is not part of the native
 MOTU device API: writes are disabled by default, optional write-token
@@ -190,9 +191,10 @@ datastore state and may return either a changed payload with a new `ETag` or
 `/meters` is a top-level device resource, not a datastore path. Meter responses
 are passed through unchanged and expose the device's meter `ETag`, but meter
 `If-None-Match` requests are one-shot device reads rather than datastore
-long-poll waits. High-rate meter consumers should wait for foreground-safe
-long-poll coordination (`avoid-long-poll-foreground-blocking`) before relying on
-USB meter polling in production.
+long-poll waits. High-rate meter consumers should still budget their polling
+rate because meter reads share the single USB control path with datastore
+traffic; the proxy transports meter data but does not provide a meter polling
+scheduler or typed meter model.
 
 During shutdown the coordinator asks the background poller to stop and waits for
 it before the USB datastore context is released.
@@ -364,10 +366,10 @@ Run the fixture self-test:
 ```
 
 The tests cover protocol byte fixtures, path normalization, strict response
-frame validation, parser helpers, fake sysfs discovery, HTTP write gating,
-token handling, and USB short read/write failure paths. Fake Linux sysfs tests
-are skipped on Windows where Linux interface names such as `3-3:1.3` are not
-valid paths.
+frame validation, parser helpers, fake sysfs discovery, the HTTP compatibility
+contract, HTTP write gating, token handling, and USB short read/write failure
+paths. Fake Linux sysfs tests are skipped on Windows where Linux interface names
+such as `3-3:1.3` are not valid paths.
 
 ## Project Layout
 
@@ -399,8 +401,8 @@ This project is licensed under the MIT License. See `LICENSE`.
 
 ## Known Follow-Ups
 
-- Add lightweight performance instrumentation or benchmarks for idle native
-  long-poll churn, large `/datastore` response parsing, and HTTP fan-out so
-  future transport/parser changes can be measured against live MOTU hardware.
+- Add lightweight performance instrumentation or benchmarks for idle long-poll
+  behavior, large `/datastore` response parsing, and HTTP fan-out so future
+  transport/parser changes can be measured against live MOTU hardware.
 - Add service packaging and deployment-specific udev/systemd integration when
   the target image layout is settled.
