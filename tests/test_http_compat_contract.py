@@ -42,7 +42,7 @@ class MotuHttpCompatibilityContractTests(TestCase):
         self.assertEqual(result.content_type, "application/json")
         self.assertEqual(
             calls,
-            [("/datastore/uid", "1479701624", None, ())],
+            [("/datastore/uid", "1479701624", None, (("client", "1479701624"),))],
         )
 
     def test_long_poll_contract_maps_no_change_to_304(self) -> None:
@@ -137,7 +137,7 @@ class MotuHttpCompatibilityContractTests(TestCase):
             "",
             "",
             False,
-            lambda path, client=None: b'{"value":"0001f2fffe00c719"}',
+            lambda path, client=None, if_none_match=None, query_fields=(): b'{"value":"0001f2fffe00c719"}',
             lambda path, body, client=None: b"{}",
             origin="http://not-the-proxy.example",
             host="127.0.0.1:1280",

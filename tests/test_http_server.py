@@ -118,7 +118,12 @@ class HttpServerTests(TestCase):
     ):
         calls: list[tuple[str, str, bytes | None]] = []
 
-        def get(path: str, client: str | None = None) -> bytes:
+        def get(
+            path: str,
+            client: str | None = None,
+            if_none_match: str | None = None,
+            query_fields: tuple[tuple[str, str], ...] = (),
+        ) -> bytes:
             calls.append(("GET", path, None))
             return b'{"value":"0001f2fffe00c719"}'
 
@@ -161,13 +166,22 @@ class HttpServerTests(TestCase):
         ]
         for request_path, body in cases:
             with self.subTest(request_path=request_path):
+                def get(
+                    path: str,
+                    client: str | None = None,
+                    if_none_match: str | None = None,
+                    query_fields: tuple[tuple[str, str], ...] = (),
+                    response_body: bytes = body,
+                ) -> bytes:
+                    return response_body
+
                 result = dispatch_datastore_request(
                     "GET",
                     request_path,
                     "",
                     "",
                     False,
-                    lambda path, client=None, body=body: body,
+                    get,
                     lambda path, body, client=None: b"{}",
                 )
                 self.assertEqual(result.response, body)
@@ -175,7 +189,12 @@ class HttpServerTests(TestCase):
     def test_get_forwards_client_identifier(self) -> None:
         calls: list[tuple[str, str | None]] = []
 
-        def get(path: str, client: str | None = None) -> bytes:
+        def get(
+            path: str,
+            client: str | None = None,
+            if_none_match: str | None = None,
+            query_fields: tuple[tuple[str, str], ...] = (),
+        ) -> bytes:
             calls.append((path, client))
             return b'{"value":"0001f2fffe00c719"}'
 
@@ -433,7 +452,12 @@ class HttpServerTests(TestCase):
     def test_get_forwards_if_none_match(self) -> None:
         calls: list[tuple[str, str | None, str | None]] = []
 
-        def get(path: str, client: str | None = None, if_none_match: str | None = None) -> DatastorePayload:
+        def get(
+            path: str,
+            client: str | None = None,
+            if_none_match: str | None = None,
+            query_fields: tuple[tuple[str, str], ...] = (),
+        ) -> DatastorePayload:
             calls.append((path, client, if_none_match))
             return DatastorePayload(b'{"changed":true}', etag="5679")
 
@@ -459,7 +483,7 @@ class HttpServerTests(TestCase):
             "",
             "",
             False,
-            lambda path, client=None, if_none_match=None: DatastorePayload(
+            lambda path, client=None, if_none_match=None, query_fields=(): DatastorePayload(
                 b"",
                 etag=if_none_match,
                 status=304,
@@ -710,7 +734,12 @@ class HttpServerTests(TestCase):
     def test_dispatcher_serializes_access_with_lock(self) -> None:
         calls: list[tuple[str, bytes]] = []
 
-        def get(path: str, client: str | None = None) -> bytes:
+        def get(
+            path: str,
+            client: str | None = None,
+            if_none_match: str | None = None,
+            query_fields: tuple[tuple[str, str], ...] = (),
+        ) -> bytes:
             calls.append(("GET", path))
             return b"{}"
 
@@ -1292,7 +1321,13 @@ class HttpHandlerTests(TestCase):
                 )
                 return result
 
-            def get(self, path: str, client: str | None = None) -> bytes:
+            def get(
+                self,
+                path: str,
+                client: str | None = None,
+                if_none_match: str | None = None,
+                query_fields: tuple[tuple[str, str], ...] = (),
+            ) -> bytes:
                 calls.append(path)
                 return body
 
@@ -1464,7 +1499,10 @@ class HttpHandlerTests(TestCase):
             "",
             "",
             False,
-            lambda path, client=None: DatastorePayload(b'{"value":"ok"}', etag="5678"),
+            lambda path, client=None, if_none_match=None, query_fields=(): DatastorePayload(
+                b'{"value":"ok"}',
+                etag="5678",
+            ),
             lambda path, body, client=None: b"{}",
         )
         self.assertEqual(result.response, b'{"value":"ok"}')

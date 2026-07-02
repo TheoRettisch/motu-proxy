@@ -40,7 +40,10 @@ from .schema import (
     validate_datastore_write_object,
 )
 
-DatastoreRead = Callable[..., bytes | DatastorePayload]
+DatastoreRead = Callable[
+    [str, str | None, str | None, tuple[tuple[str, str], ...]],
+    bytes | DatastorePayload,
+]
 DatastoreWrite = Callable[[str, bytes, str | None], bytes | DatastorePayload]
 WriteLogger = Callable[[str, str, bytes], None]
 StatusProvider = Callable[[], dict[str, object | None]]
@@ -226,7 +229,8 @@ def dispatch_datastore_request(
     path = normalize_path(request_url.path)
     if method == "GET":
         query_fields, client = parse_get_query_fields(request_path)
-        payload = _coerce_datastore_payload(_run_get(run_get, path, client, if_none_match, query_fields))
+        etag = if_none_match.strip() if if_none_match is not None else None
+        payload = _coerce_datastore_payload(run_get(path, client, etag, query_fields))
         status = 304 if payload.not_modified else 200
         return DispatchResult(
             payload.body,
@@ -256,27 +260,6 @@ def dispatch_datastore_request(
     # HTTP PATCH is a compatibility alias for the MOTU datastore POST write.
     payload = _coerce_datastore_payload(run_post(path, write_body_bytes, client))
     return DispatchResult(payload.body, path, payload.etag, content_type=payload.content_type)
-
-
-def _run_get(
-    run_get: DatastoreRead,
-    path: str,
-    client: str | None,
-    if_none_match: str | None,
-    query_fields: tuple[tuple[str, str], ...],
-) -> bytes | DatastorePayload:
-    if _uses_legacy_get_signature(query_fields):
-        if if_none_match is None:
-            return run_get(path, client)
-        return run_get(path, client, if_none_match.strip())
-    etag = if_none_match.strip() if if_none_match is not None else None
-    return run_get(path, client, etag, query_fields)
-
-
-def _uses_legacy_get_signature(query_fields: tuple[tuple[str, str], ...]) -> bool:
-    return not query_fields or (
-        len(query_fields) == 1 and query_fields[0][0] == "client"
-    )
 
 
 def _coerce_datastore_payload(value: bytes | DatastorePayload) -> DatastorePayload:
